@@ -1,0 +1,357 @@
+"""Knowledge-base ingestion into the local Qdrant vector store (hybrid RAG).
+
+PDF/DOCX/EPUB/TXT/MD files are normalised to Markdown, chunked, embedded and
+upserted *locally*: ``to_markdown`` converts via markitdown (falling back to
+``pypdf`` / ``python-docx`` / a tiny EPUB parser), the text is split into
+overlapping windows, embedded by the bge-m3 sidecar (dense + sparse) and written
+to Qdrant. There is no hosted vector store — the KB lives in the Qdrant
+collection.
+
+The full ingest path is::
+
+    upload_document
+      -> to_markdown    (normalise pdf/docx/epub/txt/md -> Markdown)
+      -> _chunk_text    (sliding character windows, CHUNK_SIZE/CHUNK_OVERLAP)
+      -> embeddings.embed_texts   (bge-m3 dense + sparse)
+      -> vectorstore.upsert_points   (payload carries lab metadata)
+
+``bulk_ingest_tree`` walks the school corpus folder, derives per-file metadata
+from the path (``corpus_meta.parse_path`` -> subject/grade/lang/lab_id) and
+ingests each file with that metadata so retrieval can be scoped by lab context.
+The document id is a stable ``uuid5`` of the ``doc_key`` (the relative path for
+bulk ingest, since lab filenames repeat across grades), and existing chunks for
+that id are deleted before re-upserting.
+
+Validation failures (unsupported extension, etc.) raise ``ValueError``; any
+embedding/vector-store failure surfaces as an ``LLMError`` subclass and is left
+to propagate so routes can map it to 504/502.
+"""
+
+import io
+import json
+import logging
+import re
+import uuid
+import zipfile
+from pathlib import Path
+
+import docx
+import pypdf
+
+from app.core.config import settings
+from app.services import corpus_meta, embeddings, vectorstore
+
+logger = logging.getLogger("assistant.ingestion")
+
+# File types we can parse and embed locally for the school knowledge base.
+# Everything is normalised to Markdown before chunking (see ``to_markdown``).
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".epub"}
+
+# uuid5 namespace for deriving stable document/chunk ids from doc keys.
+_DOC_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+
+# Documents shorter than this many characters of extracted text are flagged as
+# "stub" in the manifest (present but too thin to be a real lab procedure).
+_STUB_CHARS = 200
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _doc_id(doc_key: str) -> str:
+    """Stable document id for ``doc_key`` (re-ingest replaces in place).
+
+    ``doc_key`` is the bare filename for single uploads but the *relative path*
+    for bulk corpus ingest, since lab filenames (e.g. 'Лабораторная работа
+    №2.docx') repeat across subjects/grades and would otherwise collide.
+    """
+    return uuid.uuid5(_DOC_NAMESPACE, doc_key).hex
+
+
+def _markitdown(suffix: str, content: bytes) -> str | None:
+    """Convert ``content`` to Markdown via markitdown, or None if unavailable.
+
+    markitdown (optional dep) handles pdf/docx/epub/xlsx richly; when it is not
+    installed or fails we fall back to the per-format extractors below.
+    """
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        return None
+    try:
+        result = MarkItDown().convert_stream(io.BytesIO(content), file_extension=suffix)
+        text = (result.text_content or "").strip()
+        return text or None
+    except Exception as exc:  # noqa: BLE001 - any converter failure -> fallback
+        logger.warning("markitdown failed for '%s' (%s); using fallback", suffix, exc)
+        return None
+
+
+def _epub_to_text(content: bytes) -> str:
+    """Minimal EPUB -> text fallback: strip tags from the bundled XHTML."""
+    out: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        names = [n for n in z.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
+        for name in sorted(names):
+            html = z.read(name).decode("utf-8", "ignore")
+            out.append(_TAG_RE.sub(" ", html))
+    return "\n".join(out)
+
+
+def to_markdown(filename: str, content: bytes) -> str:
+    """Normalise any supported document to Markdown / plain text.
+
+    Tries markitdown first (best fidelity, incl. tables and EPUB); otherwise
+    falls back to pypdf / python-docx / a tiny EPUB tag-stripper. ``.md`` /
+    ``.txt`` pass through unchanged. Raises ``ValueError`` for unsupported
+    extensions.
+    """
+    suffix = Path(filename).suffix.lower()
+
+    if suffix in (".txt", ".md"):
+        return content.decode("utf-8", errors="replace")
+
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type '{suffix}'. Supported: "
+            f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+
+    md = _markitdown(suffix, content)
+    if md is not None:
+        return md
+
+    if suffix == ".pdf":
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+
+    if suffix == ".docx":
+        document = docx.Document(io.BytesIO(content))
+        return "\n".join(p.text for p in document.paragraphs if p.text and p.text.strip())
+
+    if suffix == ".epub":
+        return _epub_to_text(content)
+
+    raise ValueError(f"Unsupported file type '{suffix}'")  # pragma: no cover
+
+
+# Backwards-compatible alias (older callers / tests imported ``_extract_text``).
+_extract_text = to_markdown
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split ``text`` into overlapping character windows.
+
+    Whitespace is collapsed first, then windows of ``CHUNK_SIZE`` characters are
+    emitted stepping by ``CHUNK_SIZE - CHUNK_OVERLAP``. Empty / whitespace-only
+    windows are dropped.
+    """
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+
+    size = settings.CHUNK_SIZE
+    overlap = settings.CHUNK_OVERLAP
+    # Guard against a degenerate (or misconfigured) overlap >= size which would
+    # make the window never advance.
+    if overlap >= size:
+        overlap = max(0, size // 4)
+    step = size - overlap
+
+    chunks: list[str] = []
+    for start in range(0, len(normalized), step):
+        window = normalized[start : start + size].strip()
+        if window:
+            chunks.append(window)
+        if start + size >= len(normalized):
+            break
+    return chunks
+
+
+async def upload_document(
+    filename: str,
+    content: bytes,
+    metadata: dict | None = None,
+    doc_key: str | None = None,
+    **_,
+) -> dict:
+    """Convert to Markdown, chunk, embed and upsert one document into Qdrant.
+
+    ``metadata`` (subject/grade/lang/doc_type/lab_id …) is merged into every
+    chunk payload so retrieval can be filtered by lab context. ``doc_key`` is
+    the stable identity for replace-semantics — defaults to ``filename`` for
+    single uploads; bulk ingest passes the relative path to avoid collisions
+    between same-named lab files.
+
+    Returns ``{file_id, filename, status, chunks}``. ``status`` is ``"ready"``
+    on success or ``"empty"`` if the document yielded no usable text. Raises
+    ``ValueError`` for unsupported extensions; embedding / vector-store failures
+    propagate as ``LLMError`` subclasses.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type '{suffix}'. Supported: "
+            f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+
+    await vectorstore.ensure_collection()
+
+    key = doc_key or filename
+    doc_id = _doc_id(key)
+    text = to_markdown(filename, content)
+    chunks = _chunk_text(text)
+    if not chunks:
+        logger.info("Ingested '%s' -> doc_id=%s status=empty (no text)", key, doc_id)
+        return {"file_id": doc_id, "filename": filename, "status": "empty", "chunks": 0}
+
+    embeddings_list = await embeddings.embed_texts(chunks)
+
+    # Replace semantics: drop any existing chunks for this document first.
+    await vectorstore.delete_document(doc_id)
+
+    base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}
+    points = [
+        {
+            "id": uuid.uuid5(_DOC_NAMESPACE, f"{key}:{i}").hex,
+            "dense": emb.dense,
+            "sparse_indices": emb.sparse_indices,
+            "sparse_values": emb.sparse_values,
+            "payload": {
+                **base_payload,
+                "doc_id": doc_id,
+                "filename": filename,
+                "chunk_index": i,
+                "text": chunk,
+            },
+        }
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings_list))
+    ]
+
+    n = await vectorstore.upsert_points(points)
+    logger.info("Ingested '%s' -> doc_id=%s status=ready chunks=%d", key, doc_id, n)
+    return {"file_id": doc_id, "filename": filename, "status": "ready", "chunks": n}
+
+
+# ── Bulk corpus ingest + manifest ────────────────────────────────────────────
+
+
+def iter_corpus_files(root: str) -> list[Path]:
+    """All supported files under ``root`` (recursive), sorted for determinism."""
+    base = Path(root)
+    return sorted(
+        p
+        for p in base.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+
+
+async def bulk_ingest_tree(root: str) -> dict:
+    """Walk ``root``, derive metadata from each path and ingest every file.
+
+    Returns a summary ``{root, total, ready, empty, skipped, errors, documents}``.
+    Files whose path is not under a recognised corpus tier are skipped (logged).
+    Per-file failures are collected rather than aborting the whole run.
+    """
+    files = iter_corpus_files(root)
+    summary = {
+        "root": root,
+        "total": len(files),
+        "ready": 0,
+        "empty": 0,
+        "skipped": 0,
+        "errors": [],
+        "documents": [],
+    }
+    for path in files:
+        meta = corpus_meta.parse_path(str(path), corpus_root=root)
+        if meta is None:
+            summary["skipped"] += 1
+            logger.info("Skip (unrecognised path): %s", path)
+            continue
+        try:
+            result = await upload_document(
+                path.name, path.read_bytes(), metadata=meta, doc_key=meta["source"]
+            )
+        except Exception as exc:  # noqa: BLE001 - keep going, record the failure
+            summary["errors"].append({"source": meta["source"], "error": str(exc)})
+            logger.warning("Ingest failed for %s: %s", path, exc)
+            continue
+        summary["ready" if result["status"] == "ready" else "empty"] += 1
+        summary["documents"].append({**meta, **result})
+    logger.info(
+        "Bulk ingest of %s: %d ready, %d empty, %d skipped, %d errors",
+        root, summary["ready"], summary["empty"], summary["skipped"], len(summary["errors"]),
+    )
+    return summary
+
+
+def build_manifest(root: str) -> dict:
+    """Scan the corpus tree and report lab completeness (no embedding).
+
+    Produces ``{labs: {lab_id: {...}}, missing_metadata: [...], textbooks: N}``.
+    A lab is ``complete`` when its procedure file extracts enough text, ``stub``
+    when present-but-thin, and we record which languages exist per
+    subject/grade/number so a missing translation is visible. This is an offline
+    report; the request path treats "no instruction in Qdrant" as incomplete.
+    """
+    labs: dict[str, dict] = {}
+    missing_metadata: list[str] = []
+    textbooks = 0
+
+    for path in iter_corpus_files(root):
+        meta = corpus_meta.parse_path(str(path), corpus_root=root)
+        if meta is None:
+            missing_metadata.append(str(path))
+            continue
+        if meta["doc_type"] == "textbook":
+            textbooks += 1
+            continue
+        lab_id = meta.get("lab_id")
+        if not lab_id:
+            missing_metadata.append(meta["source"])
+            continue
+        try:
+            text = to_markdown(path.name, path.read_bytes())
+        except Exception:  # noqa: BLE001
+            text = ""
+        chars = len(re.sub(r"\s+", " ", text).strip())
+        labs[lab_id] = {
+            "lab_id": lab_id,
+            "subject": meta["subject"],
+            "grade": meta["grade"],
+            "lang": meta["lang"],
+            "lab_number": meta["lab_number"],
+            "source": meta["source"],
+            "chars": chars,
+            "status": "complete" if chars >= _STUB_CHARS else "stub",
+        }
+
+    return {
+        "labs": dict(sorted(labs.items())),
+        "missing_metadata": sorted(missing_metadata),
+        "textbooks": textbooks,
+    }
+
+
+def write_manifest(root: str, out_path: str) -> dict:
+    """Build the manifest for ``root`` and write it to ``out_path`` as JSON."""
+    manifest = build_manifest(root)
+    Path(out_path).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
+
+
+async def list_documents(**_) -> list[dict]:
+    """List ingested documents (one entry per ``doc_id``)."""
+    return await vectorstore.list_documents()
+
+
+async def delete_document(file_id: str, **_) -> bool:
+    """Delete a document's chunks; return False if it did not exist."""
+    return await vectorstore.delete_document(file_id)
+
+
+async def corpus_status(**_) -> dict:
+    """Return the Qdrant collection's status, point count and document count."""
+    return await vectorstore.collection_status()

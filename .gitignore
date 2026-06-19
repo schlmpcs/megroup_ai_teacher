@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+.DS_Store
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Large source corpus (copyrighted textbooks + video) — ingested locally, not committed
+/Лабораторные физхимбио/
+labs.json
+
+# Local/sensitive documents — not for the shared repo
+/Договор_*.docx

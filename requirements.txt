@@ -1,0 +1,18 @@
+# requirements.txt — VR AI Assistant (local hybrid retrieval via Qdrant + bge-m3 sidecar; generation/voice on OpenAI)
+fastapi>=0.109.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0
+pydantic-settings>=2.0
+openai>=1.40.0          # Responses API + file_search + Vector Stores + audio
+httpx>=0.26.0
+tenacity>=8.2.0         # Retry / exponential backoff for upstream OpenAI calls
+slowapi>=0.1.9          # Per-IP rate limiting
+python-multipart>=0.0.9 # multipart/form-data (audio upload, document upload)
+qdrant-client>=1.12.0    # local hybrid vector store (Query API: dense+sparse RRF)
+pypdf>=4.2.0             # parse PDF knowledge-base documents locally (fallback)
+python-docx>=1.1.0       # parse DOCX knowledge-base documents locally (fallback)
+markitdown>=0.0.1a2      # normalise pdf/docx/epub/xlsx -> Markdown before chunking
+
+# ── Dev / tests ────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
