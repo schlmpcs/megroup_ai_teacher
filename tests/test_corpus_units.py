@@ -195,6 +195,26 @@ def test_meta_filter_all_none_is_none():
     assert vectorstore.meta_filter(subject=None) is None
 
 
+def test_with_lang_appends_lang_to_base():
+    base = vectorstore.meta_filter(doc_type="textbook", subject="physics")
+    flt = vectorstore.with_lang(base, "ru")
+    conds = {c.key: c.match.value for c in flt.must}
+    assert conds == {"doc_type": "textbook", "subject": "physics", "lang": "ru"}
+    # base is left untouched (no lang condition leaked into it)
+    assert {c.key for c in base.must} == {"doc_type", "subject"}
+
+
+def test_with_lang_none_base_builds_lang_only_filter():
+    flt = vectorstore.with_lang(None, "kk")
+    assert [(c.key, c.match.value) for c in flt.must] == [("lang", "kk")]
+
+
+def test_with_lang_no_lang_returns_base_unchanged():
+    base = vectorstore.meta_filter(subject="biology")
+    assert vectorstore.with_lang(base, None) is base
+    assert vectorstore.with_lang(None, None) is None
+
+
 # ── llm: lab-aware grounding ─────────────────────────────────────────────────
 
 
@@ -271,3 +291,82 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
     await llm.generate_answer("вопрос", lab=lab)
     assert "инструкция" in captured["instructions"].lower()
     assert "недоступна" in captured["instructions"].lower()
+
+
+# ── llm: language-priority retrieval ─────────────────────────────────────────
+
+
+def _chunk(lang, text, score=0.9):
+    return {"score": score, "payload": {"doc_id": text, "filename": f"{text}.pdf",
+                                        "chunk_index": 0, "text": text, "lang": lang}}
+
+
+async def test_retrieve_prefers_same_language_no_fallback(monkeypatch):
+    """Same-language pass is full -> no fallback search runs."""
+    monkeypatch.setattr(llm.settings, "RETRIEVAL_TOP_K", 2, raising=False)
+    calls = []
+
+    async def _embed_query(text):
+        return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
+
+    async def _hybrid_search(dense, si, sv, top_k, candidates, query_filter=None):
+        # The lang condition is present on the (only) call.
+        lang = next((c.match.value for c in query_filter.must if c.key == "lang"), None)
+        calls.append(lang)
+        return [_chunk("ru", "ru-1"), _chunk("ru", "ru-2")]
+
+    monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
+    monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
+
+    base = vectorstore.meta_filter(doc_type="textbook", subject="physics")
+    chunks = await llm._retrieve("q", query_filter=base, lang="ru")
+
+    assert calls == ["ru"]  # only the same-language search ran
+    assert [c["payload"]["text"] for c in chunks] == ["ru-1", "ru-2"]
+
+
+async def test_retrieve_falls_back_when_same_language_thin(monkeypatch):
+    """Thin same-language pass -> unconstrained fallback backfills other lang."""
+    monkeypatch.setattr(llm.settings, "RETRIEVAL_TOP_K", 3, raising=False)
+    seen_filters = []
+
+    async def _embed_query(text):
+        return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
+
+    async def _hybrid_search(dense, si, sv, top_k, candidates, query_filter=None):
+        has_lang = any(c.key == "lang" for c in query_filter.must)
+        seen_filters.append("lang" if has_lang else "base")
+        if has_lang:
+            return [_chunk("ru", "ru-1")]  # only one same-language hit (thin)
+        # fallback returns a mix; same-language dupes are skipped, kk backfills
+        return [_chunk("ru", "ru-1"), _chunk("kk", "kk-1"), _chunk("kk", "kk-2")]
+
+    monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
+    monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
+
+    base = vectorstore.meta_filter(doc_type="textbook", subject="physics")
+    chunks = await llm._retrieve("q", query_filter=base, lang="ru")
+
+    assert seen_filters == ["lang", "base"]  # both passes ran
+    texts = [c["payload"]["text"] for c in chunks]
+    # same-language first, then other-language backfill, no ru-1 duplicate
+    assert texts == ["ru-1", "kk-1", "kk-2"]
+
+
+async def test_retrieve_no_lang_single_search(monkeypatch):
+    """Without a known lang, behaviour is unchanged (one search, no filter narrowing)."""
+    calls = []
+
+    async def _embed_query(text):
+        return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
+
+    async def _hybrid_search(dense, si, sv, top_k, candidates, query_filter=None):
+        calls.append(query_filter)
+        return [_chunk("ru", "ru-1")]
+
+    monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
+    monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
+
+    chunks = await llm._retrieve("q", query_filter=None, lang=None)
+    assert calls == [None]  # single search, filter passed through untouched
+    assert [c["payload"]["text"] for c in chunks] == ["ru-1"]

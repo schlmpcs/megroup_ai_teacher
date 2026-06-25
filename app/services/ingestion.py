@@ -30,10 +30,14 @@ to propagate so routes can map it to 504/502.
 import io
 import json
 import logging
+import posixpath
 import re
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
+from html import unescape as _html_unescape
 from pathlib import Path
+from urllib.parse import unquote
 
 import docx
 import pypdf
@@ -55,6 +59,24 @@ _DOC_NAMESPACE = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 _STUB_CHARS = 200
 
 _TAG_RE = re.compile(r"<[^>]+>")
+# Drop <script>/<style> bodies before stripping tags so their contents never
+# leak into the extracted text.
+_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
+# A "word" for the image-only heuristic: a run of 2+ Cyrillic letters (the whole
+# block, so both Russian and Kazakh). The school corpus is entirely Cyrillic, so
+# a multi-MB EPUB that yields ~no Cyrillic words is a scanned/image-only book —
+# its only "text" is stray Latin ids / page numbers left over from the markup,
+# which would otherwise be indexed as a handful of useless noise chunks.
+_WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
+
+# EPUB extraction thresholds (word counts via ``_WORD_RE``):
+#   * if markitdown returns at least this many words we trust it and skip the
+#     (more expensive) spine reparse;
+#   * below ``_EPUB_MIN_WORDS`` the best extraction is treated as image-only
+#     (scanned) and the file is skipped rather than indexed as a few noise
+#     chunks of stripped <img> tags.
+_EPUB_TRUST_WORDS = 500
+_EPUB_MIN_WORDS = 50
 
 
 def _doc_id(doc_key: str) -> str:
@@ -86,15 +108,127 @@ def _markitdown(suffix: str, content: bytes) -> str | None:
         return None
 
 
+def _count_words(text: str) -> int:
+    """Number of word-ish tokens in ``text`` (cheap image-only heuristic)."""
+    return len(_WORD_RE.findall(text))
+
+
+def _html_to_text(html: str) -> str:
+    """Strip an (x)html document to readable text (drops script/style, entities)."""
+    html = _SCRIPT_STYLE_RE.sub(" ", html)
+    text = _TAG_RE.sub(" ", html)
+    return _html_unescape(text)
+
+
+def _zip_join(base: str, href: str) -> str:
+    """Resolve an OPF-relative href to a normalised zip member path."""
+    href = unquote(href).split("#", 1)[0]  # drop url-encoding + fragment
+    joined = f"{base}/{href}" if base else href
+    return posixpath.normpath(joined)
+
+
+def _opf_path(z: zipfile.ZipFile, names: list[str]) -> str | None:
+    """Locate the OPF package document via META-INF/container.xml (or first .opf)."""
+    if "META-INF/container.xml" in names:
+        try:
+            root = ET.fromstring(z.read("META-INF/container.xml"))
+            for el in root.iter():
+                if el.tag.rsplit("}", 1)[-1] == "rootfile":
+                    full_path = el.get("full-path")
+                    if full_path:
+                        return full_path
+        except ET.ParseError:
+            pass
+    for name in names:
+        if name.lower().endswith(".opf"):
+            return name
+    return None
+
+
+def _spine_docs(z: zipfile.ZipFile, opf_path: str) -> list[str]:
+    """Return spine document zip paths in reading order, resolved against the OPF."""
+    try:
+        opf = ET.fromstring(z.read(opf_path))
+    except (KeyError, ET.ParseError):
+        return []
+    manifest: dict[str, str] = {}
+    for el in opf.iter():
+        if el.tag.rsplit("}", 1)[-1] == "item":
+            item_id, href = el.get("id"), el.get("href")
+            if item_id and href:
+                manifest[item_id] = href
+    base = opf_path.rsplit("/", 1)[0] if "/" in opf_path else ""
+    docs: list[str] = []
+    for el in opf.iter():
+        if el.tag.rsplit("}", 1)[-1] == "itemref":
+            href = manifest.get(el.get("idref") or "")
+            if href:
+                docs.append(_zip_join(base, href))
+    return docs
+
+
 def _epub_to_text(content: bytes) -> str:
-    """Minimal EPUB -> text fallback: strip tags from the bundled XHTML."""
-    out: list[str] = []
+    """Robust EPUB -> text: follow the OPF spine, in reading order.
+
+    markitdown (and ebooklib) sometimes return almost nothing for these school
+    textbooks because the spine isn't followed, so we parse the OCF container
+    ourselves: META-INF/container.xml -> OPF manifest+spine -> each spine
+    document, tags stripped, concatenated in order. If the container/spine can't
+    be read we fall back to every (x)html member, sorted alphabetically (the old
+    behaviour).
+    """
     with zipfile.ZipFile(io.BytesIO(content)) as z:
-        names = [n for n in z.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
-        for name in sorted(names):
-            html = z.read(name).decode("utf-8", "ignore")
-            out.append(_TAG_RE.sub(" ", html))
+        names = z.namelist()
+        member_set = set(names)
+        opf_path = _opf_path(z, names)
+        docs = _spine_docs(z, opf_path) if opf_path else []
+        docs = [d for d in docs if d in member_set]
+        if not docs:
+            docs = sorted(
+                n for n in names if n.lower().endswith((".xhtml", ".html", ".htm"))
+            )
+        out: list[str] = []
+        for name in docs:
+            try:
+                raw = z.read(name)
+            except KeyError:
+                continue
+            out.append(_html_to_text(raw.decode("utf-8", "ignore")))
     return "\n".join(out)
+
+
+def _extract_epub(filename: str, content: bytes) -> str:
+    """EPUB -> text, resilient to markitdown silently extracting nothing.
+
+    markitdown is tried first; when it returns suspiciously little text we
+    re-parse the spine ourselves (:func:`_epub_to_text`) and keep whichever
+    yields more words. Genuinely image-only (scanned) EPUBs extract ~no words —
+    we log a clear warning naming the file and return ``""`` so the document is
+    skipped (status ``empty``) rather than indexed as a few noise chunks. Those
+    files are listed in the manifest as ``stub`` for the OCR decision.
+    """
+    md = _markitdown(".epub", content) or ""
+    md_words = _count_words(md)
+
+    best, best_words = md, md_words
+    if md_words < _EPUB_TRUST_WORDS:
+        try:
+            spine = _epub_to_text(content)
+        except Exception as exc:  # noqa: BLE001 - any zip/xml failure -> keep markitdown
+            logger.warning("EPUB spine parse failed for '%s' (%s)", filename, exc)
+            spine = ""
+        if _count_words(spine) > best_words:
+            best, best_words = spine, _count_words(spine)
+
+    if best_words < _EPUB_MIN_WORDS:
+        logger.warning(
+            "EPUB '%s' yielded ~no extractable text (%d words) — likely "
+            "image-only/scanned; skipping (needs OCR)",
+            filename,
+            best_words,
+        )
+        return ""
+    return best
 
 
 def to_markdown(filename: str, content: bytes) -> str:
@@ -116,6 +250,12 @@ def to_markdown(filename: str, content: bytes) -> str:
             f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
+    # EPUB has its own markitdown-first-then-spine-fallback path (markitdown
+    # silently under-reads the spine on these textbooks), so handle it before the
+    # generic markitdown attempt below.
+    if suffix == ".epub":
+        return _extract_epub(filename, content)
+
     md = _markitdown(suffix, content)
     if md is not None:
         return md
@@ -127,9 +267,6 @@ def to_markdown(filename: str, content: bytes) -> str:
     if suffix == ".docx":
         document = docx.Document(io.BytesIO(content))
         return "\n".join(p.text for p in document.paragraphs if p.text and p.text.strip())
-
-    if suffix == ".epub":
-        return _epub_to_text(content)
 
     raise ValueError(f"Unsupported file type '{suffix}'")  # pragma: no cover
 

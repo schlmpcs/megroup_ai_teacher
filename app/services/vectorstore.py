@@ -74,6 +74,22 @@ def meta_filter(**fields) -> models.Filter | None:
     return models.Filter(must=must) if must else None
 
 
+def with_lang(base: "models.Filter | None", lang: str | None) -> "models.Filter | None":
+    """Return ``base`` narrowed to a single ``lang`` (e.g. "ru"/"kk").
+
+    Adds a ``lang`` ``must``-condition on top of any conditions already in
+    ``base`` (subject/doc_type scope), leaving ``base`` untouched. When ``lang``
+    is None the base filter is returned as-is, so callers can pass it straight
+    through to :func:`hybrid_search`. Used to prefer same-language chunks, with
+    the unconstrained ``base`` kept as a fallback.
+    """
+    if not lang:
+        return base
+    lang_cond = models.FieldCondition(key="lang", match=models.MatchValue(value=lang))
+    base_must = list(getattr(base, "must", None) or []) if base is not None else []
+    return models.Filter(must=base_must + [lang_cond])
+
+
 async def ensure_collection() -> None:
     """Create the dense+sparse collection if it does not already exist."""
     client = get_client()

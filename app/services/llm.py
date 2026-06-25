@@ -137,22 +137,15 @@ def build_system_prompt(
 # ── Local hybrid retrieval ────────────────────────────────────────────────────
 
 
-async def _retrieve(query: str, query_filter: Any = None) -> list[dict]:
-    """Embed the query and hybrid-search the local Qdrant knowledge base.
-
-    Returns a list of scored chunks (``{"score", "payload"}``). Chunks scoring
-    below ``RETRIEVAL_SCORE_THRESHOLD`` are dropped. ``query_filter`` (optional)
-    scopes the search to a metadata subset (e.g. physics theory only); it is
-    only forwarded when set so existing call sites/tests keep their signature.
-    """
-    emb = await embeddings.embed_query(query)
+async def _search(query_filter: Any, dense, sparse_indices, sparse_values) -> list[dict]:
+    """One hybrid search + score-threshold filter for a given ``query_filter``."""
     kwargs = {}
     if query_filter is not None:
         kwargs["query_filter"] = query_filter
     chunks = await vectorstore.hybrid_search(
-        emb.dense,
-        emb.sparse_indices,
-        emb.sparse_values,
+        dense,
+        sparse_indices,
+        sparse_values,
         top_k=settings.RETRIEVAL_TOP_K,
         candidates=settings.RETRIEVAL_CANDIDATES,
         **kwargs,
@@ -163,29 +156,85 @@ async def _retrieve(query: str, query_filter: Any = None) -> list[dict]:
     return chunks
 
 
-async def _lab_grounding(lab: Optional[dict]) -> tuple[Optional[str], bool, Any]:
+async def _retrieve(
+    query: str, query_filter: Any = None, lang: Optional[str] = None
+) -> list[dict]:
+    """Embed the query and hybrid-search the local Qdrant knowledge base.
+
+    Returns a list of scored chunks (``{"score", "payload"}``). Chunks scoring
+    below ``RETRIEVAL_SCORE_THRESHOLD`` are dropped. ``query_filter`` (optional)
+    scopes the search to a metadata subset (e.g. physics theory only); it is
+    only forwarded when set so existing call sites/tests keep their signature.
+
+    When ``lang`` is known (the question's language from the lab context), we
+    first search same-language chunks only (``query_filter`` narrowed by
+    ``lang``). If that comes back thin (fewer than ``RETRIEVAL_TOP_K`` hits) we
+    run the unconstrained search and top up from it — same-language chunks stay
+    first, the other language only backfills. This keeps retrieval Russian-first
+    while still falling back to Kazakh (or vice-versa) when the same-language KB
+    is sparse.
+    """
+    emb = await embeddings.embed_query(query)
+    if not lang:
+        return await _search(query_filter, emb.dense, emb.sparse_indices, emb.sparse_values)
+
+    same_lang = await _search(
+        vectorstore.with_lang(query_filter, lang),
+        emb.dense,
+        emb.sparse_indices,
+        emb.sparse_values,
+    )
+    if len(same_lang) >= settings.RETRIEVAL_TOP_K:
+        return same_lang
+
+    # Same-language retrieval was thin — fall back to the un-narrowed search and
+    # backfill with the other language's chunks (deduped, same-language first).
+    fallback = await _search(
+        query_filter, emb.dense, emb.sparse_indices, emb.sparse_values
+    )
+    seen = {id(c) for c in same_lang}
+    merged = list(same_lang)
+    for chunk in fallback:
+        if id(chunk) in seen:
+            continue
+        payload = chunk.get("payload") or {}
+        if payload.get("lang") == lang:
+            continue  # already covered by the same-language pass
+        merged.append(chunk)
+        if len(merged) >= settings.RETRIEVAL_TOP_K:
+            break
+    return merged
+
+
+async def _lab_grounding(
+    lab: Optional[dict],
+) -> tuple[Optional[str], bool, Any, Optional[str]]:
     """Resolve per-lab grounding from the structured ``lab`` context.
 
-    Returns ``(lab_instruction, lab_incomplete, query_filter)``:
+    Returns ``(lab_instruction, lab_incomplete, query_filter, lang)``:
       * ``lab_instruction`` — verbatim procedure text fetched from Qdrant by
         ``lab_id``, or None;
       * ``lab_incomplete`` — True when a specific lab was named (has ``lab_id``)
         but no instruction exists in the store;
-      * ``query_filter`` — scopes theory retrieval to the lab's subject.
+      * ``query_filter`` — scopes theory retrieval to the lab's subject (the
+        language-agnostic fallback filter);
+      * ``lang`` — the question's language ("ru"/"kk") from the lab context,
+        used to prefer same-language chunks during retrieval.
     """
     if not lab:
-        return None, False, None
+        return None, False, None, None
 
     query_filter = vectorstore.meta_filter(
         doc_type="textbook", subject=lab.get("subject")
     )
+    lang = lab.get("lang")
 
     lab_id = lab.get("lab_id")
     if not lab_id:
-        return None, False, query_filter
+        return None, False, query_filter, lang
 
     instruction = await vectorstore.fetch_lab_instruction(lab_id)
-    return (instruction or None), (not instruction), query_filter
+    return (instruction or None), (not instruction), query_filter, lang
 
 
 def _format_knowledge(chunks: list[dict]) -> str:
@@ -311,8 +360,8 @@ async def generate_answer(
     and injects the lab's procedure verbatim. Retries up to 3 times on
     transient timeout / upstream (5xx) errors.
     """
-    lab_instruction, lab_incomplete, query_filter = await _lab_grounding(lab)
-    chunks = await _retrieve(query, query_filter=query_filter)
+    lab_instruction, lab_incomplete, query_filter, lang = await _lab_grounding(lab)
+    chunks = await _retrieve(query, query_filter=query_filter, lang=lang)
     knowledge = _format_knowledge(chunks)
     system_prompt = build_system_prompt(
         scenario_context,
@@ -370,8 +419,8 @@ async def stream_answer(
     The route layer turns these into SSE frames. ``lab`` carries the same
     structured lab context as :func:`generate_answer`.
     """
-    lab_instruction, lab_incomplete, query_filter = await _lab_grounding(lab)
-    chunks = await _retrieve(query, query_filter=query_filter)
+    lab_instruction, lab_incomplete, query_filter, lang = await _lab_grounding(lab)
+    chunks = await _retrieve(query, query_filter=query_filter, lang=lang)
     knowledge = _format_knowledge(chunks)
     system_prompt = build_system_prompt(
         scenario_context,
