@@ -78,6 +78,99 @@ _WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
 _EPUB_TRUST_WORDS = 500
 _EPUB_MIN_WORDS = 50
 
+# OCR (opt-in, ingest-time only). Image members inside an EPUB and the language
+# mapping for Tesseract. Imports of pytesseract / pypdfium2 / PIL are deferred to
+# the OCR helpers so the serving path (and the test suite) never need them.
+_IMG_SRC_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def _tesseract_lang(lang: str | None) -> str:
+    """Map the corpus ``lang`` code to Tesseract model name(s)."""
+    return {"ru": "rus", "kk": "kaz"}.get(lang or "", "rus+kaz")
+
+
+def _ocr_image(image, lang: str) -> str:
+    """OCR a single PIL image with Tesseract (deferred import)."""
+    import pytesseract
+
+    return pytesseract.image_to_string(image, lang=lang)
+
+
+def _ocr_pdf(content: bytes, lang: str) -> str:
+    """Render a (scanned) PDF with pypdfium2 and OCR each page.
+
+    Pure-wheel rendering (no poppler): page -> bitmap -> PIL -> Tesseract.
+    """
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(content)
+    try:
+        n_pages = len(pdf)
+        max_pages = settings.OCR_MAX_PAGES or n_pages
+        scale = settings.OCR_DPI / 72.0  # pdfium renders at 72 dpi * scale
+        out: list[str] = []
+        for i in range(min(n_pages, max_pages)):
+            page = pdf[i]
+            bitmap = page.render(scale=scale)
+            image = bitmap.to_pil()
+            out.append(_ocr_image(image, lang))
+        return "\n".join(out)
+    finally:
+        pdf.close()
+
+
+def _epub_image_members(z: zipfile.ZipFile, names: list[str]) -> list[str]:
+    """EPUB image members in spine/reading order (fallback: all images, sorted).
+
+    Follows the spine documents (reusing :func:`_spine_docs` / :func:`_zip_join`)
+    and collects each ``<img src=…>`` member in reading order, de-duplicated.
+    When no spine images resolve, falls back to every image member by name.
+    """
+    member_set = set(names)
+    opf_path = _opf_path(z, names)
+    docs = _spine_docs(z, opf_path) if opf_path else []
+    docs = [d for d in docs if d in member_set]
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for doc in docs:
+        base = doc.rsplit("/", 1)[0] if "/" in doc else ""
+        try:
+            html = z.read(doc).decode("utf-8", "ignore")
+        except KeyError:
+            continue
+        for m in _IMG_SRC_RE.finditer(html):
+            member = _zip_join(base, m.group(1))
+            if member in member_set and member not in seen:
+                seen.add(member)
+                ordered.append(member)
+
+    if not ordered:
+        ordered = sorted(n for n in names if n.lower().endswith(_IMG_EXTS))
+    return ordered
+
+
+def _ocr_epub_images(content: bytes, lang: str) -> str:
+    """OCR the page-images of a scanned EPUB, in reading order."""
+    from PIL import Image
+
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        members = _epub_image_members(z, z.namelist())
+        max_pages = settings.OCR_MAX_PAGES or len(members)
+        out: list[str] = []
+        for name in members[:max_pages]:
+            try:
+                data = z.read(name)
+            except KeyError:
+                continue
+            try:
+                image = Image.open(io.BytesIO(data))
+                out.append(_ocr_image(image, lang))
+            except Exception as exc:  # noqa: BLE001 - skip an undecodable image
+                logger.warning("OCR skipped EPUB image '%s' (%s)", name, exc)
+        return "\n".join(out)
+
 
 def _doc_id(doc_key: str) -> str:
     """Stable document id for ``doc_key`` (re-ingest replaces in place).
@@ -197,13 +290,16 @@ def _epub_to_text(content: bytes) -> str:
     return "\n".join(out)
 
 
-def _extract_epub(filename: str, content: bytes) -> str:
+def _extract_epub(
+    filename: str, content: bytes, *, ocr: bool = False, lang: str | None = None
+) -> str:
     """EPUB -> text, resilient to markitdown silently extracting nothing.
 
     markitdown is tried first; when it returns suspiciously little text we
     re-parse the spine ourselves (:func:`_epub_to_text`) and keep whichever
-    yields more words. Genuinely image-only (scanned) EPUBs extract ~no words —
-    we log a clear warning naming the file and return ``""`` so the document is
+    yields more words. Genuinely image-only (scanned) EPUBs extract ~no words:
+    when ``ocr`` is set we OCR the page-images instead of skipping; otherwise we
+    log a clear warning naming the file and return ``""`` so the document is
     skipped (status ``empty``) rather than indexed as a few noise chunks. Those
     files are listed in the manifest as ``stub`` for the OCR decision.
     """
@@ -221,6 +317,17 @@ def _extract_epub(filename: str, content: bytes) -> str:
             best, best_words = spine, _count_words(spine)
 
     if best_words < _EPUB_MIN_WORDS:
+        if ocr:
+            tlang = _tesseract_lang(lang)
+            logger.info(
+                "EPUB '%s' is image-only (%d words); running OCR (lang=%s)",
+                filename, best_words, tlang,
+            )
+            ocr_text = _ocr_epub_images(content, tlang)
+            ocr_words = _count_words(ocr_text)
+            logger.info("OCR recovered %d words from EPUB '%s'", ocr_words, filename)
+            if ocr_words >= _EPUB_MIN_WORDS:
+                return ocr_text
         logger.warning(
             "EPUB '%s' yielded ~no extractable text (%d words) — likely "
             "image-only/scanned; skipping (needs OCR)",
@@ -231,13 +338,19 @@ def _extract_epub(filename: str, content: bytes) -> str:
     return best
 
 
-def to_markdown(filename: str, content: bytes) -> str:
+def to_markdown(
+    filename: str, content: bytes, *, ocr: bool = False, lang: str | None = None
+) -> str:
     """Normalise any supported document to Markdown / plain text.
 
     Tries markitdown first (best fidelity, incl. tables and EPUB); otherwise
     falls back to pypdf / python-docx / a tiny EPUB tag-stripper. ``.md`` /
     ``.txt`` pass through unchanged. Raises ``ValueError`` for unsupported
     extensions.
+
+    When ``ocr`` is set and a scanned EPUB/PDF extracts to ~no Cyrillic text, the
+    page-images are OCR'd (Tesseract, ``lang``-aware) instead of yielding nothing.
+    OCR is opt-in and ingest-time only; it is never invoked on the serving path.
     """
     suffix = Path(filename).suffix.lower()
 
@@ -254,15 +367,34 @@ def to_markdown(filename: str, content: bytes) -> str:
     # silently under-reads the spine on these textbooks), so handle it before the
     # generic markitdown attempt below.
     if suffix == ".epub":
-        return _extract_epub(filename, content)
+        return _extract_epub(filename, content, ocr=ocr, lang=lang)
 
     md = _markitdown(suffix, content)
-    if md is not None:
-        return md
 
     if suffix == ".pdf":
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        return "\n".join(p.extract_text() or "" for p in reader.pages)
+        if md is not None:
+            text = md
+        else:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        # Scanned PDFs extract ~no Cyrillic words; OCR the rendered pages when
+        # asked, keeping the result only if it actually recovered more text.
+        if ocr and _count_words(text) < _EPUB_MIN_WORDS:
+            tlang = _tesseract_lang(lang)
+            logger.info(
+                "PDF '%s' has ~no text (%d words); running OCR (lang=%s)",
+                filename, _count_words(text), tlang,
+            )
+            ocr_text = _ocr_pdf(content, tlang)
+            logger.info(
+                "OCR recovered %d words from PDF '%s'", _count_words(ocr_text), filename
+            )
+            if _count_words(ocr_text) > _count_words(text):
+                return ocr_text
+        return text
+
+    if md is not None:
+        return md
 
     if suffix == ".docx":
         document = docx.Document(io.BytesIO(content))
@@ -309,6 +441,7 @@ async def upload_document(
     content: bytes,
     metadata: dict | None = None,
     doc_key: str | None = None,
+    ocr: bool = False,
     **_,
 ) -> dict:
     """Convert to Markdown, chunk, embed and upsert one document into Qdrant.
@@ -335,7 +468,8 @@ async def upload_document(
 
     key = doc_key or filename
     doc_id = _doc_id(key)
-    text = to_markdown(filename, content)
+    lang = (metadata or {}).get("lang")
+    text = to_markdown(filename, content, ocr=ocr, lang=lang)
     chunks = _chunk_text(text)
     if not chunks:
         # No usable text (e.g. an image-only/scanned EPUB we now skip). Drop any
@@ -391,12 +525,19 @@ def iter_corpus_files(root: str) -> list[Path]:
     )
 
 
-async def bulk_ingest_tree(root: str) -> dict:
+async def bulk_ingest_tree(
+    root: str, *, ocr: bool = False, only: str | None = None
+) -> dict:
     """Walk ``root``, derive metadata from each path and ingest every file.
 
-    Returns a summary ``{root, total, ready, empty, skipped, errors, documents}``.
+    Returns a summary
+    ``{root, total, ready, empty, skipped, filtered, errors, documents}``.
     Files whose path is not under a recognised corpus tier are skipped (logged).
-    Per-file failures are collected rather than aborting the whole run.
+    ``only`` keeps the ingest root (so doc_ids stay stable) but restricts the run
+    to files whose path contains that substring — used to OCR just one subtree
+    (e.g. ``Биология/рус``) without re-embedding the whole corpus. ``ocr`` enables
+    the scanned-document OCR fallback (see :func:`to_markdown`). Per-file failures
+    are collected rather than aborting the whole run.
     """
     files = iter_corpus_files(root)
     summary = {
@@ -405,10 +546,14 @@ async def bulk_ingest_tree(root: str) -> dict:
         "ready": 0,
         "empty": 0,
         "skipped": 0,
+        "filtered": 0,
         "errors": [],
         "documents": [],
     }
     for path in files:
+        if only and only not in str(path):
+            summary["filtered"] += 1
+            continue
         meta = corpus_meta.parse_path(str(path), corpus_root=root)
         if meta is None:
             summary["skipped"] += 1
@@ -416,7 +561,7 @@ async def bulk_ingest_tree(root: str) -> dict:
             continue
         try:
             result = await upload_document(
-                path.name, path.read_bytes(), metadata=meta, doc_key=meta["source"]
+                path.name, path.read_bytes(), metadata=meta, doc_key=meta["source"], ocr=ocr
             )
         except Exception as exc:  # noqa: BLE001 - keep going, record the failure
             summary["errors"].append({"source": meta["source"], "error": str(exc)})
@@ -425,8 +570,9 @@ async def bulk_ingest_tree(root: str) -> dict:
         summary["ready" if result["status"] == "ready" else "empty"] += 1
         summary["documents"].append({**meta, **result})
     logger.info(
-        "Bulk ingest of %s: %d ready, %d empty, %d skipped, %d errors",
-        root, summary["ready"], summary["empty"], summary["skipped"], len(summary["errors"]),
+        "Bulk ingest of %s: %d ready, %d empty, %d skipped, %d filtered, %d errors",
+        root, summary["ready"], summary["empty"], summary["skipped"],
+        summary["filtered"], len(summary["errors"]),
     )
     return summary
 

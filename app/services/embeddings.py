@@ -101,15 +101,8 @@ def _parse_embedding(item: Any) -> Embedding:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-async def embed_texts(texts: list[str]) -> list[Embedding]:
-    """Embed a batch of texts via the sidecar, preserving input order.
-
-    Returns one ``Embedding`` per input. An empty input list short-circuits
-    without an HTTP call.
-    """
-    if not texts:
-        return []
-
+async def _embed_batch(texts: list[str]) -> list[Embedding]:
+    """Embed one batch (a single sidecar request), preserving order."""
     try:
         response = await _http().post("/embed", json={"inputs": texts})
         response.raise_for_status()
@@ -126,6 +119,28 @@ async def embed_texts(texts: list[str]) -> list[Embedding]:
         )
 
     return [_parse_embedding(item) for item in embeddings]
+
+
+async def embed_texts(texts: list[str]) -> list[Embedding]:
+    """Embed a batch of texts via the sidecar, preserving input order.
+
+    Returns one ``Embedding`` per input. An empty input list short-circuits
+    without an HTTP call. Large inputs are split into ``EMBED_BATCH_SIZE`` chunks
+    and sent in separate requests (the embedder GPU OOMs / the request times out
+    if an 800-chunk document is posted in one shot); results are concatenated in
+    the original order. ``EMBED_BATCH_SIZE <= 0`` sends everything in one request.
+    """
+    if not texts:
+        return []
+
+    batch_size = settings.EMBED_BATCH_SIZE
+    if batch_size <= 0:
+        batch_size = len(texts)
+
+    out: list[Embedding] = []
+    for start in range(0, len(texts), batch_size):
+        out.extend(await _embed_batch(texts[start : start + batch_size]))
+    return out
 
 
 async def embed_query(text: str) -> Embedding:

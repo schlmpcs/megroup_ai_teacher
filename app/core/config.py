@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # Sidecar exposes POST /embed returning dense + sparse vectors.
     EMBEDDING_BASE_URL: str = "http://localhost:8080"
     EMBEDDING_DIM: int = 1024
+    # Chunks are embedded in batches of this size (one HTTP call per batch) so a
+    # single huge document can't blow REQUEST_TIMEOUT_S in one giant request.
+    # <=0 sends everything in a single request (the old behaviour).
+    EMBED_BATCH_SIZE: int = 64
 
     # ── Hybrid retrieval (dense + sparse, RRF fusion) ────────────────────────
     RETRIEVAL_TOP_K: int = 5          # chunks injected into the prompt
@@ -61,6 +65,17 @@ class Settings(BaseSettings):
     # written. Metadata (subject/grade/lang/lab_id) is derived from the paths.
     CORPUS_ROOT: str = "./Лабораторные физхимбио"
     LABS_MANIFEST: str = "./labs.json"
+
+    # ── OCR fallback (opt-in; ingest-time only, server-side) ─────────────────
+    # Some textbooks are scanned page-images with no text layer (e.g. the RU
+    # biology 7/8/9 EPUBs). When OCR_ENABLED *and* normal extraction yields ~no
+    # Cyrillic text, ingestion renders the pages and runs Tesseract (rus/kaz)
+    # instead of skipping. OFF by default so plain bulk-ingest never shells out
+    # to Tesseract and the serving path is untouched. OCR_DPI is the PDF render
+    # resolution; OCR_MAX_PAGES caps pages per document (0 = all).
+    OCR_ENABLED: bool = False
+    OCR_DPI: int = 200
+    OCR_MAX_PAGES: int = 0
 
     # ── Voice (in-repo STT/TTS sidecar; see ./voice) ─────────────────────────
     # The GPU `voice` container (docker-compose service) serves STT (Whisper
@@ -85,7 +100,7 @@ class Settings(BaseSettings):
 
     # ── CORS / limits ────────────────────────────────────────────────────────
     CORS_ORIGINS: str = "*"
-    RATE_LIMIT_PER_MINUTE: int = 60
+    RATE_LIMIT_PER_MINUTE: int = 60  # per client IP; <=0 disables rate limiting
     MAX_UPLOAD_BYTES: int = 26_214_400  # 25 MB — OpenAI per-file ceiling for STT.
 
     # ── Runtime toggles ──────────────────────────────────────────────────────

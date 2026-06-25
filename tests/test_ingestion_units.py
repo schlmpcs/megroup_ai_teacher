@@ -182,7 +182,7 @@ def test_empty_document_removes_stale_chunks(monkeypatch):
     async def fake_embed(_chunks):
         raise AssertionError("embed_texts must not run for an empty document")
 
-    monkeypatch.setattr(ingestion, "to_markdown", lambda f, c: "")
+    monkeypatch.setattr(ingestion, "to_markdown", lambda f, c, **k: "")
     monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", fake_ensure)
     monkeypatch.setattr(ingestion.vectorstore, "delete_document", fake_delete)
     monkeypatch.setattr(ingestion.embeddings, "embed_texts", fake_embed)

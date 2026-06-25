@@ -16,6 +16,15 @@ markitdown[all]>=0.0.1a2 # normalise pdf/docx/epub/xlsx -> Markdown before chunk
                          # markitdown raises MissingDependency and we silently
                          # fall back to pypdf/python-docx/a crude epub stripper.
 
+# ── OCR (opt-in, ingest-time only; see OCR_ENABLED) ──────────────────────────
+# Scanned/image-only textbooks (e.g. RU biology 7/8/9) have no text layer; we
+# render the pages and OCR them with Tesseract. pypdfium2 is a pure wheel (no
+# poppler); the Tesseract *binary* + rus/kaz language data are installed in the
+# Docker image (see Dockerfile), not via pip.
+pytesseract>=0.3.10     # thin wrapper around the tesseract CLI
+pypdfium2>=4.0.0        # pure-wheel PDF page rendering (no poppler)
+Pillow>=10.0.0          # image handling for OCR input
+
 # ── Dev / tests ────────────────────────────────────────────────────────────
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

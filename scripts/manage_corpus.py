@@ -63,13 +63,13 @@ async def _delete(doc_id: str) -> None:
     print("deleted" if ok else "not found", doc_id)
 
 
-async def _bulk_ingest(root: str) -> None:
-    summary = await ingestion.bulk_ingest_tree(root)
+async def _bulk_ingest(root: str, ocr: bool = False, only: str | None = None) -> None:
+    summary = await ingestion.bulk_ingest_tree(root, ocr=ocr, only=only)
     print(
         f"Bulk ingest of {summary['root']}: "
         f"{summary['ready']} ready, {summary['empty']} empty, "
-        f"{summary['skipped']} skipped, {len(summary['errors'])} errors "
-        f"(of {summary['total']} files)"
+        f"{summary['skipped']} skipped, {summary.get('filtered', 0)} filtered, "
+        f"{len(summary['errors'])} errors (of {summary['total']} files)"
     )
     for err in summary["errors"]:
         print(f"  ERROR  {err['source']}: {err['error']}", file=sys.stderr)
@@ -98,6 +98,17 @@ def main() -> None:
 
     p_bulk = sub.add_parser("bulk-ingest", help="Walk a corpus tree and ingest all files")
     p_bulk.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
+    p_bulk.add_argument(
+        "--ocr",
+        action="store_true",
+        help="OCR scanned/image-only PDFs & EPUBs (server-side, opt-in; needs Tesseract)",
+    )
+    p_bulk.add_argument(
+        "--only",
+        default=None,
+        help="Only ingest files whose path contains this substring "
+        "(keeps the root so doc_ids stay stable, e.g. --only 'Биология/рус')",
+    )
 
     p_manifest = sub.add_parser("gen-manifest", help="Report lab completeness (no embedding)")
     p_manifest.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
@@ -116,7 +127,7 @@ def main() -> None:
     elif args.cmd == "upload":
         asyncio.run(_upload(args.paths))
     elif args.cmd == "bulk-ingest":
-        asyncio.run(_bulk_ingest(args.root))
+        asyncio.run(_bulk_ingest(args.root, ocr=args.ocr, only=args.only))
     elif args.cmd == "gen-manifest":
         _gen_manifest(args.root, args.out)
     elif args.cmd == "list":
