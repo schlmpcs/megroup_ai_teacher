@@ -1,23 +1,25 @@
-"""Voice I/O via the self-hosted STT/TTS sidecar (see ../vrrag_ttsstt).
+"""Voice I/O via the in-repo STT/TTS sidecar (the ``voice`` service, ./voice).
 
-Both speech-to-text and text-to-speech are served by a separate GPU container
-that exposes a plain HTTP API — the same service the sibling project uses:
+Both speech-to-text and text-to-speech are served by a GPU container vendored
+into this repo (``./voice``, formerly the standalone ``../vrrag_ttsstt``) that
+exposes a plain HTTP API:
 
   STT: POST {VOICE_BASE_URL}/stt/recognize   (multipart: audio file + language)
        -> {"text": "...", "language": "ru", "confidence": null, "duration_ms": N}
   TTS: POST {VOICE_BASE_URL}/tts/synthesize?format=wav   (json: text/language/speed)
        -> audio/wav bytes
 
-STT runs a multilingual Whisper (ru/kk/auto); TTS runs MMS/Silero. There is a
-single fixed voice and language control only — the cloud-era ``voice`` /
-``instructions`` / ``response_format`` knobs no longer apply and are accepted
-only for backward-compatible call signatures.
+STT runs a multilingual Whisper (ru/kk/auto); TTS runs supertonic (ru) / MMS
+(kaz). There is a single fixed voice and language control only — the cloud-era
+``voice`` / ``instructions`` / ``response_format`` knobs no longer apply and are
+accepted only for backward-compatible call signatures.
 
 This module mirrors ``embeddings.py``: a lazy shared ``httpx.AsyncClient`` and
 upstream failures mapped onto the shared ``LLMError`` family so routes translate
-them to HTTP status codes uniformly (see app/services/errors.py). The sidecar
-uses a self-signed certificate, so TLS verification is governed by
-``VOICE_VERIFY_SSL`` (off by default).
+them to HTTP status codes uniformly (see app/services/errors.py). Under docker
+compose the sidecar is reached over plain HTTP on the internal network
+(``http://voice:8001``), so ``VOICE_VERIFY_SSL`` is moot but kept for the client
+(and for any external HTTPS deployment).
 """
 
 import logging

@@ -9,12 +9,15 @@ services:
       - SCENARIOS_DIR=/app/scenarios
       - QDRANT_URL=http://qdrant:6333
       - EMBEDDING_BASE_URL=http://embedder:8080
+      # In-repo voice sidecar over the internal compose network (plain HTTP).
+      - VOICE_BASE_URL=http://voice:8001
     volumes:
       # Mount scenarios so lab descriptions can be edited without a rebuild.
       - ./scenarios:/app/scenarios:ro
     depends_on:
       - qdrant
       - embedder
+      - voice
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/health'); "]
@@ -56,6 +59,34 @@ services:
       retries: 3
       start_period: 180s
 
+  # GPU STT/TTS sidecar (in-repo; formerly the external ../vrrag_ttsstt service).
+  # STT = Whisper large-v3-turbo (ru/kk/auto, + kk LoRA); TTS = supertonic ru +
+  # MMS kaz. Requires the NVIDIA Container Toolkit on the host. Listens on 8001
+  # internally; the api reaches it at http://voice:8001 over plain HTTP. First
+  # boot downloads several GB of models into the voice_hf_cache volume.
+  voice:
+    build: ./voice
+    ports:
+      # Host-mapped for direct testing; the api uses the internal 8001 port.
+      - "8002:8001"
+    volumes:
+      - voice_hf_cache:/models/hf_cache
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8001/health'); "]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
 volumes:
   qdrant_data:
   hf_cache:
+  voice_hf_cache:

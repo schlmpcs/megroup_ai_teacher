@@ -62,11 +62,13 @@ class Settings(BaseSettings):
     CORPUS_ROOT: str = "./Лабораторные физхимбио"
     LABS_MANIFEST: str = "./labs.json"
 
-    # ── Voice (self-hosted STT/TTS sidecar; see ../vrrag_ttsstt) ─────────────
-    # A separate GPU container serves STT (Whisper ru/kk/auto) and TTS
-    # (MMS/Silero ru/kk) over HTTP. The sidecar uses a self-signed cert, so TLS
-    # verification is off by default. STT/TTS language follows DEFAULT_LANGUAGE.
-    VOICE_BASE_URL: str = "https://localhost:8002"
+    # ── Voice (in-repo STT/TTS sidecar; see ./voice) ─────────────────────────
+    # The GPU `voice` container (docker-compose service) serves STT (Whisper
+    # ru/kk/auto) and TTS (supertonic ru + MMS kaz) over plain HTTP. In compose
+    # the api reaches it at http://voice:8001; the default below targets the
+    # host-mapped port for local dev. STT/TTS language follows DEFAULT_LANGUAGE.
+    # VOICE_VERIFY_SSL is irrelevant over internal HTTP but kept for the client.
+    VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False
     VOICE_TIMEOUT_S: float = 120.0  # generous: covers GPU cold start + ≤120s audio
 

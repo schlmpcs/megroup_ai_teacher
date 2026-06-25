@@ -1,23 +1,24 @@
 # CLAUDE.md
-
+dont coauthor commits
 ## Repo Purpose
-
 Thin, stateless FastAPI proxy putting an AI assistant inside a school VR lab
 simulator (physics / chemistry / biology). Retrieval is now **local + hybrid**:
 the knowledge base lives in a self-hosted **Qdrant** vector store, queried with
 a local **BAAI/bge-m3** GPU embedder (dense + learned-sparse, fused by RRF).
-Voice (STT/TTS) is now also **local**: a self-hosted GPU sidecar (Whisper
-ru/kk/auto + MMS/Silero ru/kk — the `../vrrag_ttsstt` service) reached over HTTP.
+Voice (STT/TTS) is now also **local**: an in-repo GPU sidecar (Whisper
+ru/kk/auto + supertonic ru / MMS kaz — the `voice` compose service in `./voice`,
+vendored from the former `../vrrag_ttsstt`) reached over HTTP.
 Only generation (answers/hints) still uses **OpenAI cloud** (Responses API).
 Scenario context is injected from local JSON.
 
 So this repo self-hosts the vector DB + embedder + voice, and keeps only the LLM
 in the cloud — a hybrid of "everything OpenAI" and "everything local".
 
-Sibling reference projects: `../vrrag_dreamlab` (same idea, but fully self-hosted
-Postgres/pgvector + local embeddings + vLLM) and `../vrrag_ttsstt` (the STT/TTS
-sidecar this repo's voice layer now calls). We share the local-retrieval and
-local-voice halves and differ only in keeping the LLM on OpenAI.
+Sibling reference project: `../vrrag_dreamlab` (same idea, but fully self-hosted
+Postgres/pgvector + local embeddings + vLLM). The STT/TTS service that this
+repo's voice layer calls is now vendored in-repo under `./voice` (originally the
+standalone `../vrrag_ttsstt`). We share the local-retrieval and local-voice
+halves and differ only in keeping the LLM on OpenAI.
 
 ## Layout
 
@@ -35,10 +36,11 @@ app/
     errors.py             # LLMError family (LLMTimeoutError / LLMUpstreamError / LLMMalformedResponseError)
     scenarios.py          # load+format per-lab JSON into the system prompt
     corpus_meta.py        # derive subject/grade/lang/lab_id metadata from corpus paths
-    voice.py              # httpx client to the local STT/TTS sidecar (../vrrag_ttsstt)
+    voice.py              # httpx client to the in-repo STT/TTS sidecar (./voice)
     ingestion.py          # to_markdown -> chunk+embed (PDF/DOCX/EPUB/TXT/MD) -> Qdrant; bulk ingest + manifest
     memory.py             # request-scoped chat-history trimming
 embedder/                 # GPU sidecar container (FlagEmbedding BGEM3FlagModel, RTX 3060 / sm_86)
+voice/                    # GPU STT/TTS sidecar container (Whisper + supertonic/MMS); vendored from ../vrrag_ttsstt
 scripts/manage_corpus.py  # CLI: create-collection / upload / bulk-ingest / gen-manifest / list / status / delete
 scenarios/*.json          # one file per lab; filename stem == scenario_id
 tests/                    # pytest, OpenAI + Qdrant + embedder mocked (no network)
@@ -77,7 +79,8 @@ routes.py
   `vectorstore`/`embeddings`/`voice` (each a lazy `httpx.AsyncClient`, failures
   mapped onto the same `LLMError` family) and patched the same way in tests.
   Voice no longer touches OpenAI — `voice.transcribe`/`voice.synthesize` POST to
-  the `../vrrag_ttsstt` sidecar (`VOICE_BASE_URL`, self-signed TLS, WAV out).
+  the in-repo `voice` sidecar (`./voice`, the `voice` compose service) at
+  `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out).
 - Responses API param is `max_output_tokens` (not `max_tokens`).
 - Qdrant collection has one point per chunk with two named vectors: `dense`
   (1024-d, cosine — `EMBEDDING_DIM`) and `sparse` (learned-sparse from bge-m3).
@@ -129,9 +132,10 @@ uvicorn app.main:app --reload --port 8000
 python -m scripts.manage_corpus status        # Qdrant collection status
 python -m scripts.manage_corpus gen-manifest  # labs.json (no embedding; offline)
 python -m scripts.manage_corpus bulk-ingest   # walk CORPUS_ROOT, tag+embed all files
-docker compose up --build                     # api + qdrant + embedder
+docker compose up --build                     # api + qdrant + embedder + voice
 ```
 
-`docker compose up --build` brings up three services: `api`, `qdrant`, and the
-`embedder` GPU sidecar (needs the NVIDIA Container Toolkit; first boot downloads
-bge-m3, so it's slow).
+`docker compose up --build` brings up four services: `api`, `qdrant`, the
+`embedder` GPU sidecar, and the `voice` GPU STT/TTS sidecar (both need the NVIDIA
+Container Toolkit; the embedder and voice share the single GPU, and first boot
+downloads bge-m3 + Whisper/TTS models, so it's slow).
