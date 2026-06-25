@@ -338,12 +338,21 @@ async def upload_document(
     text = to_markdown(filename, content)
     chunks = _chunk_text(text)
     if not chunks:
-        logger.info("Ingested '%s' -> doc_id=%s status=empty (no text)", key, doc_id)
+        # No usable text (e.g. an image-only/scanned EPUB we now skip). Drop any
+        # chunks a previous ingest stored for this document so stale noise does
+        # not linger in the index — re-ingest must leave it genuinely empty.
+        removed = await vectorstore.delete_document(doc_id)
+        logger.info(
+            "Ingested '%s' -> doc_id=%s status=empty (no text%s)",
+            key, doc_id, "; removed stale chunks" if removed else "",
+        )
         return {"file_id": doc_id, "filename": filename, "status": "empty", "chunks": 0}
 
     embeddings_list = await embeddings.embed_texts(chunks)
 
-    # Replace semantics: drop any existing chunks for this document first.
+    # Replace semantics: drop any existing chunks for this document first. This
+    # runs only after a successful embed, so a transient embedder failure leaves
+    # the previously-indexed chunks intact rather than wiping the document.
     await vectorstore.delete_document(doc_id)
 
     base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}

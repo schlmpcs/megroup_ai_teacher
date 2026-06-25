@@ -163,3 +163,33 @@ def test_html_to_text_drops_script_and_style():
     assert "Привет" in out
     assert "alert" not in out
     assert "{x}" not in out
+
+
+def test_empty_document_removes_stale_chunks(monkeypatch):
+    # A doc that now extracts to nothing (image-only EPUB) must delete any
+    # chunks a previous ingest left behind, and must not call the embedder.
+    import asyncio
+
+    deleted: list[str] = []
+
+    async def fake_ensure():
+        return None
+
+    async def fake_delete(doc_id):
+        deleted.append(doc_id)
+        return True
+
+    async def fake_embed(_chunks):
+        raise AssertionError("embed_texts must not run for an empty document")
+
+    monkeypatch.setattr(ingestion, "to_markdown", lambda f, c: "")
+    monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", fake_ensure)
+    monkeypatch.setattr(ingestion.vectorstore, "delete_document", fake_delete)
+    monkeypatch.setattr(ingestion.embeddings, "embed_texts", fake_embed)
+
+    result = asyncio.run(
+        ingestion.upload_document("Биология 7 класс.epub", b"x", doc_key="bio7")
+    )
+    assert result["status"] == "empty"
+    assert result["chunks"] == 0
+    assert deleted == [ingestion._doc_id("bio7")]
