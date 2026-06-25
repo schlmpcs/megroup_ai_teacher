@@ -229,3 +229,95 @@ async def test_generate_answer_uses_retrieved_citations(monkeypatch):
     assert result.answer == "Вода кипит при 100 градусах."
     assert result.citations == [{"filename": "physics_8.pdf", "file_id": "d1"}]
     assert result.usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
+
+
+# ── grade-scoped theory retrieval (with subject-only fallback) ────────────────
+
+
+def _filter_conditions(flt) -> dict:
+    """Flatten a Qdrant ``models.Filter`` into a ``{key: value}`` dict."""
+    if flt is None:
+        return {}
+    return {c.key: c.match.value for c in (getattr(flt, "must", None) or [])}
+
+
+async def test_lab_grounding_scopes_theory_to_grade(monkeypatch):
+    """A grade-7 lab must build a grade-scoped primary filter + subject fallback."""
+
+    async def _fetch_lab_instruction(lab_id):
+        return ""  # incomplete lab — exercises the no-instruction branch too
+
+    monkeypatch.setattr(
+        llm.vectorstore, "fetch_lab_instruction", _fetch_lab_instruction
+    )
+
+    lab = {
+        "subject": "physics",
+        "grade": 7,
+        "lang": "ru",
+        "lab_id": "physics-7-ru-02",
+    }
+    _, lab_incomplete, query_filter, lang, fallback_filter = await llm._lab_grounding(lab)
+
+    assert lab_incomplete is True
+    assert lang == "ru"
+    # Primary scope pins subject AND grade — this is the whole point of the fix.
+    assert _filter_conditions(query_filter) == {
+        "doc_type": "textbook",
+        "subject": "physics",
+        "grade": 7,
+    }
+    # Fallback drops grade so retrieval can degrade to subject-only.
+    assert _filter_conditions(fallback_filter) == {
+        "doc_type": "textbook",
+        "subject": "physics",
+    }
+
+
+async def test_retrieve_falls_back_to_subject_when_grade_thin(monkeypatch):
+    """Grade-scoped retrieval that comes back thin is topped up subject-wide."""
+
+    async def _embed_query(text):
+        return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
+
+    calls: list[dict] = []
+
+    grade7_chunk = {
+        "score": 0.9,
+        "payload": {"doc_id": "g7", "chunk_index": 0, "filename": "Физика 7 кл.pdf",
+                    "grade": 7, "lang": "ru", "text": "d = L/N"},
+    }
+    subject_chunk = {
+        "score": 0.5,
+        "payload": {"doc_id": "g10", "chunk_index": 0, "filename": "Физика 10кл.PDF",
+                    "grade": 10, "lang": "ru", "text": "погрешность измерения"},
+    }
+
+    async def _hybrid_search(dense, sparse_indices, sparse_values, top_k,
+                             candidates, query_filter=None):
+        conds = _filter_conditions(query_filter)
+        calls.append(conds)
+        # Grade-scoped passes return only the one (thin) grade-7 chunk;
+        # subject-only passes additionally surface the high-school chunk.
+        if conds.get("grade") == 7:
+            return [grade7_chunk]
+        return [grade7_chunk, subject_chunk]
+
+    monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
+    monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
+    monkeypatch.setattr(llm.settings, "RETRIEVAL_TOP_K", 2, raising=False)
+    monkeypatch.setattr(llm.settings, "RETRIEVAL_SCORE_THRESHOLD", 0.0, raising=False)
+
+    _, _, query_filter, lang, fallback_filter = await llm._lab_grounding(
+        {"subject": "physics", "grade": 7, "lang": "ru"}
+    )
+    chunks = await llm._retrieve(
+        "метод рядов", query_filter=query_filter, lang=lang,
+        fallback_filter=fallback_filter,
+    )
+
+    # Grade-7 chunk first (preferred), high-school chunk only backfilled, deduped.
+    assert [c["payload"]["doc_id"] for c in chunks] == ["g7", "g10"]
+    # The narrow grade+lang scope was tried before the broader subject scope.
+    assert calls[0].get("grade") == 7 and calls[0].get("lang") == "ru"
+    assert any("grade" not in c for c in calls)

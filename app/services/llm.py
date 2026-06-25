@@ -156,85 +156,123 @@ async def _search(query_filter: Any, dense, sparse_indices, sparse_values) -> li
     return chunks
 
 
+def _dedup_key(chunk: dict) -> Any:
+    """Stable identity for a retrieved chunk (document + position).
+
+    Used to dedupe across retrieval tiers, which return freshly-built dicts (so
+    ``id()`` can't match). ``(doc_id, chunk_index)`` is unique per chunk.
+    """
+    payload = chunk.get("payload") or {}
+    return (payload.get("doc_id"), payload.get("chunk_index"))
+
+
 async def _retrieve(
-    query: str, query_filter: Any = None, lang: Optional[str] = None
+    query: str,
+    query_filter: Any = None,
+    lang: Optional[str] = None,
+    fallback_filter: Any = None,
 ) -> list[dict]:
     """Embed the query and hybrid-search the local Qdrant knowledge base.
 
     Returns a list of scored chunks (``{"score", "payload"}``). Chunks scoring
-    below ``RETRIEVAL_SCORE_THRESHOLD`` are dropped. ``query_filter`` (optional)
-    scopes the search to a metadata subset (e.g. physics theory only); it is
-    only forwarded when set so existing call sites/tests keep their signature.
+    below ``RETRIEVAL_SCORE_THRESHOLD`` are dropped.
 
-    When ``lang`` is known (the question's language from the lab context), we
-    first search same-language chunks only (``query_filter`` narrowed by
-    ``lang``). If that comes back thin (fewer than ``RETRIEVAL_TOP_K`` hits) we
-    run the unconstrained search and top up from it — same-language chunks stay
-    first, the other language only backfills. This keeps retrieval Russian-first
-    while still falling back to Kazakh (or vice-versa) when the same-language KB
-    is sparse.
+    Retrieval is tiered from the most- to the least-specific scope, deduped, and
+    stops once ``RETRIEVAL_TOP_K`` chunks are gathered:
+
+      * ``query_filter`` is the narrow scope (e.g. subject **and** grade) —
+        right-grade chapters hold the worked examples with the actual
+        numbers/formulas the answer needs.
+      * ``fallback_filter`` (optional) is the broader scope (e.g. subject-only),
+        used to backfill when the narrow scope comes back thin. Several
+        grade-specific chapters are missing/poorly-OCR'd, so a hard narrow
+        filter alone would turn those into refusals — the broader scope keeps
+        them answerable.
+      * within each scope, when ``lang`` is known we prefer same-language chunks
+        first, then any language.
+
+    This keeps retrieval grade- and language-targeted while degrading gracefully
+    to the subject (and the other language) when the targeted KB is sparse.
     """
     emb = await embeddings.embed_query(query)
-    if not lang:
-        return await _search(query_filter, emb.dense, emb.sparse_indices, emb.sparse_values)
 
-    same_lang = await _search(
-        vectorstore.with_lang(query_filter, lang),
-        emb.dense,
-        emb.sparse_indices,
-        emb.sparse_values,
-    )
-    if len(same_lang) >= settings.RETRIEVAL_TOP_K:
-        return same_lang
+    # Ordered scopes, narrowest first. Only add the broader fallback when it is
+    # genuinely broader than ``query_filter`` (i.e. a grade was supplied), so we
+    # don't run a duplicate search when no grade narrowing is in play.
+    bases = [query_filter]
+    if fallback_filter is not None:
+        bases.append(fallback_filter)
 
-    # Same-language retrieval was thin — fall back to the un-narrowed search and
-    # backfill with the other language's chunks (deduped, same-language first).
-    fallback = await _search(
-        query_filter, emb.dense, emb.sparse_indices, emb.sparse_values
-    )
-    seen = {id(c) for c in same_lang}
-    merged = list(same_lang)
-    for chunk in fallback:
-        if id(chunk) in seen:
-            continue
-        payload = chunk.get("payload") or {}
-        if payload.get("lang") == lang:
-            continue  # already covered by the same-language pass
-        merged.append(chunk)
+    tiers: list[Any] = []
+    for base in bases:
+        if lang:
+            tiers.append(vectorstore.with_lang(base, lang))
+        tiers.append(base)
+
+    merged: list[dict] = []
+    seen: set = set()
+    for tier in tiers:
+        chunks = await _search(tier, emb.dense, emb.sparse_indices, emb.sparse_values)
+        for chunk in chunks:
+            key = _dedup_key(chunk)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(chunk)
         if len(merged) >= settings.RETRIEVAL_TOP_K:
             break
-    return merged
+    return merged[: settings.RETRIEVAL_TOP_K]
 
 
 async def _lab_grounding(
     lab: Optional[dict],
-) -> tuple[Optional[str], bool, Any, Optional[str]]:
+) -> tuple[Optional[str], bool, Any, Optional[str], Any]:
     """Resolve per-lab grounding from the structured ``lab`` context.
 
-    Returns ``(lab_instruction, lab_incomplete, query_filter, lang)``:
+    Returns ``(lab_instruction, lab_incomplete, query_filter, lang,
+    fallback_filter)``:
       * ``lab_instruction`` — verbatim procedure text fetched from Qdrant by
         ``lab_id``, or None;
       * ``lab_incomplete`` — True when a specific lab was named (has ``lab_id``)
         but no instruction exists in the store;
-      * ``query_filter`` — scopes theory retrieval to the lab's subject (the
-        language-agnostic fallback filter);
+      * ``query_filter`` — scopes theory retrieval to the lab's subject **and**
+        grade, so a grade-7 question gets the grade-7 worked examples (with the
+        real numbers) rather than generic high-school prose;
       * ``lang`` — the question's language ("ru"/"kk") from the lab context,
-        used to prefer same-language chunks during retrieval.
+        used to prefer same-language chunks during retrieval;
+      * ``fallback_filter`` — the broader subject-only scope ``_retrieve`` falls
+        back to when the grade-scoped KB is thin (set only when a grade is
+        known). Grade chapters are sometimes missing/poorly-OCR'd, so we never
+        hard-filter on grade alone.
     """
     if not lab:
-        return None, False, None, None
+        return None, False, None, None, None
 
+    subject = lab.get("subject")
+    grade = lab.get("grade")
     query_filter = vectorstore.meta_filter(
-        doc_type="textbook", subject=lab.get("subject")
+        doc_type="textbook", subject=subject, grade=grade
+    )
+    # Subject-only backstop, used only when a grade actually narrowed the scope.
+    fallback_filter = (
+        vectorstore.meta_filter(doc_type="textbook", subject=subject)
+        if grade is not None
+        else None
     )
     lang = lab.get("lang")
 
     lab_id = lab.get("lab_id")
     if not lab_id:
-        return None, False, query_filter, lang
+        return None, False, query_filter, lang, fallback_filter
 
     instruction = await vectorstore.fetch_lab_instruction(lab_id)
-    return (instruction or None), (not instruction), query_filter, lang
+    return (
+        (instruction or None),
+        (not instruction),
+        query_filter,
+        lang,
+        fallback_filter,
+    )
 
 
 def _format_knowledge(chunks: list[dict]) -> str:
@@ -360,8 +398,12 @@ async def generate_answer(
     and injects the lab's procedure verbatim. Retries up to 3 times on
     transient timeout / upstream (5xx) errors.
     """
-    lab_instruction, lab_incomplete, query_filter, lang = await _lab_grounding(lab)
-    chunks = await _retrieve(query, query_filter=query_filter, lang=lang)
+    lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
+        await _lab_grounding(lab)
+    )
+    chunks = await _retrieve(
+        query, query_filter=query_filter, lang=lang, fallback_filter=fallback_filter
+    )
     knowledge = _format_knowledge(chunks)
     system_prompt = build_system_prompt(
         scenario_context,
@@ -419,8 +461,12 @@ async def stream_answer(
     The route layer turns these into SSE frames. ``lab`` carries the same
     structured lab context as :func:`generate_answer`.
     """
-    lab_instruction, lab_incomplete, query_filter, lang = await _lab_grounding(lab)
-    chunks = await _retrieve(query, query_filter=query_filter, lang=lang)
+    lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
+        await _lab_grounding(lab)
+    )
+    chunks = await _retrieve(
+        query, query_filter=query_filter, lang=lang, fallback_filter=fallback_filter
+    )
     knowledge = _format_knowledge(chunks)
     system_prompt = build_system_prompt(
         scenario_context,
