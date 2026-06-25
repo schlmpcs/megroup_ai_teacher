@@ -1,3 +1,10 @@
-FlagEmbedding>=1.2.10
+# Pin FlagEmbedding <1.4: 1.4.0 passes dtype= to AutoModel.from_pretrained, which
+# transformers <4.56 forwards to XLMRobertaModel.__init__ (TypeError: unexpected
+# keyword 'dtype'). 1.3.x loads without the dtype kwarg. We can't move to
+# transformers >=4.56 because it requires torch>=2.4 (base image is torch 2.3.1).
+FlagEmbedding>=1.2.10,<1.4
+# Pin transformers to a release that still supports the base image's torch 2.3.1.
+# Newer transformers require torch>=2.4 and crash on import (NameError: nn) here.
+transformers>=4.44.2,<4.46
 fastapi>=0.109.0
 uvicorn[standard]>=0.20.0
