@@ -8,6 +8,7 @@ Designed to run on an NVIDIA RTX 3060 (12GB, Ampere, sm_86). FlagEmbedding
 auto-selects CUDA when available; fp16 is always enabled to fit the GPU.
 """
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -43,9 +44,49 @@ class EmbedRequest(BaseModel):
     inputs: list[str]
 
 
+def _is_cuda_error(exc: BaseException) -> bool:
+    """True if ``exc`` looks like a poisoned/unavailable CUDA context.
+
+    torch raises a plain ``RuntimeError`` (e.g. "CUDA error: CUDA-capable
+    device(s) is/are busy or unavailable", "CUDA out of memory") — there's no
+    dedicated class to catch, so we string-match.
+    """
+    # ponytail: substring match; widen the needle if new CUDA phrasings show up.
+    return "CUDA" in str(exc)
+
+
+def _encode(inputs: list[str]):
+    """Run the shared model, self-terminating on a poisoned CUDA context.
+
+    A CUDA context, once poisoned, never recovers in-process — every subsequent
+    call fails identically until the process restarts. So on a CUDA error we
+    ``os._exit(1)`` and let Docker's ``restart: unless-stopped`` bring the
+    container back with a fresh context. Non-CUDA errors surface to the caller
+    as a 500 with the real detail (no restart).
+    """
+    try:
+        return _model.encode(
+            inputs,
+            return_dense=True,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+    except Exception as exc:
+        if _is_cuda_error(exc):
+            logging.critical("Poisoned CUDA context — exiting for restart: %s", exc)
+            os._exit(1)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/health")
 async def health() -> dict:
-    """Liveness probe."""
+    """Liveness probe that also exercises CUDA.
+
+    Encoding one token forces a GPU op, so a poisoned CUDA context makes this
+    probe fail — the container flips unhealthy and ``_encode`` self-heals via
+    restart — instead of reporting healthy while every ``/embed`` returns 500.
+    """
+    _encode(["ok"])
     return {"status": "ok"}
 
 
@@ -62,12 +103,7 @@ async def embed(req: EmbedRequest) -> dict:
     if not req.inputs:
         raise HTTPException(status_code=400, detail="inputs must be a non-empty list")
 
-    out = _model.encode(
-        req.inputs,
-        return_dense=True,
-        return_sparse=True,
-        return_colbert_vecs=False,
-    )
+    out = _encode(req.inputs)
 
     # dense_vecs: numpy array [n, 1024]; one row per input.
     dense_vecs = out["dense_vecs"]
