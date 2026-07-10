@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # ── OpenAI (key required) ────────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
-    OPENAI_MODEL: str = "gpt-4o"
+    OPENAI_MODEL: str = "gpt-4.1-mini"
     REQUEST_TIMEOUT_S: float = 60.0
 
     # ── Local retrieval: Qdrant vector store ────────────────────────────────
