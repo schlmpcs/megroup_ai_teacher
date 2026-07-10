@@ -109,6 +109,63 @@ def test_ask_blank_query_422(client, auth):
     assert r.status_code == 422
 
 
+def _sse_events(text):
+    """Parse SSE body into a list of decoded JSON events (excluding [DONE])."""
+    events = []
+    for frame in text.split("\n\n"):
+        if not frame.startswith("data: "):
+            continue
+        payload = frame[len("data: ") :]
+        if payload == "[DONE]":
+            continue
+        events.append(json.loads(payload))
+    return events
+
+
+def test_ask_stream(client, auth, monkeypatch):
+    async def _stream(
+        query,
+        scenario_context=None,
+        chat_history=None,
+        max_tokens=None,
+        scenario_state=None,
+        lab=None,
+    ):
+        yield {"type": "delta", "text": "Кипение — "}
+        yield {"type": "delta", "text": "это парообразование."}
+        yield {
+            "type": "done",
+            "citations": [{"filename": "physics_8.pdf", "file_id": "f1"}],
+            "usage": {"total_tokens": 10},
+        }
+
+    monkeypatch.setattr(routes, "stream_answer", _stream)
+    r = client.post("/ask", json={"query": "Что такое кипение?", "stream": True}, headers=auth)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert "[DONE]" in r.text
+    events = _sse_events(r.text)
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert "".join(deltas) == "Кипение — это парообразование."
+    done = next(e for e in events if e["type"] == "done")
+    assert done["primary_source"]["filename"] == "physics_8.pdf"
+
+
+def test_split_ready():
+    # incomplete sentence stays buffered
+    assert routes._split_ready("Вода закипает при") == ([], "Вода закипает при")
+    # complete sentence flushes, tail is kept
+    ready, rest = routes._split_ready("Вода закипает при ста градусах. Это проц")
+    assert ready == ["Вода закипает при ста градусах."]
+    assert rest == "Это проц"
+    # short fragments (list markers, decimals) are merged forward, not flushed
+    assert routes._split_ready("1. Возьмите линейку")[0] == []
+    assert routes._split_ready("Число пи равно 3.14 примерно") == (
+        [],
+        "Число пи равно 3.14 примерно",
+    )
+
+
 def test_ask_maps_timeout_to_504(client, auth, monkeypatch):
     async def _boom(*a, **k):
         raise LLMTimeoutError("slow")
@@ -254,6 +311,60 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     assert base64.b64decode(body["audio_base64"]) == b"SPOKEN"
     assert "stt" in body["observability"]["latency_ms"]
     assert "tts" in body["observability"]["latency_ms"]
+
+
+def test_voice_ask_stream(client, auth, monkeypatch):
+    async def _transcribe(audio_bytes, filename="audio.webm", language=None, prompt=None):
+        return "Зачем нагревать пробирку?"
+
+    async def _stream(
+        query,
+        scenario_context=None,
+        chat_history=None,
+        max_tokens=None,
+        scenario_state=None,
+        lab=None,
+    ):
+        yield {"type": "delta", "text": "Нагрев ускоряет реакцию. "}
+        yield {"type": "delta", "text": "Молекулы движутся быстрее."}
+        yield {
+            "type": "done",
+            "citations": [{"filename": "chem_8.pdf", "file_id": "f2"}],
+            "usage": {"total_tokens": 12},
+        }
+
+    async def _synth(text, voice=None, response_format=None, instructions=None, language=None):
+        return f"WAV:{text}".encode(), "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe", _transcribe)
+    monkeypatch.setattr(routes, "stream_answer", _stream)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        data={"stream": "true"},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    events = _sse_events(r.text)
+
+    assert events[0] == {"type": "question", "text": "Зачем нагревать пробирку?"}
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert "".join(deltas) == "Нагрев ускоряет реакцию. Молекулы движутся быстрее."
+    # one audio frame per sentence, in order, carrying the spoken text
+    import base64
+
+    audio = [e for e in events if e["type"] == "audio"]
+    assert [a["seq"] for a in audio] == [1, 2]
+    assert audio[0]["text"] == "Нагрев ускоряет реакцию."
+    assert audio[1]["text"] == "Молекулы движутся быстрее."
+    assert base64.b64decode(audio[0]["audio_base64"]) == "WAV:Нагрев ускоряет реакцию.".encode()
+    done = next(e for e in events if e["type"] == "done")
+    assert done["primary_source"]["filename"] == "chem_8.pdf"
+    assert "stt" in done["observability"]["latency_ms"]
+    assert "[DONE]" in r.text
 
 
 # ── Admin ────────────────────────────────────────────────────────────────────

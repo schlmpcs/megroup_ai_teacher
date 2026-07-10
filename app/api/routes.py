@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import List, Literal, NoReturn, Optional
@@ -89,6 +90,7 @@ class AskRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=None, ge=64, le=4096)
     scenario_state: Optional[ScenarioState] = None
     lab: Optional[Lab] = None
+    stream: bool = False
 
     @model_validator(mode="after")
     def _not_blank(self):
@@ -168,6 +170,40 @@ def _lab_dict(lab: Optional[Lab]) -> Optional[dict]:
     }
 
 
+def _sse(obj: dict) -> str:
+    """Encode one event as an SSE data frame."""
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+# Sentence boundary for TTS chunking: end punctuation followed by whitespace.
+# Decimal points ("3.14") never match; short fragments ("1." list markers,
+# "Да.") are held below _TTS_MIN_CHARS and glued to the following sentence.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+_TTS_MIN_CHARS = 20
+
+
+def _split_ready(buf: str, min_chars: int = _TTS_MIN_CHARS) -> tuple[list[str], str]:
+    """Split off complete sentences ready for TTS; keep the unfinished tail.
+
+    Returns ``(ready_chunks, remaining_buffer)``. Complete sentences shorter
+    than ``min_chars`` are merged forward so the TTS sidecar is not called on
+    tiny fragments.
+    """
+    parts = _SENTENCE_SPLIT_RE.split(buf)
+    if len(parts) == 1:
+        return [], buf
+    tail = parts.pop()
+    ready: list[str] = []
+    acc = ""
+    for part in parts:
+        acc = f"{acc} {part}".strip()
+        if len(acc) >= min_chars:
+            ready.append(acc)
+            acc = ""
+    remaining = f"{acc} {tail}".strip() if acc else tail
+    return ready, remaining
+
+
 def _handle_llm_error(exc: LLMError) -> NoReturn:
     if isinstance(exc, LLMTimeoutError):
         raise HTTPException(
@@ -186,9 +222,46 @@ def _handle_llm_error(exc: LLMError) -> NoReturn:
 @router.post("/ask")
 @limiter.limit(_consumer_limit)
 async def ask_endpoint(req: AskRequest, request: Request):
-    """Grounded Q&A for the VR client. Returns answer + citations + scenario id."""
+    """Grounded Q&A for the VR client. Returns answer + citations + scenario id.
+
+    With ``"stream": true`` the response is SSE instead of one JSON object:
+    ``{"type":"delta","text":...}`` frames as tokens arrive, one
+    ``{"type":"done","citations":...,"primary_source":...,"usage":...}`` frame,
+    then ``data: [DONE]``. Errors after the stream starts arrive as
+    ``{"type":"error","message":...}`` frames.
+    """
     scenario_context = _scenario_context_or_404(req.scenario_id)
     scenario_state = _scenario_state_text(req.scenario_state)
+
+    if req.stream:
+
+        async def event_gen():
+            try:
+                async for event in stream_answer(
+                    req.query,
+                    scenario_context=scenario_context,
+                    max_tokens=req.max_tokens,
+                    scenario_state=scenario_state,
+                    lab=_lab_dict(req.lab),
+                ):
+                    if event["type"] == "done":
+                        citations = event["citations"]
+                        yield _sse(
+                            {
+                                "type": "done",
+                                "citations": citations,
+                                "primary_source": citations[0] if citations else None,
+                                "scenario_id": req.scenario_id,
+                                "usage": event["usage"],
+                            }
+                        )
+                    else:
+                        yield _sse(event)
+            finally:
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+
     start = time.time()
     try:
         result = await generate_answer(
@@ -381,6 +454,7 @@ async def voice_ask_endpoint(
     grade: Optional[int] = Form(None),
     lang: Optional[str] = Form(None),
     lab_number: Optional[int] = Form(None),
+    stream: bool = Form(False),
 ):
     """Full voice pipeline: audio question → STT → grounded answer → TTS audio.
 
@@ -388,6 +462,13 @@ async def voice_ask_endpoint(
     the synthesized answer audio (base64). Per-stage latencies are reported so
     the ≤5s acceptance criterion can be monitored. Lab context (subject/grade/
     lang/lab_number) is optional multipart form fields, mirroring ``Lab``.
+
+    With ``stream=true`` the response is SSE: a ``{"type":"question"}`` frame
+    after STT, ``{"type":"delta","text":...}`` frames as answer tokens arrive
+    (live captions), ``{"type":"audio","seq":N,"text":...,"audio_base64":...,
+    "audio_format":...}`` frames as each sentence finishes TTS, one
+    ``{"type":"done",...}`` frame with citations, then ``data: [DONE]``. The
+    client plays audio frames back-to-back in ``seq`` order.
     """
     scenario_context = _scenario_context_or_404(scenario_id)
     scenario_state = _scenario_state_text(
@@ -400,6 +481,7 @@ async def voice_ask_endpoint(
     )
     raw = await _read_upload(file)
     timings: dict = {}
+    tts_language = language or settings.DEFAULT_LANGUAGE
 
     t0 = time.time()
     try:
@@ -409,7 +491,72 @@ async def voice_ask_endpoint(
             language=language or settings.DEFAULT_LANGUAGE,
         )
         timings["stt"] = (time.time() - t0) * 1000
+    except LLMError as exc:
+        _handle_llm_error(exc)
 
+    if stream:
+
+        async def event_gen():
+            # ponytail: TTS awaited inline per sentence (deltas buffer in the
+            # transport meanwhile); add a queue+task pipeline if TTS ever
+            # becomes the bottleneck.
+            yield _sse({"type": "question", "text": question})
+            buf = ""
+            seq = 0
+
+            async def tts_frame(text: str) -> str:
+                nonlocal seq
+                audio, media_type = await synthesize(
+                    text, voice=voice, language=tts_language
+                )
+                seq += 1
+                return _sse(
+                    {
+                        "type": "audio",
+                        "seq": seq,
+                        "text": text,
+                        "audio_base64": base64.b64encode(audio).decode("ascii"),
+                        "audio_format": media_type,
+                    }
+                )
+
+            try:
+                async for event in stream_answer(
+                    question,
+                    scenario_context=scenario_context,
+                    scenario_state=scenario_state,
+                    lab=lab,
+                ):
+                    if event["type"] == "delta":
+                        yield _sse({"type": "delta", "text": event["text"]})
+                        buf += event["text"]
+                        ready, buf = _split_ready(buf)
+                        for sentence in ready:
+                            yield await tts_frame(sentence)
+                    elif event["type"] == "done":
+                        if buf.strip():
+                            yield await tts_frame(buf.strip())
+                        citations = event["citations"]
+                        yield _sse(
+                            {
+                                "type": "done",
+                                "citations": citations,
+                                "primary_source": citations[0] if citations else None,
+                                "scenario_id": scenario_id,
+                                "usage": event["usage"],
+                                "observability": {"latency_ms": timings},
+                            }
+                        )
+                    elif event["type"] == "error":
+                        yield _sse({"type": "error", "message": event["message"]})
+            except LLMError as exc:  # synthesize() failures mid-stream
+                yield _sse({"type": "error", "message": str(exc)})
+            finally:
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+    try:
         t0 = time.time()
         result = await generate_answer(
             question,
