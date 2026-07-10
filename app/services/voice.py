@@ -34,11 +34,16 @@ from app.services.errors import (
     LLMTimeoutError,
     LLMUpstreamError,
 )
+from app.services.ttl_cache import TTLCache
 
 logger = logging.getLogger("assistant.voice")
 
 # The sidecar only ever returns WAV.
 _TTS_MEDIA_TYPE = "audio/wav"
+
+# Answers repeat across students (and across the sentence-chunked streaming
+# path), so cache synthesized WAVs by (text, language). ~0.5MB per entry.
+_tts_cache = TTLCache(settings.TTS_CACHE_SIZE, settings.ANSWER_CACHE_TTL_S)
 
 
 # ── Lazy shared HTTP client ──────────────────────────────────────────────────
@@ -127,6 +132,10 @@ async def synthesize(
     call signatures but have no effect (single fixed voice, WAV output).
     """
     lang = language or settings.DEFAULT_LANGUAGE
+    cache_key = (text, lang)
+    cached = _tts_cache.get(cache_key)
+    if cached is not None:
+        return cached
     body = {"text": text, "language": lang, "speed": 1.0}
 
     try:
@@ -140,4 +149,6 @@ async def synthesize(
     audio = response.content
     if not audio:
         raise LLMError("Voice sidecar synthesis returned no audio")
-    return audio, _TTS_MEDIA_TYPE
+    result = (audio, _TTS_MEDIA_TYPE)
+    _tts_cache.put(cache_key, result)
+    return result

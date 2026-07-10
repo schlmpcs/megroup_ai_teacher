@@ -11,8 +11,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.llm import _answer_cache
+from app.services.voice import _tts_cache
 
 AUTH = {"Authorization": "Bearer test-internal-key-1234567890"}
+
+
+@pytest.fixture(autouse=True)
+def _clear_response_caches():
+    """Answer/TTS caches are process-global; keep tests isolated."""
+    _answer_cache._data.clear()
+    _tts_cache._data.clear()
 
 
 @pytest.fixture

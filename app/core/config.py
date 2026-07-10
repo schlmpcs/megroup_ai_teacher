@@ -36,7 +36,16 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
     OPENAI_MODEL: str = "gpt-4.1-mini"
+    # "" omits the param; "priority" buys faster first-token at ~2x token cost.
+    OPENAI_SERVICE_TIER: str = ""
     REQUEST_TIMEOUT_S: float = 60.0
+
+    # ── In-process response caches (size or TTL <= 0 disables) ──────────────
+    # Same teacher questions repeat across students; cached answers/audio
+    # return in ~ms. Ephemeral per-process — cleared on every deploy.
+    ANSWER_CACHE_SIZE: int = 512
+    ANSWER_CACHE_TTL_S: float = 3600.0
+    TTS_CACHE_SIZE: int = 128
 
     # ── Local retrieval: Qdrant vector store ────────────────────────────────
     QDRANT_URL: str = "http://localhost:6333"

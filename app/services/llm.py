@@ -32,6 +32,7 @@ from app.core.config import settings
 from app.services import embeddings, vectorstore
 from app.services.openai_client import client
 from app.services.memory import build_input_messages, trim_history
+from app.services.ttl_cache import TTLCache
 
 # Service-layer exceptions live in app/services/errors.py so embeddings/
 # vectorstore can raise them without importing this module. Re-exported here so
@@ -373,6 +374,38 @@ def _log_generation(tag: str, query: str, result: AnswerResult) -> None:
     )
 
 
+# ── Answer cache + generation params ────────────────────────────────────────
+
+_answer_cache = TTLCache(settings.ANSWER_CACHE_SIZE, settings.ANSWER_CACHE_TTL_S)
+
+
+def _answer_cache_key(
+    query: str,
+    scenario_context: Optional[str],
+    scenario_state: Optional[str],
+    lab: Optional[dict],
+    max_tokens: Optional[int],
+) -> tuple:
+    """Everything that changes the generated answer, minus chat history.
+
+    Only single-turn requests are cached (multi-turn answers depend on the
+    dialogue); the caller passes a key only in that case.
+    """
+    return (
+        _WS_RE.sub(" ", query).strip().casefold(),
+        scenario_context or "",
+        scenario_state or "",
+        tuple(sorted((k, str(v)) for k, v in (lab or {}).items())),
+        max_tokens or 0,
+    )
+
+
+def _tier_kwargs() -> dict:
+    """Optional OpenAI service tier (e.g. "priority" for faster first-token)."""
+    tier = settings.OPENAI_SERVICE_TIER
+    return {"service_tier": tier} if tier else {}
+
+
 # ── Core completion ────────────────────────────────────────────────────────
 
 
@@ -396,8 +429,21 @@ async def generate_answer(
     ``lab`` is the structured lab context from the simulator (subject/grade/
     lang/lab_number + composed ``lab_id``); it scopes retrieval to the subject
     and injects the lab's procedure verbatim. Retries up to 3 times on
-    transient timeout / upstream (5xx) errors.
+    transient timeout / upstream (5xx) errors. Single-turn requests are served
+    from the in-process answer cache when an identical question (same scenario/
+    state/lab) was answered within ``ANSWER_CACHE_TTL_S``.
     """
+    cache_key = (
+        _answer_cache_key(query, scenario_context, scenario_state, lab, max_tokens)
+        if chat_history is None or len(chat_history) <= 1
+        else None
+    )
+    if cache_key is not None:
+        cached = _answer_cache.get(cache_key)
+        if cached is not None:
+            _log_generation("answer_cached", query, cached)
+            return cached
+
     lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
         await _lab_grounding(lab)
     )
@@ -427,6 +473,7 @@ async def generate_answer(
             input=input_messages,
             max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
+            **_tier_kwargs(),
         )
     except openai.APIError as exc:
         raise _map_openai_error(exc) from exc
@@ -441,6 +488,8 @@ async def generate_answer(
         usage=_usage_dict(response),
     )
     _log_generation("answer", query, result)
+    if cache_key is not None:
+        _answer_cache.put(cache_key, result)
     return result
 
 
@@ -459,8 +508,22 @@ async def stream_answer(
       {"type": "error", "message": "..."}     # on upstream failure
 
     The route layer turns these into SSE frames. ``lab`` carries the same
-    structured lab context as :func:`generate_answer`.
+    structured lab context as :func:`generate_answer`. Shares the answer cache
+    with :func:`generate_answer` — a hit yields the whole answer as one delta.
     """
+    cache_key = (
+        _answer_cache_key(query, scenario_context, scenario_state, lab, max_tokens)
+        if chat_history is None or len(chat_history) <= 1
+        else None
+    )
+    if cache_key is not None:
+        cached = _answer_cache.get(cache_key)
+        if cached is not None:
+            _log_generation("answer_stream_cached", query, cached)
+            yield {"type": "delta", "text": cached.answer}
+            yield {"type": "done", "citations": cached.citations, "usage": cached.usage}
+            return
+
     lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
         await _lab_grounding(lab)
     )
@@ -490,6 +553,7 @@ async def stream_answer(
             input=input_messages,
             max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
+            **_tier_kwargs(),
         ) as stream:
             async for event in stream:
                 if getattr(event, "type", None) == "response.output_text.delta":
@@ -509,6 +573,8 @@ async def stream_answer(
         usage=_usage_dict(final),
     )
     _log_generation("answer_stream", query, result)
+    if cache_key is not None and result.answer:
+        _answer_cache.put(cache_key, result)
     yield {"type": "done", "citations": result.citations, "usage": result.usage}
 
 
@@ -568,6 +634,7 @@ async def rephrase_hint(
             instructions=instructions,
             input=[{"role": "user", "content": user_msg}],
             max_output_tokens=256,
+            **_tier_kwargs(),
             temperature=0.4,
         )
     except openai.APIError as exc:
