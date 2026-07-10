@@ -44,8 +44,14 @@ from app.services.voice import synthesize, transcribe
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = logging.getLogger("assistant.api")
 
-limiter = Limiter(key_func=get_remote_address)
-_consumer_limit = f"{settings.RATE_LIMIT_PER_MINUTE}/minute"
+# Set RATE_LIMIT_PER_MINUTE<=0 to disable rate limiting entirely (e.g. for bulk
+# eval runs from a single client). The decorators stay in place but become
+# no-ops when the limiter is disabled.
+_rate_limit_enabled = settings.RATE_LIMIT_PER_MINUTE > 0
+limiter = Limiter(key_func=get_remote_address, enabled=_rate_limit_enabled)
+_consumer_limit = (
+    f"{settings.RATE_LIMIT_PER_MINUTE}/minute" if _rate_limit_enabled else "1000000/minute"
+)
 
 
 # ── Request models ───────────────────────────────────────────────────────────
