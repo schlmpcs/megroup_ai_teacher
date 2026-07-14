@@ -16,6 +16,14 @@ def fake_answer(monkeypatch):
         scenario_state=None,
         lab=None,
     ):
+        _gen.calls.append(
+            {
+                "query": query,
+                "scenario_context": scenario_context,
+                "scenario_state": scenario_state,
+                "lab": lab,
+            }
+        )
         # The scenario context should be threaded through when a scenario_id is given.
         suffix = " [scenario]" if scenario_context else ""
         if scenario_state:
@@ -28,6 +36,7 @@ def fake_answer(monkeypatch):
             usage={"total_tokens": 10},
         )
 
+    _gen.calls = []
     monkeypatch.setattr(routes, "generate_answer", _gen)
     return _gen
 
@@ -78,14 +87,32 @@ def test_ask_threads_scenario_state(client, auth, fake_answer):
             "query": "Что мне делать дальше?",
             "scenario_id": "physics_lab_02_heating",
             "scenario_state": {
+                "current_step_id": "ignite-burner",
+                "current_step_index": 2,
                 "current_step": "Зажечь спиртовку спичкой",
+                "next_step_id": "heat-water",
+                "next_step": "Начать нагрев воды",
+                "completed_steps": ["prepare-workplace"],
                 "held_items": ["спички", "спиртовка"],
+                "visible_items": ["стакан", "термометр"],
+                "allowed_actions": ["зажечь спиртовку"],
+                "last_action": "Поднёс спичку к фитилю",
+                "last_action_result": "Фитиль ещё не загорелся",
             },
         },
         headers=auth,
     )
     assert r.status_code == 200
     assert r.json()["answer"].endswith("[scenario] [state]")
+    state = fake_answer.calls[-1]["scenario_state"]
+    assert "актуальный снимок сцены от симулятора" in state
+    assert "ID текущего шага: ignite-burner" in state
+    assert "Индекс текущего шага: 2" in state
+    assert "Следующий шаг, назначенный симулятором: Начать нагрев воды" in state
+    assert "Завершённые шаги: prepare-workplace" in state
+    assert "Предметы, видимые ученику: стакан, термометр" in state
+    assert "Разрешённые действия сейчас: зажечь спиртовку" in state
+    assert "Результат последнего действия: Фитиль ещё не загорелся" in state
 
 
 def test_ask_empty_scenario_state_is_noop(client, auth, fake_answer):
@@ -97,6 +124,31 @@ def test_ask_empty_scenario_state_is_noop(client, auth, fake_answer):
     )
     assert r.status_code == 200
     assert "[state]" not in r.json()["answer"]
+
+
+def test_ask_explicit_empty_held_items_is_authoritative(client, auth, fake_answer):
+    r = client.post(
+        "/ask",
+        json={"query": "Что у меня в руках?", "scenario_state": {"held_items": []}},
+        headers=auth,
+    )
+    assert r.status_code == 200
+    assert "Предметы в руках у ученика: нет" in fake_answer.calls[-1]["scenario_state"]
+
+
+def test_ask_rejects_oversized_scenario_state(client, auth):
+    r = client.post(
+        "/ask",
+        json={
+            "query": "Что дальше?",
+            "scenario_state": {
+                "current_step": "x" * routes.settings.MAX_INPUT_CHARS,
+                "next_step": "y",
+            },
+        },
+        headers=auth,
+    )
+    assert r.status_code == 422
 
 
 def test_ask_unknown_scenario_404(client, auth, fake_answer):
@@ -181,13 +233,25 @@ def test_ask_maps_timeout_to_504(client, auth, monkeypatch):
 def test_chat_completions_nonstream(client, auth, fake_answer):
     r = client.post(
         "/v1/chat/completions",
-        json={"model": "gpt-4o", "messages": [{"role": "user", "content": "Привет"}]},
+        json={
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Привет"}],
+            "scenario_state": {
+                "current_step_id": "observe",
+                "next_step": "Записать наблюдение",
+                "allowed_actions": ["открыть журнал"],
+            },
+        },
         headers=auth,
     )
     assert r.status_code == 200
     body = r.json()
     assert body["choices"][0]["message"]["content"].startswith("Ответ на: Привет")
     assert body["metadata"]["primary_source"]["file_id"] == "f1"
+    state = fake_answer.calls[-1]["scenario_state"]
+    assert "ID текущего шага: observe" in state
+    assert "Следующий шаг, назначенный симулятором: Записать наблюдение" in state
+    assert "Разрешённые действия сейчас: открыть журнал" in state
 
 
 def test_chat_completions_latest_must_be_user(client, auth):
@@ -235,17 +299,31 @@ def test_chat_completions_stream(client, auth, monkeypatch):
 
 
 def test_hint_rephrases(client, auth, monkeypatch):
+    seen = {}
+
     async def _hint(hint_text, hint_level, scenario_context=None, scenario_state=None):
+        seen["scenario_state"] = scenario_state
         return f"L{hint_level}: {hint_text}"
 
     monkeypatch.setattr(routes, "rephrase_hint", _hint)
     r = client.post(
         "/hint",
-        json={"hint_text": "Подойди к трубке", "hint_level": 2},
+        json={
+            "hint_text": "Подойди к трубке",
+            "hint_level": 2,
+            "scenario_state": {
+                "current_step_id": "connect-tube",
+                "visible_items": ["трубка"],
+                "last_action_result": "Трубка не подключена",
+            },
+        },
         headers=auth,
     )
     assert r.status_code == 200
     assert r.json()["hint"] == "L2: Подойди к трубке"
+    assert "ID текущего шага: connect-tube" in seen["scenario_state"]
+    assert "Предметы, видимые ученику: трубка" in seen["scenario_state"]
+    assert "Результат последнего действия: Трубка не подключена" in seen["scenario_state"]
 
 
 def test_hint_level_out_of_range_422(client, auth):
@@ -299,18 +377,49 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     r = client.post(
         "/voice_ask",
         files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
-        data={"scenario_id": "physics_lab_02_heating"},
+        data={
+            "scenario_id": "physics_lab_02_heating",
+            "current_step_id": "heat-water",
+            "current_step_index": "3",
+            "current_step": "Нагреть воду",
+            "next_step_id": "record-temperature",
+            "next_step": "Записать температуру",
+            "completed_steps": ["prepare-stand"],
+            "held_items": [],
+            "visible_items": ["термометр"],
+            "allowed_actions": ["включить нагрев"],
+            "last_action": "Поставил стакан",
+            "last_action_result": "Успешно",
+        },
         headers=auth,
     )
     assert r.status_code == 200
     body = r.json()
     assert body["question"] == "Зачем нагревать пробирку?"
-    assert body["answer"].endswith("[scenario]")
+    assert body["answer"].endswith("[scenario] [state]")
+    state = fake_answer.calls[-1]["scenario_state"]
+    assert "ID текущего шага: heat-water" in state
+    assert "Индекс текущего шага: 3" in state
+    assert "Следующий шаг, назначенный симулятором: Записать температуру" in state
+    assert "Завершённые шаги: prepare-stand" in state
+    assert "Предметы, видимые ученику: термометр" in state
+    assert "Разрешённые действия сейчас: включить нагрев" in state
+    assert "Результат последнего действия: Успешно" in state
     import base64
 
     assert base64.b64decode(body["audio_base64"]) == b"SPOKEN"
     assert "stt" in body["observability"]["latency_ms"]
     assert "tts" in body["observability"]["latency_ms"]
+
+
+def test_voice_ask_rejects_oversized_scene_field(client, auth):
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        data={"current_step_id": "x" * 129},
+        headers=auth,
+    )
+    assert r.status_code == 422
 
 
 def test_voice_ask_stream(client, auth, monkeypatch):

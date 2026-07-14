@@ -215,6 +215,37 @@ def test_with_lang_no_lang_returns_base_unchanged():
     assert vectorstore.with_lang(None, None) is None
 
 
+async def test_fetch_lab_instruction_record_keeps_source_payloads(monkeypatch):
+    payload_1 = {
+        "doc_id": "lab-doc",
+        "filename": "Лабораторная работа №2.docx",
+        "doc_type": "lab_instruction",
+        "source": "Физика 8 класс/рус/Лабораторная работа №2.docx",
+        "lab_id": "physics-8-ru-02",
+        "lab_number": 2,
+        "chunk_index": 1,
+        "text": "Шаг второй.",
+    }
+    payload_0 = {**payload_1, "chunk_index": 0, "text": "Шаг первый."}
+
+    class _Client:
+        async def collection_exists(self, name):
+            return True
+
+        async def scroll(self, **kwargs):
+            return [SimpleNamespace(payload=payload_1), SimpleNamespace(payload=payload_0)], None
+
+    monkeypatch.setattr(vectorstore, "get_client", lambda: _Client())
+
+    record = await vectorstore.fetch_lab_instruction_record("physics-8-ru-02")
+
+    assert record["text"] == "Шаг первый.\nШаг второй."
+    assert [payload["chunk_index"] for payload in record["payloads"]] == [0, 1]
+    assert record["payloads"][0]["source"].endswith("Лабораторная работа №2.docx")
+    # The old public helper remains text-only for backwards compatibility.
+    assert await vectorstore.fetch_lab_instruction("physics-8-ru-02") == record["text"]
+
+
 # ── llm: lab-aware grounding ─────────────────────────────────────────────────
 
 
@@ -227,11 +258,38 @@ async def test_generate_answer_injects_lab_instruction(monkeypatch):
     async def _hybrid_search(dense, sparse_indices, sparse_values, top_k, candidates,
                              query_filter=None):
         captured["filter"] = query_filter
-        return []
+        return [
+            {
+                "score": 0.9,
+                "payload": {
+                    "doc_id": "physics-book-8",
+                    "filename": "Физика 8 класс.pdf",
+                    "doc_type": "textbook",
+                    "source": "Физика/рус/Физика 8 класс.pdf",
+                    "chunk_index": 4,
+                    "page_start": 52,
+                    "page_end": 52,
+                    "text": "Кипение происходит во всем объеме жидкости.",
+                },
+            }
+        ]
 
-    async def _fetch_lab_instruction(lab_id):
+    async def _fetch_lab_instruction_record(lab_id):
         captured["lab_id"] = lab_id
-        return "Тема: Кипение. Ход работы: нагрей воду."
+        return {
+            "text": "Тема: Кипение. Ход работы: нагрей воду.",
+            "payloads": [
+                {
+                    "doc_id": "lab-doc-2",
+                    "filename": "Лабораторная работа №2.docx",
+                    "doc_type": "lab_instruction",
+                    "source": "Физика 8 класс/рус/Лабораторная работа №2.docx",
+                    "chunk_index": 0,
+                    "lab_id": lab_id,
+                    "lab_number": 2,
+                }
+            ],
+        }
 
     def _meta_filter(**fields):
         captured["filter_fields"] = fields
@@ -246,7 +304,11 @@ async def test_generate_answer_injects_lab_instruction(monkeypatch):
 
     monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
     monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
-    monkeypatch.setattr(llm.vectorstore, "fetch_lab_instruction", _fetch_lab_instruction)
+    monkeypatch.setattr(
+        llm.vectorstore,
+        "fetch_lab_instruction_record",
+        _fetch_lab_instruction_record,
+    )
     monkeypatch.setattr(llm.vectorstore, "meta_filter", _meta_filter)
     monkeypatch.setattr(llm.client.responses, "create", _create)
 
@@ -259,6 +321,13 @@ async def test_generate_answer_injects_lab_instruction(monkeypatch):
     assert captured["filter"] == "FILTER_SENTINEL"
     assert captured["filter_fields"] == {"doc_type": "textbook", "subject": "physics"}
     assert "Ход работы: нагрей воду." in captured["instructions"]
+    # This is a theory question, so the retrieved textbook remains primary even
+    # though the lab instruction was also injected and cited.
+    assert result.primary_source["file_id"] == "physics-book-8"
+    assert result.primary_source["source_type"] == "textbook"
+    assert result.citations[1]["file_id"] == "lab-doc-2"
+    assert result.citations[1]["source_type"] == "lab_instruction"
+    assert result.citations[1]["lab_id"] == "physics-8-ru-02"
 
 
 async def test_generate_answer_incomplete_lab_warns(monkeypatch):
@@ -271,8 +340,8 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
                              query_filter=None):
         return []
 
-    async def _fetch_lab_instruction(lab_id):
-        return ""  # missing instruction -> incomplete lab
+    async def _fetch_lab_instruction_record(lab_id):
+        return None  # missing instruction -> incomplete lab
 
     async def _create(**kwargs):
         captured["instructions"] = kwargs["instructions"]
@@ -283,7 +352,11 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
 
     monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
     monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
-    monkeypatch.setattr(llm.vectorstore, "fetch_lab_instruction", _fetch_lab_instruction)
+    monkeypatch.setattr(
+        llm.vectorstore,
+        "fetch_lab_instruction_record",
+        _fetch_lab_instruction_record,
+    )
     monkeypatch.setattr(llm.client.responses, "create", _create)
 
     lab = {"subject": "biology", "grade": 9, "lang": "ru", "lab_number": 7,

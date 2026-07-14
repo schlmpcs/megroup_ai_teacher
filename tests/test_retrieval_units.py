@@ -164,7 +164,97 @@ async def test_upload_document_txt_chunks_and_upserts(monkeypatch):
     assert payload["doc_id"] == result["file_id"]
     assert payload["filename"] == "notes.txt"
     assert payload["chunk_index"] == 0
+    assert payload["chunk_count"] == result["chunks"]
+    assert payload["source_path"] == "notes.txt"
+    assert payload["source_type"] == "document"
+    assert payload["file_type"] == "txt"
+    assert payload["char_start"] == 0
+    assert payload["char_end"] > payload["char_start"]
     assert isinstance(payload["text"], str) and payload["text"]
+
+
+async def test_upload_document_pdf_propagates_page_and_source_metadata(monkeypatch):
+    vs = _RecordingVectorstore()
+    _patch_ingestion(monkeypatch, vs)
+    monkeypatch.setattr(ingestion.settings, "CHUNK_SIZE", 100, raising=False)
+    monkeypatch.setattr(ingestion.settings, "CHUNK_OVERLAP", 10, raising=False)
+
+    class _Page:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _Reader:
+        pages = [_Page("Первая страница"), _Page("Вторая страница")]
+
+    monkeypatch.setattr(ingestion, "to_markdown", lambda *args, **kwargs: (
+        "Первая страница\nВторая страница"
+    ))
+    monkeypatch.setattr(ingestion.pypdf, "PdfReader", lambda stream: _Reader())
+
+    result = await ingestion.upload_document(
+        "Физика 8.pdf",
+        b"synthetic-pdf",
+        metadata={
+            "doc_type": "textbook",
+            "source": "Физика/рус/Физика 8.pdf",
+            "subject": "physics",
+            "grade": 8,
+            "lang": "ru",
+        },
+    )
+
+    assert result["chunks"] == 1
+    payload = vs.upserted[0]["payload"]
+    assert payload["source_type"] == "textbook"
+    assert payload["source_path"] == "Физика/рус/Физика 8.pdf"
+    assert payload["pages"] == [1, 2]
+    assert payload["page_start"] == 1
+    assert payload["page_end"] == 2
+
+
+async def test_upload_document_pdf_omits_pages_when_text_cannot_be_aligned(monkeypatch):
+    vs = _RecordingVectorstore()
+    _patch_ingestion(monkeypatch, vs)
+
+    class _Page:
+        def extract_text(self):
+            return "Текст pypdf"
+
+    class _Reader:
+        pages = [_Page()]
+
+    monkeypatch.setattr(
+        ingestion,
+        "to_markdown",
+        lambda *args, **kwargs: "Другой текст из OCR или markitdown",
+    )
+    monkeypatch.setattr(ingestion.pypdf, "PdfReader", lambda stream: _Reader())
+
+    await ingestion.upload_document("scan.pdf", b"synthetic-pdf")
+
+    payload = vs.upserted[0]["payload"]
+    assert "pages" not in payload
+    assert "page_start" not in payload
+    assert "page_end" not in payload
+
+
+def test_chunk_records_carry_latest_chapter_and_section(monkeypatch):
+    monkeypatch.setattr(ingestion.settings, "CHUNK_SIZE", 45, raising=False)
+    monkeypatch.setattr(ingestion.settings, "CHUNK_OVERLAP", 0, raising=False)
+    text = (
+        "# Глава 3. Тепловые явления\n"
+        "Теория о нагревании вещества и температуре.\n"
+        "§ 14. Кипение\n"
+        "Кипение происходит во всем объеме жидкости."
+    )
+
+    records = ingestion._chunk_records(text)
+
+    assert records[0]["chapter"] == "Глава 3. Тепловые явления"
+    assert records[-1]["section"] == "§ 14. Кипение"
 
 
 async def test_upload_document_unsupported_extension_raises(monkeypatch):
@@ -227,7 +317,14 @@ async def test_generate_answer_uses_retrieved_citations(monkeypatch):
 
     result = await llm.generate_answer("Когда кипит вода?")
     assert result.answer == "Вода кипит при 100 градусах."
-    assert result.citations == [{"filename": "physics_8.pdf", "file_id": "d1"}]
+    assert result.citations == [
+        {
+            "filename": "physics_8.pdf",
+            "file_id": "d1",
+            "chunk_indexes": [0],
+            "display_label": "physics_8",
+        }
+    ]
     assert result.usage == {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}
 
 
@@ -244,11 +341,11 @@ def _filter_conditions(flt) -> dict:
 async def test_lab_grounding_scopes_theory_to_grade(monkeypatch):
     """A grade-7 lab must build a grade-scoped primary filter + subject fallback."""
 
-    async def _fetch_lab_instruction(lab_id):
-        return ""  # incomplete lab — exercises the no-instruction branch too
+    async def _fetch_lab_instruction_record(lab_id):
+        return None  # incomplete lab - exercises the no-instruction branch too
 
     monkeypatch.setattr(
-        llm.vectorstore, "fetch_lab_instruction", _fetch_lab_instruction
+        llm.vectorstore, "fetch_lab_instruction_record", _fetch_lab_instruction_record
     )
 
     lab = {
@@ -257,9 +354,17 @@ async def test_lab_grounding_scopes_theory_to_grade(monkeypatch):
         "lang": "ru",
         "lab_id": "physics-7-ru-02",
     }
-    _, lab_incomplete, query_filter, lang, fallback_filter = await llm._lab_grounding(lab)
+    (
+        _,
+        lab_incomplete,
+        query_filter,
+        lang,
+        fallback_filter,
+        lab_source_chunks,
+    ) = await llm._lab_grounding(lab)
 
     assert lab_incomplete is True
+    assert lab_source_chunks == []
     assert lang == "ru"
     # Primary scope pins subject AND grade — this is the whole point of the fix.
     assert _filter_conditions(query_filter) == {
@@ -308,7 +413,7 @@ async def test_retrieve_falls_back_to_subject_when_grade_thin(monkeypatch):
     monkeypatch.setattr(llm.settings, "RETRIEVAL_TOP_K", 2, raising=False)
     monkeypatch.setattr(llm.settings, "RETRIEVAL_SCORE_THRESHOLD", 0.0, raising=False)
 
-    _, _, query_filter, lang, fallback_filter = await llm._lab_grounding(
+    _, _, query_filter, lang, fallback_filter, _ = await llm._lab_grounding(
         {"subject": "physics", "grade": 7, "lang": "ru"}
     )
     chunks = await llm._retrieve(

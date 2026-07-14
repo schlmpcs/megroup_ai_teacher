@@ -7,9 +7,23 @@ __pycache__/
 data/uploads/*
 !data/uploads/.gitkeep
 
-# Large source corpus (copyrighted textbooks + video) — ingested locally, not committed
+# Large source corpus (copyrighted textbooks + video), ingested locally and not committed
 /Лабораторные физхимбио/
 labs.json
 
-# Local/sensitive documents — not for the shared repo
+# Local/sensitive documents, not for the shared repo
 /Договор_*.docx
+
+# Local agent/session state
+/.claude/
+
+# Generated accuracy-evaluation artifacts
+/chart_data.json
+/eval_accuracy_dashboard.html
+/eval_batches/
+/eval_graded.json
+/eval_results.json
+/eval_results.md
+/eval_slim.json
+/grades.json
+/missing_content.json

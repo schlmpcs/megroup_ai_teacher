@@ -6,7 +6,8 @@ These feed the assistant's hybrid RAG search in Qdrant (dense + sparse).
 
 ## API
 
-- `GET /health` -> `{"status": "ok"}`
+- `GET /health` -> `{"status": "ok"}`. The health check performs a small GPU
+  encoding operation, so it also detects a poisoned CUDA context.
 - `POST /embed` with `{"inputs": ["text", ...]}` (empty list -> HTTP 400)
 
   Response:
@@ -25,9 +26,13 @@ Requires an NVIDIA GPU (FlagEmbedding auto-selects CUDA; fp16 always on):
 
 ```bash
 docker build -t embedder embedder/
-docker run --gpus all -p 8080:8080 \
+docker run --gpus all --restart unless-stopped -p 8080:8080 \
   -v hf-cache:/root/.cache/huggingface embedder
 ```
+
+On a CUDA failure the worker exits so Docker can restart it with a clean GPU
+context. Keep the restart policy enabled in standalone deployments. The main
+`docker-compose.yml` already sets `restart: unless-stopped`.
 
 The model (~2GB) is downloaded on first start and cached in the Hugging Face
 cache volume (`HF_HOME=/root/.cache/huggingface`), so subsequent starts are fast.

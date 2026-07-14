@@ -1,9 +1,9 @@
-# requirements.txt — VR AI Assistant (local hybrid retrieval via Qdrant + bge-m3 sidecar; generation/voice on OpenAI)
+# VR AI Assistant: local retrieval and voice sidecars, with generation on OpenAI
 fastapi>=0.109.0
 uvicorn[standard]>=0.20.0
 pydantic>=2.0
 pydantic-settings>=2.0
-openai>=1.40.0          # Responses API + file_search + Vector Stores + audio
+openai>=1.40.0          # Responses API generation client
 httpx>=0.26.0
 tenacity>=8.2.0         # Retry / exponential backoff for upstream OpenAI calls
 slowapi>=0.1.9          # Per-IP rate limiting

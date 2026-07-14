@@ -34,7 +34,7 @@ def test_build_system_prompt_state_omitted_when_blank():
 # ── Citations from retrieved chunks (local hybrid RAG) ───────────────────────
 
 
-def _chunk(doc_id, filename, text, chunk_index=0, score=1.0):
+def _chunk(doc_id, filename, text, chunk_index=0, score=1.0, **metadata):
     return {
         "score": score,
         "payload": {
@@ -42,20 +42,132 @@ def _chunk(doc_id, filename, text, chunk_index=0, score=1.0):
             "filename": filename,
             "chunk_index": chunk_index,
             "text": text,
+            **metadata,
         },
     }
 
 
-def test_citations_from_chunks_dedupes_by_filename_first_seen():
+def test_citations_from_chunks_groups_locators_by_document_first_seen():
     chunks = [
-        _chunk("d1", "physics_8.pdf", "t1", chunk_index=0),
-        _chunk("d1", "physics_8.pdf", "t2", chunk_index=1),  # dup filename
+        _chunk(
+            "d1",
+            "physics_8.pdf",
+            "t1",
+            chunk_index=0,
+            doc_type="textbook",
+            source="Физика/physics_8.pdf",
+            page_start=14,
+            page_end=14,
+            chapter="Глава 3",
+        ),
+        _chunk(
+            "d1",
+            "physics_8.pdf",
+            "t2",
+            chunk_index=1,
+            doc_type="textbook",
+            source="Физика/physics_8.pdf",
+            pages=[14, 15],
+            chapter="Глава 3",
+        ),
         _chunk("d2", "chem_9.pdf", "t3", chunk_index=0),
     ]
     citations = llm._citations_from_chunks(chunks)
-    assert citations == [
-        {"filename": "physics_8.pdf", "file_id": "d1"},
-        {"filename": "chem_9.pdf", "file_id": "d2"},
+    assert citations[0] == {
+        "filename": "physics_8.pdf",
+        "file_id": "d1",
+        "source_type": "textbook",
+        "source_path": "Физика/physics_8.pdf",
+        "chunk_indexes": [0, 1],
+        "pages": [14, 15],
+        "page_start": 14,
+        "page_end": 15,
+        "chapters": ["Глава 3"],
+        "chapter": "Глава 3",
+        "display_label": "physics_8, Глава 3, стр. 14-15",
+    }
+    assert citations[1]["filename"] == "chem_9.pdf"
+    assert citations[1]["file_id"] == "d2"
+    assert citations[1]["chunk_indexes"] == [0]
+
+
+def test_citations_keep_same_filename_documents_distinct_and_skip_nulls():
+    chunks = [
+        _chunk("lab-a", "Лабораторная работа №2.docx", "a", source="7/a.docx"),
+        _chunk("lab-b", "Лабораторная работа №2.docx", "b", source="8/b.docx"),
+        {"payload": {"filename": None, "doc_id": None, "text": "noise"}},
+    ]
+
+    citations = llm._citations_from_chunks(chunks)
+
+    assert [citation["file_id"] for citation in citations] == ["lab-a", "lab-b"]
+    assert all(citation["filename"] for citation in citations)
+    assert all(citation["file_id"] for citation in citations)
+
+
+def test_lab_instruction_citation_has_human_readable_label():
+    citation = llm._citations_from_chunks(
+        [
+            _chunk(
+                "lab-2",
+                "Лабораторная работа №2.docx",
+                "ход работы",
+                doc_type="lab_instruction",
+                source="labs/Лабораторная работа №2.docx",
+                lab_id="physics-8-ru-02",
+                lab_number=2,
+            )
+        ]
+    )[0]
+
+    assert citation["source_type"] == "lab_instruction"
+    assert citation["lab_id"] == "physics-8-ru-02"
+    assert citation["lab_number"] == 2
+    assert citation["display_label"] == "Инструкция к лабораторной работе №2"
+
+
+def test_lab_procedure_query_intent_is_precision_biased_for_ru_and_kk():
+    assert llm._is_lab_procedure_query("Что мне делать дальше?") is True
+    assert llm._is_lab_procedure_query("Как выполнить лабораторную работу?") is True
+    assert llm._is_lab_procedure_query("Опишите основные этапы выполнения работы") is True
+    assert llm._is_lab_procedure_query("Что наблюдаем в ходе эксперимента?") is True
+    assert llm._is_lab_procedure_query("Главный результат в конце работы?") is True
+    assert llm._is_lab_procedure_query("Әрі қарай не істеу керек?") is True
+    assert llm._is_lab_procedure_query("Келесі қадам қандай?") is True
+    assert llm._is_lab_procedure_query("Почему вода кипит?") is False
+    assert llm._is_lab_procedure_query("Как происходит кипение?") is False
+    assert llm._is_lab_procedure_query("Кипение қалай жүреді?") is False
+
+
+def test_answer_citations_order_theory_and_procedure_sources_by_query_intent():
+    theory = [
+        _chunk(
+            "book",
+            "Физика 8.pdf",
+            "теория кипения",
+            doc_type="textbook",
+        )
+    ]
+    lab = [
+        _chunk(
+            "lab",
+            "Лабораторная работа №2.docx",
+            "ход работы",
+            doc_type="lab_instruction",
+            lab_number=2,
+        )
+    ]
+
+    theory_answer = llm._answer_citations("Почему вода кипит?", theory, lab)
+    procedure_answer = llm._answer_citations("Что делать дальше?", theory, lab)
+
+    assert [c["source_type"] for c in theory_answer] == [
+        "textbook",
+        "lab_instruction",
+    ]
+    assert [c["source_type"] for c in procedure_answer] == [
+        "lab_instruction",
+        "textbook",
     ]
 
 

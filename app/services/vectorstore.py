@@ -181,12 +181,13 @@ async def hybrid_search(
     return [{"score": point.score, "payload": point.payload} for point in result.points]
 
 
-async def fetch_lab_instruction(lab_id: str) -> str:
-    """Return the full procedure text for ``lab_id``, reassembled in order.
+async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
+    """Return procedure text plus its stored chunk payloads for ``lab_id``.
 
     Scrolls all chunks tagged with this ``lab_id`` and concatenates them by
-    ``chunk_index``. Returns "" if the lab has no instruction in the store
-    (i.e. an incomplete/missing lab — the caller degrades gracefully).
+    ``chunk_index``. The payloads let callers cite the actual lab instruction
+    document instead of only unrelated theory retrieval. Returns ``None`` when
+    the lab has no instruction in the store.
     """
     client = get_client()
     flt = models.Filter(
@@ -194,8 +195,8 @@ async def fetch_lab_instruction(lab_id: str) -> str:
     )
     try:
         if not await client.collection_exists(settings.QDRANT_COLLECTION):
-            return ""
-        rows: list[tuple[int, str]] = []
+            return None
+        rows: list[tuple[int, str, dict]] = []
         offset = None
         while True:
             records, offset = await client.scroll(
@@ -207,13 +208,33 @@ async def fetch_lab_instruction(lab_id: str) -> str:
                 with_vectors=False,
             )
             for rec in records:
-                payload = rec.payload or {}
-                rows.append((payload.get("chunk_index", 0), payload.get("text", "")))
+                payload = dict(rec.payload or {})
+                rows.append(
+                    (payload.get("chunk_index", 0), payload.get("text", ""), payload)
+                )
             if offset is None:
                 break
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
-    return "\n".join(text for _, text in sorted(rows) if text).strip()
+    ordered = sorted(rows, key=lambda row: row[0])
+    text = "\n".join(text for _, text, _ in ordered if text).strip()
+    if not text:
+        return None
+    return {
+        "text": text,
+        "payloads": [payload for _, _, payload in ordered],
+    }
+
+
+async def fetch_lab_instruction(lab_id: str) -> str:
+    """Return only the full procedure text for ``lab_id``.
+
+    This preserves the original public behavior for callers that do not need
+    source metadata. New citation-aware callers should use
+    :func:`fetch_lab_instruction_record`.
+    """
+    record = await fetch_lab_instruction_record(lab_id)
+    return record["text"] if record else ""
 
 
 async def list_documents() -> list[dict]:

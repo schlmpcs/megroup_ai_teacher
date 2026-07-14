@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import List, Literal, NoReturn, Optional
+from typing import Annotated, List, Literal, NoReturn, Optional
 
 from fastapi import (
     APIRouter,
@@ -18,7 +18,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -58,15 +58,60 @@ _consumer_limit = (
 # ── Request models ───────────────────────────────────────────────────────────
 
 
-class ScenarioState(BaseModel):
-    """Live per-request scene state from the simulator (ТЗ §3.2).
+_SCENE_STATE_ID_CHARS = 128
+_SCENE_STATE_ITEM_CHARS = 256
+_SCENE_STATE_MAX_ITEMS = 50
 
-    Distinct from the static scenario document: this is what the user is doing
-    *right now* — which step they are on and which objects they are holding.
+SceneStateId = Annotated[str, Field(max_length=_SCENE_STATE_ID_CHARS)]
+SceneStateItem = Annotated[str, Field(max_length=_SCENE_STATE_ITEM_CHARS)]
+
+
+class ScenarioState(BaseModel):
+    """Authoritative live scene snapshot supplied for one request (ТЗ §3.2).
+
+    This is intentionally independent of ``scenario_id``. A simulator with no
+    static scenario JSON can still provide enough explicit state for reliable
+    current-step and next-step answers. The original ``current_step`` and
+    ``held_items`` fields remain valid for backwards compatibility.
     """
 
+    current_step_id: Optional[SceneStateId] = None
+    current_step_index: Optional[int] = Field(default=None, ge=0, le=1_000_000)
     current_step: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
-    held_items: Optional[List[str]] = Field(default=None, max_length=50)
+    next_step_id: Optional[SceneStateId] = None
+    next_step: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
+    completed_steps: Optional[List[SceneStateItem]] = Field(
+        default=None, max_length=_SCENE_STATE_MAX_ITEMS
+    )
+    held_items: Optional[List[SceneStateItem]] = Field(
+        default=None, max_length=_SCENE_STATE_MAX_ITEMS
+    )
+    visible_items: Optional[List[SceneStateItem]] = Field(
+        default=None, max_length=_SCENE_STATE_MAX_ITEMS
+    )
+    allowed_actions: Optional[List[SceneStateItem]] = Field(
+        default=None, max_length=_SCENE_STATE_MAX_ITEMS
+    )
+    last_action: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
+    last_action_result: Optional[str] = Field(
+        default=None, max_length=settings.MAX_INPUT_CHARS
+    )
+
+    @model_validator(mode="after")
+    def _bounded_total_content(self):
+        """Keep the whole state snapshot concise enough for prompt injection."""
+        total = 0
+        for value in self.model_dump(exclude_none=True).values():
+            if isinstance(value, list):
+                total += sum(len(item) for item in value)
+            else:
+                total += len(str(value))
+        if total > settings.MAX_INPUT_CHARS:
+            raise ValueError(
+                "scenario_state content must not exceed "
+                f"{settings.MAX_INPUT_CHARS} characters in total"
+            )
+        return self
 
 
 class Lab(BaseModel):
@@ -153,8 +198,23 @@ def _scenario_state_text(state: Optional[ScenarioState]) -> Optional[str]:
     """Render live scene state into a prompt block, or None if nothing useful."""
     if state is None:
         return None
-    text = format_scenario_state(state.current_step, state.held_items)
+    text = format_scenario_state(**state.model_dump())
     return text or None
+
+
+def _scenario_state_from_form(**values) -> ScenarioState:
+    """Validate multipart scene fields with the same model as JSON requests."""
+    try:
+        return ScenarioState(**values)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(
+                include_url=False,
+                include_context=False,
+                include_input=False,
+            ),
+        ) from exc
 
 
 def _lab_dict(lab: Optional[Lab]) -> Optional[dict]:
@@ -448,8 +508,17 @@ async def voice_ask_endpoint(
     scenario_id: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
     voice: Optional[str] = Form(None),
+    current_step_id: Optional[str] = Form(None),
+    current_step_index: Optional[int] = Form(None),
     current_step: Optional[str] = Form(None),
+    next_step_id: Optional[str] = Form(None),
+    next_step: Optional[str] = Form(None),
+    completed_steps: Optional[List[str]] = Form(None),
     held_items: Optional[List[str]] = Form(None),
+    visible_items: Optional[List[str]] = Form(None),
+    allowed_actions: Optional[List[str]] = Form(None),
+    last_action: Optional[str] = Form(None),
+    last_action_result: Optional[str] = Form(None),
     subject: Optional[str] = Form(None),
     grade: Optional[int] = Form(None),
     lang: Optional[str] = Form(None),
@@ -472,7 +541,19 @@ async def voice_ask_endpoint(
     """
     scenario_context = _scenario_context_or_404(scenario_id)
     scenario_state = _scenario_state_text(
-        ScenarioState(current_step=current_step, held_items=held_items)
+        _scenario_state_from_form(
+            current_step_id=current_step_id,
+            current_step_index=current_step_index,
+            current_step=current_step,
+            next_step_id=next_step_id,
+            next_step=next_step,
+            completed_steps=completed_steps,
+            held_items=held_items,
+            visible_items=visible_items,
+            allowed_actions=allowed_actions,
+            last_action=last_action,
+            last_action_result=last_action_result,
+        )
     )
     lab = _lab_dict(
         Lab(subject=subject, grade=grade, lang=lang or "ru", lab_number=lab_number)
@@ -600,7 +681,11 @@ async def corpus_status_endpoint():
 
 @router.post("/admin/documents", status_code=status.HTTP_201_CREATED)
 async def upload_document_endpoint(file: UploadFile = File(...)):
-    """Upload a PDF/DOCX/TXT into the knowledge-base vector store."""
+    """Upload one untagged PDF/DOCX/EPUB/TXT/MD document into the knowledge base.
+
+    Structured textbook and lab-instruction metadata is assigned only by the
+    corpus ``bulk-ingest`` workflow documented in ``README.md``.
+    """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
     if suffix not in ingestion.SUPPORTED_EXTENSIONS:

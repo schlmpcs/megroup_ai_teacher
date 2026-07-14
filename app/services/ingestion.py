@@ -69,6 +69,15 @@ _SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
 # which would otherwise be indexed as a handful of useless noise chunks.
 _WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
 
+# Headings worth carrying into citation metadata. Markdown headings are kept
+# verbatim by markitdown; the plain-text alternatives cover the most common
+# chapter/section labels in the Russian and Kazakh school corpus.
+_HEADING_RE = re.compile(
+    r"(?im)^\s*(?:(?P<markdown>#{1,6})\s+)?"
+    r"(?P<title>(?:(?:глава|раздел|параграф|тарау|бөлім)\b|\xa7)"
+    r"[^\r\n]{0,150})\s*$"
+)
+
 # EPUB extraction thresholds (word counts via ``_WORD_RE``):
 #   * if markitdown returns at least this many words we trust it and skip the
 #     (more expensive) spine reparse;
@@ -414,7 +423,7 @@ def _chunk_text(text: str) -> list[str]:
     emitted stepping by ``CHUNK_SIZE - CHUNK_OVERLAP``. Empty / whitespace-only
     windows are dropped.
     """
-    normalized = re.sub(r"\s+", " ", text).strip()
+    normalized = _normalize_text(text)
     if not normalized:
         return []
 
@@ -434,6 +443,114 @@ def _chunk_text(text: str) -> list[str]:
         if start + size >= len(normalized):
             break
     return chunks
+
+
+def _normalize_text(text: str) -> str:
+    """Collapse whitespace exactly as the chunker does."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _section_markers(text: str) -> list[tuple[int, str, str]]:
+    """Return normalized offsets for chapter/section headings in ``text``.
+
+    The offsets are approximate only at whitespace boundaries, which is enough
+    for assigning the latest heading to a character-window chunk. A heading is
+    metadata, not part of retrieval scoring or document reconstruction.
+    """
+    markers: list[tuple[int, str, str]] = []
+    for match in _HEADING_RE.finditer(text):
+        title = _normalize_text(match.group("title"))
+        if not title:
+            continue
+        prefix = _normalize_text(text[: match.start()])
+        offset = len(prefix) + (1 if prefix else 0)
+        kind = "chapter" if title.casefold().startswith(("глава", "тарау")) else "section"
+        markers.append((offset, kind, title))
+    return markers
+
+
+def _pdf_page_spans(content: bytes, extracted_text: str) -> list[tuple[int, int, int]]:
+    """Map normalized PDF text offsets to 1-based page numbers when safe.
+
+    Page metadata is emitted only when pypdf's page-by-page extraction exactly
+    matches the normalized text selected by :func:`to_markdown`. This avoids
+    attaching incorrect pages when markitdown produced materially different
+    text, or when OCR was needed. The serving and OCR paths remain unchanged.
+    """
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        pages = [
+            (page_number, _normalize_text(page.extract_text() or ""))
+            for page_number, page in enumerate(reader.pages, start=1)
+        ]
+    except Exception as exc:  # noqa: BLE001 - citation locator is best-effort
+        logger.debug("Could not derive PDF page locators: %s", exc)
+        return []
+
+    nonempty = [(number, text) for number, text in pages if text]
+    normalized = _normalize_text(extracted_text)
+    if not nonempty or " ".join(text for _, text in nonempty) != normalized:
+        return []
+
+    spans: list[tuple[int, int, int]] = []
+    cursor = 0
+    for page_number, page_text in nonempty:
+        start = cursor
+        end = start + len(page_text)
+        spans.append((start, end, page_number))
+        cursor = end + 1
+    return spans
+
+
+def _chunk_records(
+    text: str, *, page_spans: list[tuple[int, int, int]] | None = None
+) -> list[dict]:
+    """Chunk text and retain character, page and heading locators per chunk."""
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+
+    size = settings.CHUNK_SIZE
+    overlap = settings.CHUNK_OVERLAP
+    if overlap >= size:
+        overlap = max(0, size // 4)
+    step = size - overlap
+    markers = _section_markers(text)
+
+    records: list[dict] = []
+    active: dict[str, str] = {}
+    marker_index = 0
+    for start in range(0, len(normalized), step):
+        end = min(start + size, len(normalized))
+        window = normalized[start:end].strip()
+        if not window:
+            continue
+
+        while marker_index < len(markers) and markers[marker_index][0] < end:
+            _, kind, title = markers[marker_index]
+            active[kind] = title
+            marker_index += 1
+
+        locator: dict = {
+            "char_start": start,
+            "char_end": end,
+            **active,
+        }
+        pages = sorted(
+            {
+                page_number
+                for page_start, page_end, page_number in (page_spans or [])
+                if start < page_end and end > page_start
+            }
+        )
+        if pages:
+            locator["page_start"] = pages[0]
+            locator["page_end"] = pages[-1]
+            locator["pages"] = pages
+        records.append({"text": window, **locator})
+        if end >= len(normalized):
+            break
+    return records
 
 
 async def upload_document(
@@ -470,8 +587,10 @@ async def upload_document(
     doc_id = _doc_id(key)
     lang = (metadata or {}).get("lang")
     text = to_markdown(filename, content, ocr=ocr, lang=lang)
-    chunks = _chunk_text(text)
-    if not chunks:
+    page_spans = _pdf_page_spans(content, text) if suffix == ".pdf" else []
+    chunk_records = _chunk_records(text, page_spans=page_spans)
+    chunks = [record["text"] for record in chunk_records]
+    if not chunk_records:
         # No usable text (e.g. an image-only/scanned EPUB we now skip). Drop any
         # chunks a previous ingest stored for this document so stale noise does
         # not linger in the index — re-ingest must leave it genuinely empty.
@@ -490,6 +609,11 @@ async def upload_document(
     await vectorstore.delete_document(doc_id)
 
     base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}
+    base_payload.setdefault("source_path", base_payload.get("source") or key)
+    base_payload.setdefault(
+        "source_type", base_payload.get("doc_type") or "document"
+    )
+    base_payload.setdefault("file_type", suffix.removeprefix("."))
     points = [
         {
             "id": uuid.uuid5(_DOC_NAMESPACE, f"{key}:{i}").hex,
@@ -501,10 +625,12 @@ async def upload_document(
                 "doc_id": doc_id,
                 "filename": filename,
                 "chunk_index": i,
-                "text": chunk,
+                "chunk_count": len(chunk_records),
+                **{k: v for k, v in record.items() if k != "text"},
+                "text": record["text"],
             },
         }
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings_list))
+        for i, (record, emb) in enumerate(zip(chunk_records, embeddings_list))
     ]
 
     n = await vectorstore.upsert_points(points)

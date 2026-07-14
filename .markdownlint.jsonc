@@ -1,0 +1,6 @@
+{
+  // Commands, URLs and wide API tables are clearer when kept on one line.
+  "MD013": false,
+  // Existing tables use the compact delimiter style accepted by GitHub Markdown.
+  "MD060": false
+}

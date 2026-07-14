@@ -131,20 +131,58 @@ def format_scenario_context(doc: dict[str, Any]) -> str:
 def format_scenario_state(
     current_step: Optional[str] = None,
     held_items: Optional[list[str]] = None,
+    *,
+    current_step_id: Optional[str] = None,
+    current_step_index: Optional[int] = None,
+    next_step_id: Optional[str] = None,
+    next_step: Optional[str] = None,
+    completed_steps: Optional[list[str]] = None,
+    visible_items: Optional[list[str]] = None,
+    allowed_actions: Optional[list[str]] = None,
+    last_action: Optional[str] = None,
+    last_action_result: Optional[str] = None,
 ) -> str:
     """Render the LIVE per-request scene state (ТЗ §3.2) into a labelled block.
 
-    Unlike the static scenario document, this reflects what the simulator
-    reports *right now*: which step the user is performing and which objects
-    they are currently holding. Returns "" when no live state was supplied.
+    Unlike the static scenario document, this is an authoritative snapshot of
+    what the simulator reports *right now*. Explicit empty lists render as
+    ``нет`` so the model can distinguish "none" from an omitted/unknown field.
+    Returns "" when no usable live state was supplied.
     """
     lines: list[str] = []
+
+    def add_text(label: str, value: Optional[str]) -> None:
+        if value and value.strip():
+            lines.append(f"{label}: {value.strip()}")
+
+    def add_list(label: str, values: Optional[list[str]]) -> None:
+        if values is None:
+            return
+        items = [str(item).strip() for item in values if str(item).strip()]
+        lines.append(f"{label}: {', '.join(items) if items else 'нет'}")
+
+    add_text("ID текущего шага", current_step_id)
+    if current_step_index is not None:
+        lines.append(f"Индекс текущего шага: {current_step_index}")
     if current_step and current_step.strip():
         lines.append(f"Текущий шаг ученика: {current_step.strip()}")
-    items = [str(i).strip() for i in (held_items or []) if str(i).strip()]
-    if items:
-        lines.append("Предметы в руках у ученика: " + ", ".join(items))
-    return "\n".join(lines)
+    add_text("ID следующего шага", next_step_id)
+    add_text("Следующий шаг, назначенный симулятором", next_step)
+    add_list("Завершённые шаги", completed_steps)
+    add_list("Предметы в руках у ученика", held_items)
+    add_list("Предметы, видимые ученику", visible_items)
+    add_list("Разрешённые действия сейчас", allowed_actions)
+    add_text("Последнее действие ученика", last_action)
+    add_text("Результат последнего действия", last_action_result)
+
+    if not lines:
+        return ""
+    authority = (
+        "Авторитетность: это актуальный снимок сцены от симулятора для текущего "
+        "запроса. При расхождении со статическим описанием сценария эти данные "
+        "имеют приоритет."
+    )
+    return "\n".join([authority, *lines])
 
 
 def get_scenario_context(scenario_id: Optional[str]) -> Optional[str]:

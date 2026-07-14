@@ -49,6 +49,36 @@ logger = logging.getLogger("assistant.llm")
 
 _WS_RE = re.compile(r"\s+")
 
+# Precision-biased RU/KK intent signals for questions whose authoritative source
+# is the current lab instruction. General theory wording such as "почему" or
+# "как происходит" deliberately does not match, even when a lab is active.
+_LAB_PROCEDURE_QUERY_RE = re.compile(
+    r"(?:"
+    r"(?:что|чего)\s+(?:мне\s+)?(?:делать|сделать)(?:\s+(?:дальше|сейчас|теперь))?"
+    r"|(?:следующ\w*|текущ\w*)\s+шаг"
+    r"|(?:порядок|последовательность)\s+(?:моих\s+)?действий"
+    r"|ход\s+(?:этой\s+)?работы"
+    r"|как\s+(?:мне\s+)?(?:выполнить|провести|начать|продолжить|завершить)"
+    r"|куда\s+(?:мне\s+)?(?:положить|поставить|налить|переместить)"
+    r"|(?:какова|какая|в\s+ч[её]м)\s+цель\s+(?:лабораторной\s+)?работы"
+    r"|(?:опиши(?:те)?|перечисли(?:те)?|назови(?:те)?)\s+"
+    r"(?:основн\w+\s+)?(?:этапы|шаги)\s+(?:выполнения|проведения)"
+    r"|что\s+(?:мы\s+)?наблюда\w*\s+в\s+ходе\s+"
+    r"(?:эксперимента|опыта|работы)"
+    r"|(?:главн\w+\s+)?результат\s+(?:в\s+)?конце\s+"
+    r"(?:эксперимента|опыта|работы)"
+    r"|(?:енді|қазір|әрі\s+қарай)\s+не\s+істе(?:у(?:ім)?|ймін)"
+    r"|не\s+істеу(?:ім)?\s+(?:керек|қажет)"
+    r"|(?:келесі|қазіргі)\s+қадам"
+    r"|әрекеттер?\s+(?:реті|тәртібі)"
+    r"|жұмыс\s+(?:барысы|тәртібі)"
+    r"|қалай\s+(?:орындау|жасау|бастау|жалғастыру|аяқтау)"
+    r"|қайда\s+(?:қою|құю|орналастыру)"
+    r"|(?:зертханалық\s+)?жұмыстың\s+мақсаты"
+    r")",
+    re.IGNORECASE,
+)
+
 
 # ── Prompt construction ──────────────────────────────────────────────────────
 
@@ -227,11 +257,11 @@ async def _retrieve(
 
 async def _lab_grounding(
     lab: Optional[dict],
-) -> tuple[Optional[str], bool, Any, Optional[str], Any]:
+) -> tuple[Optional[str], bool, Any, Optional[str], Any, list[dict]]:
     """Resolve per-lab grounding from the structured ``lab`` context.
 
     Returns ``(lab_instruction, lab_incomplete, query_filter, lang,
-    fallback_filter)``:
+    fallback_filter, lab_source_chunks)``:
       * ``lab_instruction`` — verbatim procedure text fetched from Qdrant by
         ``lab_id``, or None;
       * ``lab_incomplete`` — True when a specific lab was named (has ``lab_id``)
@@ -245,9 +275,11 @@ async def _lab_grounding(
         back to when the grade-scoped KB is thin (set only when a grade is
         known). Grade chapters are sometimes missing/poorly-OCR'd, so we never
         hard-filter on grade alone.
+      * ``lab_source_chunks`` - stored payloads for the injected instruction,
+        used to return a citation to the actual procedure document.
     """
     if not lab:
-        return None, False, None, None, None
+        return None, False, None, None, None, []
 
     subject = lab.get("subject")
     grade = lab.get("grade")
@@ -264,15 +296,20 @@ async def _lab_grounding(
 
     lab_id = lab.get("lab_id")
     if not lab_id:
-        return None, False, query_filter, lang, fallback_filter
+        return None, False, query_filter, lang, fallback_filter, []
 
-    instruction = await vectorstore.fetch_lab_instruction(lab_id)
+    record = await vectorstore.fetch_lab_instruction_record(lab_id)
+    instruction = record["text"] if record else ""
+    source_chunks = [
+        {"payload": payload} for payload in (record or {}).get("payloads", [])
+    ]
     return (
         (instruction or None),
         (not instruction),
         query_filter,
         lang,
         fallback_filter,
+        source_chunks,
     )
 
 
@@ -296,23 +333,139 @@ def _format_knowledge(chunks: list[dict]) -> str:
 
 
 def _citations_from_chunks(chunks: list[dict]) -> list[dict]:
-    """Derive citations from retrieved chunks, deduped by filename.
+    """Group chunk metadata into stable, locator-rich document citations.
 
-    Returns ``{"filename", "file_id"}`` per distinct filename, in first-seen
-    order. Tolerant of missing payload keys.
+    ``filename`` and ``file_id`` remain present for existing clients. New fields
+    describe the source type/path and aggregate chunk, page, chapter and section
+    locators across all retrieved chunks from the same document. Payloads that
+    cannot identify a real document are skipped, so no null citations leak into
+    API responses.
     """
-    citations: list[dict] = []
-    seen: set = set()
+    grouped: dict[tuple[str, str], dict] = {}
     for chunk in chunks:
         payload = chunk.get("payload") or {}
+        source_path = payload.get("source_path") or payload.get("source")
         filename = payload.get("filename")
-        if filename in seen:
+        if not filename and source_path:
+            filename = re.split(r"[/\\]", str(source_path))[-1]
+        file_id = payload.get("doc_id") or payload.get("file_id")
+        if not filename or not file_id:
             continue
-        seen.add(filename)
-        citations.append(
-            {"filename": filename, "file_id": payload.get("doc_id")}
+
+        key = (str(file_id), str(source_path or filename))
+        citation = grouped.get(key)
+        if citation is None:
+            citation = {"filename": filename, "file_id": file_id}
+            for field_name, value in (
+                ("source_type", payload.get("source_type") or payload.get("doc_type")),
+                ("source_path", source_path),
+                ("file_type", payload.get("file_type")),
+                ("subject", payload.get("subject")),
+                ("grade", payload.get("grade")),
+                ("lang", payload.get("lang")),
+                ("lab_id", payload.get("lab_id")),
+                ("lab_number", payload.get("lab_number")),
+            ):
+                if value is not None and value != "":
+                    citation[field_name] = value
+            citation["_chunk_indexes"] = set()
+            citation["_pages"] = set()
+            citation["_chapters"] = []
+            citation["_sections"] = []
+            grouped[key] = citation
+
+        chunk_indexes = payload.get("chunk_indexes")
+        if not isinstance(chunk_indexes, (list, tuple, set)):
+            chunk_indexes = [payload.get("chunk_index")]
+        citation["_chunk_indexes"].update(
+            value for value in chunk_indexes if isinstance(value, int)
         )
+
+        pages = payload.get("pages")
+        if not isinstance(pages, (list, tuple, set)):
+            pages = [pages]
+        pages = list(pages) + [payload.get("page_start"), payload.get("page_end")]
+        citation["_pages"].update(value for value in pages if isinstance(value, int))
+
+        for field_name, accumulator in (
+            ("chapter", "_chapters"),
+            ("section", "_sections"),
+        ):
+            value = payload.get(field_name)
+            if value and value not in citation[accumulator]:
+                citation[accumulator].append(value)
+
+    citations: list[dict] = []
+    for citation in grouped.values():
+        chunk_indexes = sorted(citation.pop("_chunk_indexes"))
+        pages = sorted(citation.pop("_pages"))
+        chapters = citation.pop("_chapters")
+        sections = citation.pop("_sections")
+        if chunk_indexes:
+            citation["chunk_indexes"] = chunk_indexes
+        if pages:
+            citation["pages"] = pages
+            citation["page_start"] = pages[0]
+            citation["page_end"] = pages[-1]
+        if chapters:
+            citation["chapters"] = chapters
+            if len(chapters) == 1:
+                citation["chapter"] = chapters[0]
+        if sections:
+            citation["sections"] = sections
+            if len(sections) == 1:
+                citation["section"] = sections[0]
+        citation["display_label"] = _citation_display_label(citation)
+        citations.append(citation)
     return citations
+
+
+def _citation_display_label(citation: dict) -> str:
+    """Build a concise Russian display label from structured citation data."""
+    if citation.get("source_type") == "lab_instruction":
+        number = citation.get("lab_number")
+        label = "Инструкция к лабораторной работе"
+        if number is not None:
+            label += f" №{number}"
+    else:
+        filename = str(citation.get("filename") or "Источник")
+        label = re.sub(r"\.[^.]+$", "", filename)
+
+    if citation.get("chapter"):
+        label += f", {citation['chapter']}"
+    elif citation.get("section"):
+        label += f", {citation['section']}"
+
+    page_start = citation.get("page_start")
+    page_end = citation.get("page_end")
+    if page_start is not None:
+        page_label = str(page_start)
+        if page_end is not None and page_end != page_start:
+            page_label += f"-{page_end}"
+        label += f", стр. {page_label}"
+    return label
+
+
+def _is_lab_procedure_query(query: str) -> bool:
+    """Whether RU/KK wording clearly asks for current-lab procedure details."""
+    normalized = _WS_RE.sub(" ", query or "").strip()
+    return bool(normalized and _LAB_PROCEDURE_QUERY_RE.search(normalized))
+
+
+def _answer_citations(
+    query: str, theory_chunks: list[dict], lab_source_chunks: list[dict]
+) -> list[dict]:
+    """Build citations with primary-source ordering matched to query intent.
+
+    Lab procedure/current-step questions prefer the lab instruction. Theory
+    questions prefer retrieved textbooks, while still retaining the injected
+    lab instruction after them for transparency.
+    """
+    if _is_lab_procedure_query(query):
+        ordered_chunks = [*lab_source_chunks, *theory_chunks]
+    else:
+        ordered_chunks = [*theory_chunks, *lab_source_chunks]
+    return _citations_from_chunks(ordered_chunks)
 
 
 def _response_text(response: Any) -> str:
@@ -444,7 +597,14 @@ async def generate_answer(
             _log_generation("answer_cached", query, cached)
             return cached
 
-    lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
+    (
+        lab_instruction,
+        lab_incomplete,
+        query_filter,
+        lang,
+        fallback_filter,
+        lab_source_chunks,
+    ) = (
         await _lab_grounding(lab)
     )
     chunks = await _retrieve(
@@ -484,7 +644,7 @@ async def generate_answer(
 
     result = AnswerResult(
         answer=answer,
-        citations=_citations_from_chunks(chunks),
+        citations=_answer_citations(query, chunks, lab_source_chunks),
         usage=_usage_dict(response),
     )
     _log_generation("answer", query, result)
@@ -524,7 +684,14 @@ async def stream_answer(
             yield {"type": "done", "citations": cached.citations, "usage": cached.usage}
             return
 
-    lab_instruction, lab_incomplete, query_filter, lang, fallback_filter = (
+    (
+        lab_instruction,
+        lab_incomplete,
+        query_filter,
+        lang,
+        fallback_filter,
+        lab_source_chunks,
+    ) = (
         await _lab_grounding(lab)
     )
     chunks = await _retrieve(
@@ -569,7 +736,7 @@ async def stream_answer(
 
     result = AnswerResult(
         answer=_response_text(final),
-        citations=_citations_from_chunks(chunks),
+        citations=_answer_citations(query, chunks, lab_source_chunks),
         usage=_usage_dict(final),
     )
     _log_generation("answer_stream", query, result)
