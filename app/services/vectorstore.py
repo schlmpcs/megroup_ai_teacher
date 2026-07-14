@@ -247,6 +247,17 @@ async def list_documents() -> list[dict]:
         if not await client.collection_exists(settings.QDRANT_COLLECTION):
             return []
         docs: dict[str, dict] = {}
+        metadata_fields = (
+            "doc_type",
+            "source_type",
+            "source_path",
+            "subject",
+            "grade",
+            "lang",
+            "lab_id",
+            "lab_number",
+            "file_type",
+        )
         offset = None
         while True:
             records, offset = await client.scroll(
@@ -263,16 +274,29 @@ async def list_documents() -> list[dict]:
                     continue
                 entry = docs.get(doc_id)
                 if entry is None:
-                    docs[doc_id] = {
+                    entry = {
                         "file_id": doc_id,
                         "filename": payload.get("filename"),
                         "chunks": 1,
                         "status": "ready",
                     }
+                    for field in metadata_fields:
+                        entry[field] = payload.get(field)
+                    # Older ingests used ``source`` / ``doc_type`` before the
+                    # explicit citation aliases were added. Expose useful
+                    # listing metadata for those documents too.
+                    entry["source_path"] = entry["source_path"] or payload.get("source")
+                    entry["source_type"] = entry["source_type"] or entry["doc_type"]
+                    docs[doc_id] = entry
                 else:
                     entry["chunks"] += 1
                     if entry["filename"] is None:
                         entry["filename"] = payload.get("filename")
+                    for field in metadata_fields:
+                        if entry[field] is None:
+                            entry[field] = payload.get(field)
+                    entry["source_path"] = entry["source_path"] or payload.get("source")
+                    entry["source_type"] = entry["source_type"] or entry["doc_type"]
             if offset is None:
                 break
     except Exception as exc:  # noqa: BLE001

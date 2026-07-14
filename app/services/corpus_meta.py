@@ -46,6 +46,10 @@ _LANGS = {
 _GRADE_RE = re.compile(r"(\d{1,2})")
 _LABNUM_RE = re.compile(r"№?\s*(\d{1,2})")
 
+_UPLOAD_DOC_TYPES = {"textbook", "lab_instruction"}
+_UPLOAD_SUBJECTS = {"physics", "chemistry", "biology"}
+_UPLOAD_LANGS = {"ru", "kk"}
+
 
 def _norm(token: str) -> str:
     return unicodedata.normalize("NFKC", token).strip().lower()
@@ -106,6 +110,92 @@ def compose_lab_id(
     if lab_number is None:
         return None
     return f"{subject}-{grade}-{lang}-{lab_number:02d}"
+
+
+def _upload_basename(filename: str) -> str:
+    """Return a safe, Unicode-preserving basename for an admin upload."""
+    normalized = unicodedata.normalize("NFKC", str(filename)).replace("\\", "/")
+    basename = PurePath(normalized).name.strip()
+    basename = re.sub(r"[\x00-\x1f\x7f]", "_", basename)
+    if not basename or basename in {".", ".."}:
+        raise ValueError("filename must contain a valid basename")
+    return basename
+
+
+def _upload_int(value: object, field: str, minimum: int, maximum: int) -> int:
+    """Validate an integer upload field without silently accepting booleans."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer from {minimum} to {maximum}")
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field} must be an integer from {minimum} to {maximum}"
+        ) from exc
+    if str(value).strip() != str(parsed) or not minimum <= parsed <= maximum:
+        raise ValueError(f"{field} must be an integer from {minimum} to {maximum}")
+    return parsed
+
+
+def build_upload_metadata(
+    filename: str,
+    doc_type: Optional[str] = None,
+    subject: Optional[str] = None,
+    grade: Optional[int] = None,
+    lang: Optional[str] = None,
+    lab_number: Optional[int] = None,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Validate structured admin-upload fields and build stable metadata.
+
+    With no structured fields this preserves the legacy upload behaviour by
+    returning ``(None, None)``. Structured documents get a deterministic
+    virtual source below ``admin_uploads``; that source is also their document
+    key, so re-uploading the same filename in the same metadata scope replaces
+    the document while identical filenames in other scopes remain distinct.
+    """
+    structured = (doc_type, subject, grade, lang, lab_number)
+    if all(value is None for value in structured):
+        return None, None
+    if doc_type is None:
+        raise ValueError("doc_type is required when structured metadata is provided")
+
+    doc_type = str(doc_type).strip().lower()
+    if doc_type not in _UPLOAD_DOC_TYPES:
+        raise ValueError("doc_type must be 'textbook' or 'lab_instruction'")
+
+    if subject is None or grade is None or lang is None:
+        raise ValueError(f"{doc_type} requires subject, grade and lang")
+    subject = str(subject).strip().lower()
+    lang = str(lang).strip().lower()
+    if subject not in _UPLOAD_SUBJECTS:
+        raise ValueError("subject must be physics, chemistry or biology")
+    if lang not in _UPLOAD_LANGS:
+        raise ValueError("lang must be ru or kk")
+    grade = _upload_int(grade, "grade", 7, 11)
+
+    basename = _upload_basename(filename)
+    scope = ["admin_uploads", doc_type, subject, str(grade), lang]
+    metadata: dict = {
+        "doc_type": doc_type,
+        "subject": subject,
+        "grade": grade,
+        "lang": lang,
+    }
+
+    if doc_type == "textbook":
+        if lab_number is not None:
+            raise ValueError("textbook does not accept lab_number")
+    else:
+        if lab_number is None:
+            raise ValueError("lab_instruction requires lab_number")
+        lab_number = _upload_int(lab_number, "lab_number", 1, 99)
+        lab_id = compose_lab_id(subject, grade, lang, lab_number)
+        metadata.update(lab_number=lab_number, lab_id=lab_id)
+        scope.append(f"{lab_number:02d}")
+
+    source = "/".join([*scope, basename])
+    metadata["source"] = source
+    return metadata, source
 
 
 def parse_path(path: str, corpus_root: Optional[str] = None) -> Optional[dict]:

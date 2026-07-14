@@ -84,6 +84,114 @@ def test_compose_lab_id_without_number_is_none():
     assert corpus_meta.compose_lab_id("physics", 10, "ru", None) is None
 
 
+def test_build_upload_metadata_legacy_upload_is_unchanged():
+    assert corpus_meta.build_upload_metadata("notes.pdf") == (None, None)
+
+
+def test_build_upload_metadata_textbook_has_stable_scoped_key():
+    metadata, doc_key = corpus_meta.build_upload_metadata(
+        "../unsafe/Physics 8.pdf",
+        doc_type="textbook",
+        subject="physics",
+        grade=8,
+        lang="ru",
+    )
+
+    assert doc_key == "admin_uploads/textbook/physics/8/ru/Physics 8.pdf"
+    assert metadata == {
+        "source": doc_key,
+        "doc_type": "textbook",
+        "subject": "physics",
+        "grade": 8,
+        "lang": "ru",
+    }
+
+
+def test_build_upload_metadata_lab_instruction_composes_lab_id():
+    metadata, doc_key = corpus_meta.build_upload_metadata(
+        r"C:\uploads\Lab 2.docx",
+        doc_type="lab_instruction",
+        subject="chemistry",
+        grade=10,
+        lang="kk",
+        lab_number=2,
+    )
+
+    assert doc_key == "admin_uploads/lab_instruction/chemistry/10/kk/02/Lab 2.docx"
+    assert metadata["source"] == doc_key
+    assert metadata["lab_number"] == 2
+    assert metadata["lab_id"] == "chemistry-10-kk-02"
+
+
+def test_build_upload_metadata_scopes_same_filename_without_collisions():
+    _, physics_key = corpus_meta.build_upload_metadata(
+        "book.pdf", "textbook", "physics", 7, "ru"
+    )
+    _, biology_key = corpus_meta.build_upload_metadata(
+        "book.pdf", "textbook", "biology", 7, "ru"
+    )
+    _, physics_key_again = corpus_meta.build_upload_metadata(
+        "book.pdf", "textbook", "physics", 7, "ru"
+    )
+
+    assert physics_key != biology_key
+    assert physics_key == physics_key_again
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"subject": "physics"}, "doc_type is required"),
+        ({"doc_type": "notes"}, "doc_type must be"),
+        ({"doc_type": "textbook"}, "requires subject, grade and lang"),
+        (
+            {"doc_type": "textbook", "subject": "math", "grade": 8, "lang": "ru"},
+            "subject must be",
+        ),
+        (
+            {"doc_type": "textbook", "subject": "physics", "grade": 6, "lang": "ru"},
+            "grade must be",
+        ),
+        (
+            {"doc_type": "textbook", "subject": "physics", "grade": 8, "lang": "en"},
+            "lang must be",
+        ),
+        (
+            {
+                "doc_type": "textbook",
+                "subject": "physics",
+                "grade": 8,
+                "lang": "ru",
+                "lab_number": 1,
+            },
+            "does not accept lab_number",
+        ),
+        (
+            {
+                "doc_type": "lab_instruction",
+                "subject": "physics",
+                "grade": 8,
+                "lang": "ru",
+            },
+            "requires lab_number",
+        ),
+        (
+            {
+                "doc_type": "lab_instruction",
+                "subject": "physics",
+                "grade": 8,
+                "lang": "ru",
+                "lab_number": 100,
+            },
+            "lab_number must be",
+        ),
+    ],
+)
+def test_build_upload_metadata_rejects_invalid_structured_fields(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        corpus_meta.build_upload_metadata("document.pdf", **kwargs)
+
+
 # ── ingestion: to_markdown + bulk + manifest ─────────────────────────────────
 
 
@@ -244,6 +352,49 @@ async def test_fetch_lab_instruction_record_keeps_source_payloads(monkeypatch):
     assert record["payloads"][0]["source"].endswith("Лабораторная работа №2.docx")
     # The old public helper remains text-only for backwards compatibility.
     assert await vectorstore.fetch_lab_instruction("physics-8-ru-02") == record["text"]
+
+
+async def test_list_documents_exposes_document_metadata(monkeypatch):
+    first = {
+        "doc_id": "physics-book-8",
+        "filename": "Physics 8.pdf",
+        "doc_type": "textbook",
+        "source": "admin_uploads/textbook/physics/8/ru/Physics 8.pdf",
+        "subject": "physics",
+        "grade": 8,
+        "lang": "ru",
+        "file_type": "pdf",
+    }
+    second = {**first, "source_type": "textbook", "source_path": first["source"]}
+
+    class _Client:
+        async def collection_exists(self, name):
+            return True
+
+        async def scroll(self, **kwargs):
+            return [SimpleNamespace(payload=first), SimpleNamespace(payload=second)], None
+
+    monkeypatch.setattr(vectorstore, "get_client", lambda: _Client())
+
+    documents = await vectorstore.list_documents()
+
+    assert documents == [
+        {
+            "file_id": "physics-book-8",
+            "filename": "Physics 8.pdf",
+            "chunks": 2,
+            "status": "ready",
+            "doc_type": "textbook",
+            "source_type": "textbook",
+            "source_path": first["source"],
+            "subject": "physics",
+            "grade": 8,
+            "lang": "ru",
+            "lab_id": None,
+            "lab_number": None,
+            "file_type": "pdf",
+        }
+    ]
 
 
 # ── llm: lab-aware grounding ─────────────────────────────────────────────────

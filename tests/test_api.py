@@ -496,6 +496,196 @@ def test_list_scenarios_endpoint(client, auth):
     assert "physics_lab_02_heating" in ids
 
 
+def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
+    call = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
+        call.update(
+            filename=filename,
+            raw=raw,
+            metadata=metadata,
+            doc_key=doc_key,
+            ocr=ocr,
+        )
+        return {
+            "file_id": "general-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("../notes.md", b"general notes", "text/markdown")},
+        headers=auth,
+    )
+
+    assert r.status_code == 201
+    assert r.json() == {
+        "file_id": "general-id",
+        "filename": "notes.md",
+        "status": "ready",
+        "chunks": 1,
+    }
+    assert call == {
+        "filename": "notes.md",
+        "raw": b"general notes",
+        "metadata": None,
+        "doc_key": None,
+        "ocr": False,
+    }
+
+
+def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
+    call = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
+        call.update(metadata=metadata, doc_key=doc_key)
+        return {
+            "file_id": "textbook-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 4,
+        }
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("Physics 8.pdf", b"pdf data", "application/pdf")},
+        data={
+            "doc_type": "textbook",
+            "subject": "physics",
+            "grade": "8",
+            "lang": "ru",
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 201
+    metadata = r.json()["metadata"]
+    assert metadata == call["metadata"]
+    assert metadata == {
+        "doc_type": "textbook",
+        "subject": "physics",
+        "grade": 8,
+        "lang": "ru",
+        "source": "admin_uploads/textbook/physics/8/ru/Physics 8.pdf",
+    }
+    assert call["doc_key"] == metadata["source"]
+
+
+def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
+    call = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
+        call.update(metadata=metadata, doc_key=doc_key)
+        return {
+            "file_id": "lab-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 2,
+        }
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("Lab 2.docx", b"docx data", "application/octet-stream")},
+        data={
+            "doc_type": "lab_instruction",
+            "subject": "chemistry",
+            "grade": "10",
+            "lang": "kk",
+            "lab_number": "2",
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 201
+    metadata = r.json()["metadata"]
+    assert metadata["lab_id"] == "chemistry-10-kk-02"
+    assert metadata["lab_number"] == 2
+    assert metadata["source"] == (
+        "admin_uploads/lab_instruction/chemistry/10/kk/02/Lab 2.docx"
+    )
+    assert call["metadata"] == metadata
+    assert call["doc_key"] == metadata["source"]
+
+
+def test_upload_forwards_ocr_flag(client, auth, monkeypatch):
+    call = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
+        call["ocr"] = ocr
+        return {
+            "file_id": "ocr-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("scan.pdf", b"scanned pdf", "application/pdf")},
+        data={"ocr": "true"},
+        headers=auth,
+    )
+
+    assert r.status_code == 201
+    assert call["ocr"] is True
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"subject": "physics", "grade": "8", "lang": "ru"},
+        {"doc_type": "textbook", "subject": "physics", "grade": "8"},
+        {
+            "doc_type": "lab_instruction",
+            "subject": "chemistry",
+            "grade": "10",
+            "lang": "kk",
+        },
+        {
+            "doc_type": "textbook",
+            "subject": "physics",
+            "grade": "8",
+            "lang": "ru",
+            "lab_number": "2",
+        },
+    ],
+)
+def test_upload_invalid_metadata_combination_400(client, auth, metadata):
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("document.pdf", b"pdf data", "application/pdf")},
+        data=metadata,
+        headers=auth,
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"doc_type": "notes"},
+        {"doc_type": "textbook", "subject": "math"},
+        {"doc_type": "textbook", "grade": "6"},
+        {"doc_type": "textbook", "lang": "en"},
+        {"doc_type": "lab_instruction", "lab_number": "100"},
+    ],
+)
+def test_upload_enum_and_range_validation_422(client, auth, metadata):
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("document.pdf", b"pdf data", "application/pdf")},
+        data=metadata,
+        headers=auth,
+    )
+    assert r.status_code == 422
+
+
 def test_upload_unsupported_type_400(client, auth):
     r = client.post(
         "/admin/documents",

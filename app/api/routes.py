@@ -25,7 +25,7 @@ from slowapi.util import get_remote_address
 from app.core.config import settings
 from app.core.security import verify_api_key
 from app.services import ingestion
-from app.services.corpus_meta import compose_lab_id
+from app.services.corpus_meta import build_upload_metadata, compose_lab_id
 from app.services.llm import (
     LLMTimeoutError,
     LLMError,
@@ -680,13 +680,17 @@ async def corpus_status_endpoint():
 
 
 @router.post("/admin/documents", status_code=status.HTTP_201_CREATED)
-async def upload_document_endpoint(file: UploadFile = File(...)):
-    """Upload one untagged PDF/DOCX/EPUB/TXT/MD document into the knowledge base.
-
-    Structured textbook and lab-instruction metadata is assigned only by the
-    corpus ``bulk-ingest`` workflow documented in ``README.md``.
-    """
-    filename = file.filename or ""
+async def upload_document_endpoint(
+    file: UploadFile = File(...),
+    doc_type: Optional[Literal["textbook", "lab_instruction"]] = Form(None),
+    subject: Optional[Literal["physics", "chemistry", "biology"]] = Form(None),
+    grade: Optional[int] = Form(None, ge=7, le=11),
+    lang: Optional[Literal["ru", "kk"]] = Form(None),
+    lab_number: Optional[int] = Form(None, ge=1, le=99),
+    ocr: bool = Form(False),
+):
+    """Upload a general document, textbook, or lab instruction into the KB."""
+    filename = Path((file.filename or "").replace("\\", "/")).name
     suffix = Path(filename).suffix.lower()
     if suffix not in ingestion.SUPPORTED_EXTENSIONS:
         raise HTTPException(
@@ -696,13 +700,38 @@ async def upload_document_endpoint(file: UploadFile = File(...)):
                 f"{', '.join(sorted(ingestion.SUPPORTED_EXTENSIONS))}"
             ),
         )
+
+    structured_metadata_supplied = any(
+        value is not None for value in (doc_type, subject, grade, lang, lab_number)
+    )
+    try:
+        metadata, doc_key = build_upload_metadata(
+            filename,
+            doc_type=doc_type,
+            subject=subject,
+            grade=grade,
+            lang=lang,
+            lab_number=lab_number,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     raw = await _read_upload(file)
     try:
-        return await ingestion.upload_document(filename, raw)
+        result = await ingestion.upload_document(
+            filename,
+            raw,
+            metadata=metadata,
+            doc_key=doc_key,
+            ocr=ocr,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except LLMError as exc:
         _handle_llm_error(exc)
+    if structured_metadata_supplied:
+        return {**result, "metadata": metadata}
+    return result
 
 
 @router.get("/admin/documents")
