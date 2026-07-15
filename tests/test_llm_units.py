@@ -213,6 +213,8 @@ def test_build_system_prompt_general_fallback_is_explicit_and_language_locked():
     assert "Жауапты толық қазақ тілінде жаз" in prompt
     assert llm._GENERAL_KNOWLEDGE_MARKER in prompt
     assert llm._GROUNDED_MARKER in prompt
+    assert "запрещено отказывать" in prompt
+    assert "бас тартпай" in prompt
 
 
 def test_query_inference_handles_ru_and_kk_across_school_subjects(monkeypatch):
