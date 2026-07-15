@@ -9,7 +9,7 @@ simulator (physics / chemistry / biology). Retrieval is now **local + hybrid**:
 the knowledge base lives in a self-hosted **Qdrant** vector store, queried with
 a local **BAAI/bge-m3** GPU embedder (dense + learned-sparse, fused by RRF).
 Voice (STT/TTS) is now also **local**: an in-repo GPU sidecar (Whisper
-ru/kk/auto + Qwen3-TTS 0.6B default/Supertonic selectable for ru + MMS kaz,
+ru/kk/auto + Supertonic default/Qwen3-TTS 0.6B selectable for ru + MMS kaz,
 the `voice` compose service in `./voice`,
 vendored from the former `../vrrag_ttsstt`) reached over HTTP.
 Only generation (answers/hints) still uses **OpenAI cloud** (Responses API).
@@ -87,7 +87,7 @@ routes.py
   Voice no longer touches OpenAI. `voice.transcribe`/`voice.synthesize` POST to
   the in-repo `voice` sidecar (`./voice`, the `voice` compose service) at
   `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out). Russian TTS
-  defaults to Qwen3-TTS 0.6B; `backend=supertonic` selects the comparison model.
+  defaults to Supertonic; `backend=qwen` selects Qwen3-TTS 0.6B explicitly.
 - Responses API param is `max_output_tokens` (not `max_tokens`).
 - Qdrant collection has one point per chunk with two named vectors: `dense`
   (1024-d, cosine, configured by `EMBEDDING_DIM`) and `sparse` (learned-sparse

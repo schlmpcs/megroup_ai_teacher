@@ -380,11 +380,11 @@ def test_tts(client, auth, monkeypatch):
     r = client.post("/tts", json={"text": "Привет, ученик"}, headers=auth)
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/wav")
-    assert r.headers["x-tts-backend"] == "qwen"
+    assert r.headers["x-tts-backend"] == "supertonic"
     assert r.content == b"AUDIOBYTES"
 
 
-def test_tts_selects_supertonic(client, auth, monkeypatch):
+def test_tts_selects_qwen(client, auth, monkeypatch):
     calls = []
 
     async def _synth(
@@ -401,13 +401,13 @@ def test_tts_selects_supertonic(client, auth, monkeypatch):
     monkeypatch.setattr(routes, "synthesize", _synth)
     r = client.post(
         "/tts",
-        json={"text": "Привет, ученик", "backend": "supertonic", "voice": "M3"},
+        json={"text": "Привет, ученик", "backend": "qwen", "voice": "Aiden"},
         headers=auth,
     )
 
     assert r.status_code == 200
-    assert r.headers["x-tts-backend"] == "supertonic"
-    assert calls == [{"backend": "supertonic", "voice": "M3"}]
+    assert r.headers["x-tts-backend"] == "qwen"
+    assert calls == [{"backend": "qwen", "voice": "Aiden"}]
 
 
 def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):

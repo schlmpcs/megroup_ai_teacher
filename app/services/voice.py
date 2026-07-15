@@ -10,8 +10,8 @@ exposes a plain HTTP API:
        (json: text/language/speed/backend/voice)
        -> audio/wav bytes
 
-STT runs a multilingual Whisper (ru/kk/auto). Russian TTS defaults to Qwen3-TTS
-0.6B and can explicitly select Qwen or Supertonic; Kazakh uses MMS. The local
+STT runs a multilingual Whisper (ru/kk/auto). Russian TTS defaults to Supertonic
+and can explicitly select Qwen3-TTS 0.6B; Kazakh uses MMS. The local
 ``voice`` control selects the Qwen speaker or Supertonic style. The cloud-era
 ``instructions`` / ``response_format`` knobs remain compatibility-only.
 
@@ -129,8 +129,8 @@ async def synthesize(
 ) -> tuple[bytes, str]:
     """Synthesize ``text`` to speech via the sidecar. Returns (audio_bytes, media_type).
 
-    Russian supports ``qwen`` and ``supertonic`` backends. Qwen is selected by
-    default and ``voice`` chooses its speaker (or the Supertonic style). Kazakh
+    Russian supports ``qwen`` and ``supertonic`` backends. Supertonic is selected
+    by default and ``voice`` chooses its style (or the Qwen speaker). Kazakh
     stays on MMS. Output is always WAV.
     """
     lang = language or settings.DEFAULT_LANGUAGE

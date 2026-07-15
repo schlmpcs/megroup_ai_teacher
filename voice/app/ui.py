@@ -277,8 +277,8 @@ TEST_UI_HTML = """<!doctype html>
           <textarea id="tts-text-ru" data-role="tts-text" autocomplete="off">Здравствуйте, я проверяю синтез речи.</textarea>
           <div class="control-row">
             <select data-role="tts-backend" aria-label="TTS backend">
-              <option value="qwen">Qwen3-TTS 0.6B</option>
               <option value="supertonic">Supertonic</option>
+              <option value="qwen">Qwen3-TTS 0.6B</option>
               <option value="mms">MMS</option>
             </select>
             <button data-action="tts" type="button">Generate</button>

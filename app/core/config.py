@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False
     VOICE_TIMEOUT_S: float = 120.0  # generous: covers GPU cold start + ≤120s audio
-    VOICE_TTS_RU_DEFAULT_BACKEND: str = "qwen"
+    VOICE_TTS_RU_DEFAULT_BACKEND: str = "supertonic"
 
     @field_validator("VOICE_TTS_RU_DEFAULT_BACKEND")
     @classmethod

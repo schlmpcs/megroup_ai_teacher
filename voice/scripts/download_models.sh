@@ -13,7 +13,7 @@ qwen_model = os.environ.get(
 )
 ru_backends = {
     item.strip().lower()
-    for item in os.environ.get("TTS_RU_BACKENDS", "qwen,supertonic").split(",")
+    for item in os.environ.get("TTS_RU_BACKENDS", "supertonic,qwen").split(",")
     if item.strip()
 }
 repos = [

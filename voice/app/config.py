@@ -31,8 +31,8 @@ class Settings:
     stt_ru_model: str = os.getenv("STT_RU_MODEL", "openai/whisper-large-v3-turbo")
     tts_kk_model: str = os.getenv("TTS_KK_MODEL", "facebook/mms-tts-kaz")
     tts_ru_model: str = os.getenv("TTS_RU_MODEL", "facebook/mms-tts-rus")
-    tts_ru_backend: str = os.getenv("TTS_RU_BACKEND", "qwen").strip().lower()
-    tts_ru_backends: tuple[str, ...] = _csv_env("TTS_RU_BACKENDS", "qwen,supertonic")
+    tts_ru_backend: str = os.getenv("TTS_RU_BACKEND", "supertonic").strip().lower()
+    tts_ru_backends: tuple[str, ...] = _csv_env("TTS_RU_BACKENDS", "supertonic,qwen")
     tts_ru_qwen_model: str = os.getenv(
         "TTS_RU_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     )

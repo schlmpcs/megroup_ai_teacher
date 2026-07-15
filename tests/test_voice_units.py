@@ -97,28 +97,28 @@ async def test_synthesize_posts_json_and_returns_wav(monkeypatch):
     }
 
 
-async def test_synthesize_defaults_russian_to_qwen_and_forwards_voice(monkeypatch):
+async def test_synthesize_defaults_russian_to_supertonic(monkeypatch):
     fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
     monkeypatch.setattr(voice, "_http", lambda: fake)
 
-    await voice.synthesize("Здравствуйте", language="ru", voice="Serena")
+    await voice.synthesize("Здравствуйте", language="ru")
 
     assert fake.calls[0][1]["json"] == {
         "text": "Здравствуйте",
         "language": "ru",
         "speed": 1.0,
-        "backend": "qwen",
-        "voice": "Serena",
+        "backend": "supertonic",
     }
 
 
-async def test_synthesize_can_select_supertonic(monkeypatch):
+async def test_synthesize_can_select_qwen_and_forward_voice(monkeypatch):
     fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
     monkeypatch.setattr(voice, "_http", lambda: fake)
 
-    await voice.synthesize("Здравствуйте", language="ru", backend="supertonic")
+    await voice.synthesize("Здравствуйте", language="ru", backend="qwen", voice="Aiden")
 
-    assert fake.calls[0][1]["json"]["backend"] == "supertonic"
+    assert fake.calls[0][1]["json"]["backend"] == "qwen"
+    assert fake.calls[0][1]["json"]["voice"] == "Aiden"
 
 
 async def test_synthesize_empty_audio_raises(monkeypatch):
