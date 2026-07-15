@@ -36,7 +36,7 @@ class Settings:
     tts_ru_qwen_model: str = os.getenv(
         "TTS_RU_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     )
-    tts_ru_qwen_speaker: str = os.getenv("TTS_RU_QWEN_SPEAKER", "Serena")
+    tts_ru_qwen_speaker: str = os.getenv("TTS_RU_QWEN_SPEAKER", "Aiden")
     tts_ru_qwen_dtype: str = os.getenv("TTS_RU_QWEN_DTYPE", "bfloat16").strip().lower()
     tts_ru_qwen_attention: str = (
         os.getenv("TTS_RU_QWEN_ATTENTION", "sdpa").strip().lower()
