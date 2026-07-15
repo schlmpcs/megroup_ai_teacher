@@ -173,3 +173,6 @@ async def test_synthesize_uses_cache(monkeypatch):
 
     await voice.synthesize("Привет", language="kk")  # different language -> miss
     assert fake.calls == 2
+
+    await voice.synthesize("Привет", language="ru", backend="supertonic")
+    assert fake.calls == 3

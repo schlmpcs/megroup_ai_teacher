@@ -6,13 +6,14 @@ exposes a plain HTTP API:
 
   STT: POST {VOICE_BASE_URL}/stt/recognize   (multipart: audio file + language)
        -> {"text": "...", "language": "ru", "confidence": null, "duration_ms": N}
-  TTS: POST {VOICE_BASE_URL}/tts/synthesize?format=wav   (json: text/language/speed)
+  TTS: POST {VOICE_BASE_URL}/tts/synthesize?format=wav
+       (json: text/language/speed/backend/voice)
        -> audio/wav bytes
 
-STT runs a multilingual Whisper (ru/kk/auto); TTS runs supertonic (ru) / MMS
-(kaz). There is a single fixed voice and language control only — the cloud-era
-``voice`` / ``instructions`` / ``response_format`` knobs no longer apply and are
-accepted only for backward-compatible call signatures.
+STT runs a multilingual Whisper (ru/kk/auto). Russian TTS defaults to Qwen3-TTS
+0.6B and can explicitly select Qwen or Supertonic; Kazakh uses MMS. The local
+``voice`` control selects the Qwen speaker or Supertonic style. The cloud-era
+``instructions`` / ``response_format`` knobs remain compatibility-only.
 
 This module mirrors ``embeddings.py``: a lazy shared ``httpx.AsyncClient`` and
 upstream failures mapped onto the shared ``LLMError`` family so routes translate
@@ -120,23 +121,35 @@ async def transcribe(
 
 async def synthesize(
     text: str,
-    voice: Optional[str] = None,  # noqa: ARG001 — accepted for call-site compat
-    response_format: Optional[str] = None,  # noqa: ARG001 — sidecar always WAV
-    instructions: Optional[str] = None,  # noqa: ARG001 — no persona control
+    voice: Optional[str] = None,
+    response_format: Optional[str] = None,  # noqa: ARG001, sidecar always WAV
+    instructions: Optional[str] = None,  # noqa: ARG001, no instruction control
     language: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> tuple[bytes, str]:
     """Synthesize ``text`` to speech via the sidecar. Returns (audio_bytes, media_type).
 
-    The local TTS exposes only ``language`` (``"ru"`` / ``"kk"``); ``voice``,
-    ``response_format`` and ``instructions`` are accepted for backward-compatible
-    call signatures but have no effect (single fixed voice, WAV output).
+    Russian supports ``qwen`` and ``supertonic`` backends. Qwen is selected by
+    default and ``voice`` chooses its speaker (or the Supertonic style). Kazakh
+    stays on MMS. Output is always WAV.
     """
     lang = language or settings.DEFAULT_LANGUAGE
-    cache_key = (text, lang)
+    selected_backend = backend
+    if selected_backend is None:
+        if lang == "ru":
+            selected_backend = settings.VOICE_TTS_RU_DEFAULT_BACKEND
+        elif lang == "kk":
+            selected_backend = "mms"
+
+    cache_key = (text, lang, selected_backend, voice)
     cached = _tts_cache.get(cache_key)
     if cached is not None:
         return cached
     body = {"text": text, "language": lang, "speed": 1.0}
+    if selected_backend is not None:
+        body["backend"] = selected_backend
+    if voice is not None:
+        body["voice"] = voice
 
     try:
         response = await _http().post(

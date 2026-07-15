@@ -61,13 +61,13 @@ class Settings(BaseSettings):
     EMBED_BATCH_SIZE: int = 64
 
     # ── Hybrid retrieval (dense + sparse, RRF fusion) ────────────────────────
-    RETRIEVAL_TOP_K: int = 5          # chunks injected into the prompt
-    RETRIEVAL_CANDIDATES: int = 20    # per-branch prefetch before fusion
+    RETRIEVAL_TOP_K: int = 5  # chunks injected into the prompt
+    RETRIEVAL_CANDIDATES: int = 20  # per-branch prefetch before fusion
     RETRIEVAL_SCORE_THRESHOLD: float = 0.0
 
     # ── Document chunking (we now parse + chunk locally) ─────────────────────
-    CHUNK_SIZE: int = 800             # characters per chunk
-    CHUNK_OVERLAP: int = 120          # characters of overlap between chunks
+    CHUNK_SIZE: int = 800  # characters per chunk
+    CHUNK_OVERLAP: int = 120  # characters of overlap between chunks
 
     # ── Corpus bulk ingest (offline; scripts/manage_corpus.py) ───────────────
     # Root of the school corpus tree and where the lab-completeness manifest is
@@ -88,13 +88,24 @@ class Settings(BaseSettings):
 
     # ── Voice (in-repo STT/TTS sidecar; see ./voice) ─────────────────────────
     # The GPU `voice` container (docker-compose service) serves STT (Whisper
-    # ru/kk/auto) and TTS (supertonic ru + MMS kaz) over plain HTTP. In compose
+    # ru/kk/auto) and TTS (Qwen3-TTS/Supertonic ru + MMS kaz) over plain HTTP. In compose
     # the api reaches it at http://voice:8001; the default below targets the
     # host-mapped port for local dev. STT/TTS language follows DEFAULT_LANGUAGE.
     # VOICE_VERIFY_SSL is irrelevant over internal HTTP but kept for the client.
     VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False
     VOICE_TIMEOUT_S: float = 120.0  # generous: covers GPU cold start + ≤120s audio
+    VOICE_TTS_RU_DEFAULT_BACKEND: str = "qwen"
+
+    @field_validator("VOICE_TTS_RU_DEFAULT_BACKEND")
+    @classmethod
+    def _valid_tts_backend(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in {"mms", "qwen", "supertonic"}:
+            raise ValueError(
+                "VOICE_TTS_RU_DEFAULT_BACKEND must be one of: mms, qwen, supertonic"
+            )
+        return normalized
 
     # ── Behaviour ────────────────────────────────────────────────────────────
     DEFAULT_LANGUAGE: str = "ru"

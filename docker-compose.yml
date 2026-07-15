@@ -11,6 +11,7 @@ services:
       - EMBEDDING_BASE_URL=http://embedder:8080
       # In-repo voice sidecar over the internal compose network (plain HTTP).
       - VOICE_BASE_URL=http://voice:8001
+      - VOICE_TTS_RU_DEFAULT_BACKEND=${VOICE_TTS_RU_DEFAULT_BACKEND:-qwen}
     volumes:
       # Mount scenarios so lab descriptions can be edited without a rebuild.
       - ./scenarios:/app/scenarios:ro
@@ -60,8 +61,9 @@ services:
       start_period: 180s
 
   # GPU STT/TTS sidecar (in-repo; formerly the external ../vrrag_ttsstt service).
-  # STT = Whisper large-v3-turbo (ru/kk/auto, + kk LoRA); TTS = supertonic ru +
-  # MMS kaz. Requires the NVIDIA Container Toolkit on the host. Listens on 8001
+  # STT = Whisper large-v3-turbo (ru/kk/auto, + kk LoRA); Russian TTS defaults
+  # to Qwen3-TTS 0.6B with Supertonic available for comparison; Kazakh uses MMS.
+  # Requires the NVIDIA Container Toolkit on the host. Listens on 8001
   # internally; the api reaches it at http://voice:8001 over plain HTTP. First
   # boot downloads several GB of models into the voice_hf_cache volume.
   voice:
@@ -71,6 +73,15 @@ services:
       - "8002:8001"
     volumes:
       - voice_hf_cache:/models/hf_cache
+    environment:
+      - TTS_RU_BACKEND=${TTS_RU_BACKEND:-qwen}
+      - TTS_RU_BACKENDS=${TTS_RU_BACKENDS:-qwen,supertonic}
+      - TTS_RU_QWEN_MODEL=${TTS_RU_QWEN_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
+      - TTS_RU_QWEN_SPEAKER=${TTS_RU_QWEN_SPEAKER:-Serena}
+      - TTS_RU_QWEN_DTYPE=${TTS_RU_QWEN_DTYPE:-bfloat16}
+      - TTS_RU_QWEN_ATTENTION=${TTS_RU_QWEN_ATTENTION:-sdpa}
+      - TTS_RU_QWEN_MAX_NEW_TOKENS=${TTS_RU_QWEN_MAX_NEW_TOKENS:-2048}
+      - TTS_RU_SUPERTONIC_VOICE_STYLE=${TTS_RU_SUPERTONIC_VOICE_STYLE:-M3}
     restart: unless-stopped
     deploy:
       resources:

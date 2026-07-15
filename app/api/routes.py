@@ -52,7 +52,9 @@ logger = logging.getLogger("assistant.api")
 _rate_limit_enabled = settings.RATE_LIMIT_PER_MINUTE > 0
 limiter = Limiter(key_func=get_remote_address, enabled=_rate_limit_enabled)
 _consumer_limit = (
-    f"{settings.RATE_LIMIT_PER_MINUTE}/minute" if _rate_limit_enabled else "1000000/minute"
+    f"{settings.RATE_LIMIT_PER_MINUTE}/minute"
+    if _rate_limit_enabled
+    else "1000000/minute"
 )
 
 
@@ -78,7 +80,9 @@ class ScenarioState(BaseModel):
 
     current_step_id: Optional[SceneStateId] = None
     current_step_index: Optional[int] = Field(default=None, ge=0, le=1_000_000)
-    current_step: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
+    current_step: Optional[str] = Field(
+        default=None, max_length=settings.MAX_INPUT_CHARS
+    )
     next_step_id: Optional[SceneStateId] = None
     next_step: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
     completed_steps: Optional[List[SceneStateItem]] = Field(
@@ -93,7 +97,9 @@ class ScenarioState(BaseModel):
     allowed_actions: Optional[List[SceneStateItem]] = Field(
         default=None, max_length=_SCENE_STATE_MAX_ITEMS
     )
-    last_action: Optional[str] = Field(default=None, max_length=settings.MAX_INPUT_CHARS)
+    last_action: Optional[str] = Field(
+        default=None, max_length=settings.MAX_INPUT_CHARS
+    )
     last_action_result: Optional[str] = Field(
         default=None, max_length=settings.MAX_INPUT_CHARS
     )
@@ -178,6 +184,7 @@ class HintRequest(BaseModel):
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=settings.MAX_INPUT_CHARS)
     voice: Optional[str] = None
+    backend: Optional[Literal["mms", "qwen", "supertonic"]] = None
     format: Optional[str] = None
     instructions: Optional[str] = None
     language: Optional[str] = None
@@ -190,9 +197,13 @@ def _scenario_context_or_404(scenario_id: Optional[str]) -> Optional[str]:
     try:
         return get_scenario_context(scenario_id)
     except ScenarioNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
 
 
 def _scenario_state_text(state: Optional[ScenarioState]) -> Optional[str]:
@@ -346,7 +357,9 @@ async def ask_endpoint(req: AskRequest, request: Request):
     }
 
 
-def _sse_chat_chunk(model: str, delta: dict, finish_reason: Optional[str] = None) -> str:
+def _sse_chat_chunk(
+    model: str, delta: dict, finish_reason: Optional[str] = None
+) -> str:
     payload = {
         "id": "chatcmpl-vr",
         "object": "chat.completion.chunk",
@@ -391,7 +404,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         yield f"data: {json.dumps({'metadata': meta}, ensure_ascii=False)}\n\n"
                         yield _sse_chat_chunk(req.model, {}, finish_reason="stop")
                     elif event["type"] == "error":
-                        err = {"error": {"message": event["message"], "type": "stream_error"}}
+                        err = {
+                            "error": {
+                                "message": event["message"],
+                                "type": "stream_error",
+                            }
+                        }
                         yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
             finally:
                 yield "data: [DONE]\n\n"
@@ -495,10 +513,19 @@ async def tts_endpoint(req: TTSRequest, request: Request):
             response_format=req.format,
             instructions=req.instructions,
             language=req.language,
+            backend=req.backend,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
-    return Response(content=audio, media_type=media_type)
+    language = req.language or settings.DEFAULT_LANGUAGE
+    selected_backend = req.backend or (
+        settings.VOICE_TTS_RU_DEFAULT_BACKEND if language == "ru" else "mms"
+    )
+    return Response(
+        content=audio,
+        media_type=media_type,
+        headers={"X-TTS-Backend": selected_backend},
+    )
 
 
 @router.post("/voice_ask")
@@ -509,6 +536,7 @@ async def voice_ask_endpoint(
     scenario_id: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
     voice: Optional[str] = Form(None),
+    tts_backend: Optional[Literal["mms", "qwen", "supertonic"]] = Form(None),
     current_step_id: Optional[str] = Form(None),
     current_step_index: Optional[int] = Form(None),
     current_step: Optional[str] = Form(None),
@@ -589,7 +617,10 @@ async def voice_ask_endpoint(
             async def tts_frame(text: str) -> str:
                 nonlocal seq
                 audio, media_type = await synthesize(
-                    text, voice=voice, language=tts_language
+                    text,
+                    voice=voice,
+                    language=tts_language,
+                    backend=tts_backend,
                 )
                 seq += 1
                 return _sse(
@@ -650,7 +681,10 @@ async def voice_ask_endpoint(
 
         t0 = time.time()
         audio, media_type = await synthesize(
-            result.answer, voice=voice, language=language or settings.DEFAULT_LANGUAGE
+            result.answer,
+            voice=voice,
+            language=language or settings.DEFAULT_LANGUAGE,
+            backend=tts_backend,
         )
         timings["tts"] = (time.time() - t0) * 1000
     except LLMError as exc:
@@ -715,7 +749,9 @@ async def upload_document_endpoint(
             lab_number=lab_number,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
 
     raw = await _read_upload(file)
     try:
@@ -727,7 +763,9 @@ async def upload_document_endpoint(
             ocr=ocr,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     except LLMError as exc:
         _handle_llm_error(exc)
     clear_answer_cache()
@@ -743,7 +781,9 @@ async def list_documents_endpoint():
     except (ValueError, LLMError) as exc:
         if isinstance(exc, LLMError):
             _handle_llm_error(exc)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
 
 
 @router.delete("/admin/documents/{file_id}")
@@ -753,7 +793,9 @@ async def delete_document_endpoint(file_id: str):
     except LLMError as exc:
         _handle_llm_error(exc)
     if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
+        )
     clear_answer_cache()
     return {"deleted": True, "file_id": file_id}
 

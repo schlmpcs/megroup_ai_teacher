@@ -245,6 +245,9 @@ TEST_UI_HTML = """<!doctype html>
           <label for="tts-text-kk">Text to synthesize</label>
           <textarea id="tts-text-kk" data-role="tts-text" autocomplete="off">Сәлеметсіз бе, дауыс синтезін тексеріп жатырмын.</textarea>
           <div class="control-row">
+            <select data-role="tts-backend" aria-label="TTS backend">
+              <option value="mms">MMS</option>
+            </select>
             <button data-action="tts" type="button">Generate</button>
           </div>
           <audio data-role="tts-audio" controls></audio>
@@ -273,6 +276,11 @@ TEST_UI_HTML = """<!doctype html>
           <label for="tts-text-ru">Text to synthesize</label>
           <textarea id="tts-text-ru" data-role="tts-text" autocomplete="off">Здравствуйте, я проверяю синтез речи.</textarea>
           <div class="control-row">
+            <select data-role="tts-backend" aria-label="TTS backend">
+              <option value="qwen">Qwen3-TTS 0.6B</option>
+              <option value="supertonic">Supertonic</option>
+              <option value="mms">MMS</option>
+            </select>
             <button data-action="tts" type="button">Generate</button>
           </div>
           <audio data-role="tts-audio" controls></audio>
@@ -336,7 +344,8 @@ TEST_UI_HTML = """<!doctype html>
             throw new Error(await readError(response));
           }
           const health = await response.json();
-          status.textContent = `Status: ${health.status} | STT: ${health.stt_models.join(", ") || "none"} | TTS: ${health.tts_models.join(", ") || "none"}`;
+          const backends = JSON.stringify(health.tts_backends || {});
+          status.textContent = `Status: ${health.status} | STT: ${health.stt_models.join(", ") || "none"} | TTS: ${health.tts_models.join(", ") || "none"} | Backends: ${backends}`;
         } catch (error) {
           status.textContent = `Health check failed: ${error.message}`;
         }
@@ -345,6 +354,7 @@ TEST_UI_HTML = """<!doctype html>
       async function synthesize(panel) {
         const language = panel.dataset.language;
         const text = panel.querySelector('[data-role="tts-text"]').value.trim();
+        const backend = panel.querySelector('[data-role="tts-backend"]').value;
         const audio = panel.querySelector('[data-role="tts-audio"]');
         if (!text) {
           setMessage(panel, "tts", "Enter text before generating audio.", "error");
@@ -356,7 +366,7 @@ TEST_UI_HTML = """<!doctype html>
           const response = await fetch(endpoints.tts, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text, language, speed: 1.0 })
+            body: JSON.stringify({ text, language, speed: 1.0, backend })
           });
           if (!response.ok) {
             throw new Error(await readError(response));
@@ -492,17 +502,29 @@ def _proxy_request(request: urllib.request.Request) -> Response:
         ) as remote_response:
             content = remote_response.read()
             headers = getattr(remote_response, "headers", None)
-            content_type = headers.get("Content-Type", "application/octet-stream") if headers else "application/octet-stream"
+            content_type = (
+                headers.get("Content-Type", "application/octet-stream")
+                if headers
+                else "application/octet-stream"
+            )
             return Response(content=content, media_type=content_type)
     except urllib.error.HTTPError as exc:
         detail = exc.read()
-        content_type = exc.headers.get("Content-Type", "application/json") if exc.headers else "application/json"
+        content_type = (
+            exc.headers.get("Content-Type", "application/json")
+            if exc.headers
+            else "application/json"
+        )
         return Response(content=detail, status_code=exc.code, media_type=content_type)
     except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"Remote request failed: {exc.reason}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Remote request failed: {exc.reason}"
+        ) from exc
 
 
-def _multipart_body(language: str, filename: str, content_type: str, audio_bytes: bytes) -> tuple[bytes, str]:
+def _multipart_body(
+    language: str, filename: str, content_type: str, audio_bytes: bytes
+) -> tuple[bytes, str]:
     boundary = f"----vrrag-ui-{uuid.uuid4().hex}"
     parts = [
         f"--{boundary}\r\n"
@@ -536,7 +558,9 @@ def register_remote_proxy(app: FastAPI) -> None:
         return _proxy_request(request)
 
     @app.post("/remote/stt/recognize")
-    async def remote_stt(audio: UploadFile = File(...), language: str = Form(default="auto")) -> Response:
+    async def remote_stt(
+        audio: UploadFile = File(...), language: str = Form(default="auto")
+    ) -> Response:
         audio_bytes = await audio.read()
         body, boundary = _multipart_body(
             language=language,

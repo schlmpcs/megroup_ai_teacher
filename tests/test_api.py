@@ -50,7 +50,9 @@ def test_missing_auth_rejected(client):
 
 
 def test_bad_auth_rejected(client):
-    r = client.post("/ask", json={"query": "привет"}, headers={"Authorization": "Bearer nope"})
+    r = client.post(
+        "/ask", json={"query": "привет"}, headers={"Authorization": "Bearer nope"}
+    )
     assert r.status_code == 403
 
 
@@ -192,7 +194,9 @@ def test_ask_stream(client, auth, monkeypatch):
         }
 
     monkeypatch.setattr(routes, "stream_answer", _stream)
-    r = client.post("/ask", json={"query": "Что такое кипение?", "stream": True}, headers=auth)
+    r = client.post(
+        "/ask", json={"query": "Что такое кипение?", "stream": True}, headers=auth
+    )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
     assert "[DONE]" in r.text
@@ -274,7 +278,11 @@ def test_chat_completions_stream(client, auth, monkeypatch):
     ):
         yield {"type": "delta", "text": "Ответ "}
         yield {"type": "delta", "text": "готов"}
-        yield {"type": "done", "citations": [{"filename": "a.pdf", "file_id": "f"}], "usage": {}}
+        yield {
+            "type": "done",
+            "citations": [{"filename": "a.pdf", "file_id": "f"}],
+            "usage": {},
+        }
 
     monkeypatch.setattr(routes, "stream_answer", _stream)
     r = client.post(
@@ -323,7 +331,9 @@ def test_hint_rephrases(client, auth, monkeypatch):
     assert r.json()["hint"] == "L2: Подойди к трубке"
     assert "ID текущего шага: connect-tube" in seen["scenario_state"]
     assert "Предметы, видимые ученику: трубка" in seen["scenario_state"]
-    assert "Результат последнего действия: Трубка не подключена" in seen["scenario_state"]
+    assert (
+        "Результат последнего действия: Трубка не подключена" in seen["scenario_state"]
+    )
 
 
 def test_hint_level_out_of_range_422(client, auth):
@@ -335,7 +345,9 @@ def test_hint_level_out_of_range_422(client, auth):
 
 
 def test_stt(client, auth, monkeypatch):
-    async def _transcribe(audio_bytes, filename="audio.webm", language=None, prompt=None):
+    async def _transcribe(
+        audio_bytes, filename="audio.webm", language=None, prompt=None
+    ):
         return "распознанный текст"
 
     monkeypatch.setattr(routes, "transcribe", _transcribe)
@@ -354,21 +366,64 @@ def test_stt_empty_file_400(client, auth):
 
 
 def test_tts(client, auth, monkeypatch):
-    async def _synth(text, voice=None, response_format=None, instructions=None, language=None):
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
         return b"AUDIOBYTES", "audio/wav"
 
     monkeypatch.setattr(routes, "synthesize", _synth)
     r = client.post("/tts", json={"text": "Привет, ученик"}, headers=auth)
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/wav")
+    assert r.headers["x-tts-backend"] == "qwen"
     assert r.content == b"AUDIOBYTES"
 
 
+def test_tts_selects_supertonic(client, auth, monkeypatch):
+    calls = []
+
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
+        calls.append({"backend": backend, "voice": voice})
+        return b"AUDIOBYTES", "audio/wav"
+
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    r = client.post(
+        "/tts",
+        json={"text": "Привет, ученик", "backend": "supertonic", "voice": "M3"},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.headers["x-tts-backend"] == "supertonic"
+    assert calls == [{"backend": "supertonic", "voice": "M3"}]
+
+
 def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
-    async def _transcribe(audio_bytes, filename="audio.webm", language=None, prompt=None):
+    async def _transcribe(
+        audio_bytes, filename="audio.webm", language=None, prompt=None
+    ):
         return "Зачем нагревать пробирку?"
 
-    async def _synth(text, voice=None, response_format=None, instructions=None, language=None):
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
         return b"SPOKEN", "audio/wav"
 
     monkeypatch.setattr(routes, "transcribe", _transcribe)
@@ -423,7 +478,9 @@ def test_voice_ask_rejects_oversized_scene_field(client, auth):
 
 
 def test_voice_ask_stream(client, auth, monkeypatch):
-    async def _transcribe(audio_bytes, filename="audio.webm", language=None, prompt=None):
+    async def _transcribe(
+        audio_bytes, filename="audio.webm", language=None, prompt=None
+    ):
         return "Зачем нагревать пробирку?"
 
     async def _stream(
@@ -442,7 +499,14 @@ def test_voice_ask_stream(client, auth, monkeypatch):
             "usage": {"total_tokens": 12},
         }
 
-    async def _synth(text, voice=None, response_format=None, instructions=None, language=None):
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
         return f"WAV:{text}".encode(), "audio/wav"
 
     monkeypatch.setattr(routes, "transcribe", _transcribe)
@@ -469,7 +533,10 @@ def test_voice_ask_stream(client, auth, monkeypatch):
     assert [a["seq"] for a in audio] == [1, 2]
     assert audio[0]["text"] == "Нагрев ускоряет реакцию."
     assert audio[1]["text"] == "Молекулы движутся быстрее."
-    assert base64.b64decode(audio[0]["audio_base64"]) == "WAV:Нагрев ускоряет реакцию.".encode()
+    assert (
+        base64.b64decode(audio[0]["audio_base64"])
+        == "WAV:Нагрев ускоряет реакцию.".encode()
+    )
     done = next(e for e in events if e["type"] == "done")
     assert done["primary_source"]["filename"] == "chem_8.pdf"
     assert "stt" in done["observability"]["latency_ms"]

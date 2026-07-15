@@ -41,7 +41,9 @@ class _FakeHTTP:
         self.calls: list[tuple] = []
 
     async def post(self, url, files=None, data=None, params=None, json=None):
-        self.calls.append((url, {"files": files, "data": data, "params": params, "json": json}))
+        self.calls.append(
+            (url, {"files": files, "data": data, "params": params, "json": json})
+        )
         return self._response
 
 
@@ -87,7 +89,36 @@ async def test_synthesize_posts_json_and_returns_wav(monkeypatch):
     url, kw = fake.calls[0]
     assert url == "/tts/synthesize"
     assert kw["params"] == {"format": "wav"}
-    assert kw["json"] == {"text": "Привет", "language": "kk", "speed": 1.0}
+    assert kw["json"] == {
+        "text": "Привет",
+        "language": "kk",
+        "speed": 1.0,
+        "backend": "mms",
+    }
+
+
+async def test_synthesize_defaults_russian_to_qwen_and_forwards_voice(monkeypatch):
+    fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
+    monkeypatch.setattr(voice, "_http", lambda: fake)
+
+    await voice.synthesize("Здравствуйте", language="ru", voice="Serena")
+
+    assert fake.calls[0][1]["json"] == {
+        "text": "Здравствуйте",
+        "language": "ru",
+        "speed": 1.0,
+        "backend": "qwen",
+        "voice": "Serena",
+    }
+
+
+async def test_synthesize_can_select_supertonic(monkeypatch):
+    fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
+    monkeypatch.setattr(voice, "_http", lambda: fake)
+
+    await voice.synthesize("Здравствуйте", language="ru", backend="supertonic")
+
+    assert fake.calls[0][1]["json"]["backend"] == "supertonic"
 
 
 async def test_synthesize_empty_audio_raises(monkeypatch):
@@ -99,7 +130,9 @@ async def test_synthesize_empty_audio_raises(monkeypatch):
 
 
 def test_map_http_error_connect_to_timeout():
-    assert isinstance(voice._map_http_error(httpx.ConnectError("refused")), LLMTimeoutError)
+    assert isinstance(
+        voice._map_http_error(httpx.ConnectError("refused")), LLMTimeoutError
+    )
 
 
 def test_map_http_error_5xx_to_upstream():

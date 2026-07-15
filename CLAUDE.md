@@ -9,7 +9,8 @@ simulator (physics / chemistry / biology). Retrieval is now **local + hybrid**:
 the knowledge base lives in a self-hosted **Qdrant** vector store, queried with
 a local **BAAI/bge-m3** GPU embedder (dense + learned-sparse, fused by RRF).
 Voice (STT/TTS) is now also **local**: an in-repo GPU sidecar (Whisper
-ru/kk/auto + supertonic ru / MMS kaz, the `voice` compose service in `./voice`,
+ru/kk/auto + Qwen3-TTS 0.6B default/Supertonic selectable for ru + MMS kaz,
+the `voice` compose service in `./voice`,
 vendored from the former `../vrrag_ttsstt`) reached over HTTP.
 Only generation (answers/hints) still uses **OpenAI cloud** (Responses API).
 Scenario context is injected from local JSON.
@@ -43,7 +44,7 @@ app/
     ingestion.py          # to_markdown -> chunk+embed (PDF/DOCX/EPUB/TXT/MD) -> Qdrant; bulk ingest + manifest
     memory.py             # request-scoped chat-history trimming
 embedder/                 # GPU sidecar container (FlagEmbedding BGEM3FlagModel, RTX 3060 / sm_86)
-voice/                    # GPU STT/TTS sidecar container (Whisper + supertonic/MMS); vendored from ../vrrag_ttsstt
+voice/                    # GPU STT/TTS sidecar (Whisper + Qwen3-TTS/Supertonic/MMS); vendored from ../vrrag_ttsstt
 scripts/manage_corpus.py  # CLI: create-collection / upload / bulk-ingest / gen-manifest / list / status / delete
 scenarios/*.json          # one file per lab; filename stem == scenario_id
 tests/                    # pytest, OpenAI + Qdrant + embedder mocked (no network)
@@ -85,7 +86,8 @@ routes.py
   mapped onto the same `LLMError` family) and patched the same way in tests.
   Voice no longer touches OpenAI. `voice.transcribe`/`voice.synthesize` POST to
   the in-repo `voice` sidecar (`./voice`, the `voice` compose service) at
-  `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out).
+  `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out). Russian TTS
+  defaults to Qwen3-TTS 0.6B; `backend=supertonic` selects the comparison model.
 - Responses API param is `max_output_tokens` (not `max_tokens`).
 - Qdrant collection has one point per chunk with two named vectors: `dense`
   (1024-d, cosine, configured by `EMBEDDING_DIM`) and `sparse` (learned-sparse
@@ -128,7 +130,8 @@ routes.py
   `RETRIEVAL_TOP_K`, `RETRIEVAL_CANDIDATES`, `RETRIEVAL_SCORE_THRESHOLD`,
   `CHUNK_SIZE`, `CHUNK_OVERLAP`, `CORPUS_ROOT`, `LABS_MANIFEST`. Voice knobs:
   `VOICE_BASE_URL`,
-  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S` (STT/TTS language follows
+  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S`, `VOICE_TTS_RU_DEFAULT_BACKEND`
+  (STT/TTS language follows
   `DEFAULT_LANGUAGE`). (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
   `TTS_MODEL`/`TTS_VOICE`/`TTS_FORMAT`/`TTS_INSTRUCTIONS` are removed.)
 - Keep the proxy stateless. There is no app DB; KB state lives in Qdrant.
@@ -148,7 +151,7 @@ docker compose up --build                     # api + qdrant + embedder + voice
 `docker compose up --build` brings up four services: `api`, `qdrant`, the
 `embedder` GPU sidecar, and the `voice` GPU STT/TTS sidecar (both need the NVIDIA
 Container Toolkit; the embedder and voice share the single GPU, and first boot
-downloads bge-m3 + Whisper/TTS models, so it's slow).
+downloads bge-m3 + Whisper/Qwen3-TTS/Supertonic/MMS models, so it's slow).
 
 ## Running accuracy evals
 

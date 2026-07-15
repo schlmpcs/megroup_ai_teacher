@@ -19,27 +19,34 @@ logger = logging.getLogger(__name__)
 class SttBackend(Protocol):
     loaded: list[str]
 
-    def load_models(self) -> None:
-        ...
+    def load_models(self) -> None: ...
 
-    def transcribe(self, audio_bytes: bytes, language: str) -> dict:
-        ...
+    def transcribe(self, audio_bytes: bytes, language: str) -> dict: ...
 
 
 class TtsBackend(Protocol):
     loaded: list[str]
 
-    def load_models(self) -> None:
-        ...
+    def load_models(self) -> None: ...
 
-    def synthesize(self, text: str, language: str, speed: float) -> bytes:
-        ...
+    def select_backend(self, language: str, backend: str | None = None) -> str: ...
+
+    def synthesize(
+        self,
+        text: str,
+        language: str,
+        speed: float,
+        backend: str | None = None,
+        voice: str | None = None,
+    ) -> bytes: ...
 
 
 class SynthesizeRequest(BaseModel):
     text: str = Field(min_length=1)
     language: str = "ru"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    backend: str | None = None
+    voice: str | None = None
 
     @field_validator("text")
     @classmethod
@@ -53,6 +60,25 @@ class SynthesizeRequest(BaseModel):
     def language_must_be_supported(cls, value: str) -> str:
         return normalize_tts_language(value)
 
+    @field_validator("backend")
+    @classmethod
+    def backend_must_be_supported(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"mms", "qwen", "supertonic"}:
+            raise ValueError("backend must be one of: mms, qwen, supertonic")
+        return normalized
+
+    @field_validator("voice")
+    @classmethod
+    def voice_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("voice must not be blank")
+        return normalized
 
 
 def _default_stt_backend(settings: Settings) -> SttBackend:
@@ -62,9 +88,9 @@ def _default_stt_backend(settings: Settings) -> SttBackend:
 
 
 def _default_tts_backend(settings: Settings) -> TtsBackend:
-    from app.tts.model import MmsTtsBackend
+    from app.tts.model import LocalTtsBackend
 
-    return MmsTtsBackend(settings)
+    return LocalTtsBackend(settings)
 
 
 def create_app(
@@ -74,7 +100,9 @@ def create_app(
     max_upload_bytes: int | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
-    upload_limit = max_upload_bytes if max_upload_bytes is not None else settings.max_upload_bytes
+    upload_limit = (
+        max_upload_bytes if max_upload_bytes is not None else settings.max_upload_bytes
+    )
     stt_backend = stt_backend or _default_stt_backend(settings)
     tts_backend = tts_backend or _default_tts_backend(settings)
 
@@ -92,40 +120,61 @@ def create_app(
     @app.get("/health")
     def health():
         def loaded_language_keys(backend, prefix: str) -> list[str]:
-            models = getattr(backend, "_models", None)
-            if isinstance(models, dict) and models:
-                return list(models.keys())
-            return [item.removeprefix(prefix) for item in backend.loaded if item.startswith(prefix)]
+            return [
+                item.removeprefix(prefix)
+                for item in backend.loaded
+                if item.startswith(prefix)
+            ]
 
         return {
             "status": "ok",
             "stt_models": loaded_language_keys(stt_backend, "stt_"),
             "tts_models": loaded_language_keys(tts_backend, "tts_"),
+            "tts_backends": getattr(tts_backend, "available_backends", {}),
+            "tts_default_backends": getattr(tts_backend, "default_backends", {}),
         }
 
     @app.post("/stt/recognize")
-    async def recognize(audio: UploadFile = File(...), language: str = Form(default="auto")):
+    async def recognize(
+        audio: UploadFile = File(...), language: str = Form(default="auto")
+    ):
         normalized_language = normalize_stt_language(language)
         audio_bytes = await audio.read()
         if len(audio_bytes) > upload_limit:
-            raise HTTPException(status_code=413, detail="audio upload exceeds MAX_UPLOAD_BYTES")
+            raise HTTPException(
+                status_code=413, detail="audio upload exceeds MAX_UPLOAD_BYTES"
+            )
 
         try:
-            return await asyncio.to_thread(stt_backend.transcribe, audio_bytes, normalized_language)
+            return await asyncio.to_thread(
+                stt_backend.transcribe, audio_bytes, normalized_language
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("STT transcription failed")
-            raise HTTPException(status_code=500, detail="STT transcription failed") from exc
+            raise HTTPException(
+                status_code=500, detail="STT transcription failed"
+            ) from exc
 
     @app.post("/tts/synthesize")
     async def synthesize(req: SynthesizeRequest, format: str = Query(default="wav")):
         normalized_format = format.strip().lower()
         if normalized_format not in {"wav", "json"}:
-            raise HTTPException(status_code=422, detail="format must be one of: wav, json")
+            raise HTTPException(
+                status_code=422, detail="format must be one of: wav, json"
+            )
 
         try:
-            wav_bytes = await asyncio.to_thread(tts_backend.synthesize, req.text, req.language, req.speed)
+            selected_backend = tts_backend.select_backend(req.language, req.backend)
+            wav_bytes = await asyncio.to_thread(
+                tts_backend.synthesize,
+                req.text,
+                req.language,
+                req.speed,
+                selected_backend,
+                req.voice,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -138,10 +187,16 @@ def create_app(
                     "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
                     "content_type": "audio/wav",
                     "language": req.language,
+                    "backend": selected_backend,
+                    "voice": req.voice,
                 }
             )
 
-        return Response(content=wav_bytes, media_type="audio/wav")
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"X-TTS-Backend": selected_backend},
+        )
 
     return app
 

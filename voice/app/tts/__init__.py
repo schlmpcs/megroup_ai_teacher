@@ -1,3 +1,3 @@
-from app.tts.model import MmsTtsBackend
+from app.tts.model import LocalTtsBackend, MmsTtsBackend
 
-__all__ = ["MmsTtsBackend"]
+__all__ = ["LocalTtsBackend", "MmsTtsBackend"]
