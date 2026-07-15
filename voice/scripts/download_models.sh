@@ -8,6 +8,9 @@ import os
 from huggingface_hub import snapshot_download
 
 cache_dir = os.environ.get("HF_HOME", "/models/hf_cache")
+qwen_model = os.environ.get(
+    "TTS_RU_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+)
 ru_backends = {
     item.strip().lower()
     for item in os.environ.get("TTS_RU_BACKENDS", "qwen,supertonic").split(",")
@@ -22,13 +25,15 @@ repos = [
 if "mms" in ru_backends:
     repos.append(os.environ.get("TTS_RU_MODEL", "facebook/mms-tts-rus"))
 if "qwen" in ru_backends:
-    repos.append(
-        os.environ.get(
-            "TTS_RU_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-        )
-    )
+    repos.append(qwen_model)
 
 for repo in dict.fromkeys(repos):
-    snapshot_download(repo_id=repo, cache_dir=cache_dir)
+    # qwen-tts resolves its nested speech tokenizer through HF_HOME/hub and has
+    # an upstream cache_dir mismatch for subfolder metadata. Keep Qwen in the
+    # standard hub cache; the other existing models retain their legacy path.
+    kwargs = {"repo_id": repo}
+    if repo != qwen_model:
+        kwargs["cache_dir"] = cache_dir
+    snapshot_download(**kwargs)
     print(f"downloaded {repo}")
 PY

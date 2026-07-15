@@ -152,7 +152,6 @@ class LocalTtsBackend:
 
         device_map = "cuda:0" if self.settings.device.startswith("cuda") else "cpu"
         load_kwargs = {
-            "cache_dir": self.settings.hf_cache,
             "device_map": device_map,
             "dtype": dtype,
         }
