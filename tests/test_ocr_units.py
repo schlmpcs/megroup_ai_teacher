@@ -192,7 +192,7 @@ def test_pdf_ocr_off_returns_thin_text(monkeypatch):
 
 def test_pdf_ocr_kept_only_if_better(monkeypatch):
     # Real text already present (>= threshold) -> OCR is never attempted.
-    rich = "слово " * 100
+    rich = _RU
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: rich)
 
     def _boom(*a, **k):
@@ -200,4 +200,65 @@ def test_pdf_ocr_kept_only_if_better(monkeypatch):
 
     monkeypatch.setattr(ingestion, "_ocr_pdf", _boom)
     text = ingestion.to_markdown("good.pdf", b"%PDF-fake", ocr=True, lang="ru")
-    assert text == rich
+    assert text == rich.strip()
+
+
+def test_pdf_high_word_count_okulyk_text_triggers_ocr(monkeypatch):
+    notice = (
+        "Книга предоставлена исключительно в образовательных целях согласно "
+        "Приказа Министра образования и науки Республики Казахстан от 17 мая "
+        "2019 года № 217 Все учебники Казахстана ищите на сайтах OKULYK.COM и "
+        "OKULYK.KZ"
+    )
+    corrupt = "\n".join(f"page{i}\n{notice}" for i in range(1, 31))
+    assert ingestion._count_words(corrupt) > 50
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: corrupt)
+    called = []
+
+    def fake_ocr(content, lang):
+        called.append(lang)
+        return f"| page1 | | 1 |\n{_RU}\nВсе учебники Казахстана на OKULYK.KZ"
+
+    monkeypatch.setattr(ingestion, "_ocr_pdf", fake_ocr)
+    text = ingestion.to_markdown("Химия 8.pdf", b"%PDF-fake", ocr=True, lang="kk")
+
+    assert called == ["kaz"]
+    assert "Клеточная мембрана" in text
+    assert "OKULYK" not in text
+    assert "page1" not in text
+
+
+def test_pdf_unknown_extreme_repetition_triggers_ocr(monkeypatch):
+    # This has many Cyrillic words and no known OKULYK marker, but almost no
+    # information diversity. The old word-count-only check trusted it.
+    corrupt = "служебная копия школьного архива. " * 100
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: corrupt)
+    monkeypatch.setattr(ingestion, "_ocr_pdf", lambda content, lang: _RU)
+
+    text = ingestion.to_markdown("Химия 9.pdf", b"%PDF-fake", ocr=True, lang="ru")
+
+    assert text == _RU.strip()
+
+
+def test_pdf_bad_ocr_does_not_replace_cleaned_text_layer(monkeypatch):
+    useful = (
+        "Химиялық реакция кезінде бастапқы заттардан жаңа заттар түзіледі және "
+        "атомдардың жалпы саны сақталады. "
+    ) * 6
+    notice = (
+        "Все учебники Казахстана на OKULYK.KZ Книга предоставлена исключительно "
+        "в образовательных целях"
+    )
+    corrupt = "\n".join([notice] * 30 + [useful])
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: corrupt)
+    monkeypatch.setattr(
+        ingestion,
+        "_ocr_pdf",
+        lambda content, lang: "неразборчивая копия страницы. " * 100,
+    )
+
+    text = ingestion.to_markdown("Химия 10.pdf", b"%PDF-fake", ocr=True, lang="ru")
+
+    assert "Химиялық реакция" in text
+    assert "OKULYK" not in text
+    assert "неразборчивая" not in text

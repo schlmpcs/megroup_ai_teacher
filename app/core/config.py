@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     MAX_INPUT_CHARS: int = 4000
     LLM_MAX_TOKENS: int = 600
     LLM_TEMPERATURE: float = 0.2
+    # When retrieval has no relevant usable evidence and no scenario/procedure
+    # is authoritative, allow the model to answer from reliable general science
+    # knowledge. Such answers are explicitly returned without citations.
+    ALLOW_GENERAL_KNOWLEDGE_FALLBACK: bool = True
     SCENARIOS_DIR: str = "./scenarios"
 
     # Chat memory — request-scoped, no persistence.

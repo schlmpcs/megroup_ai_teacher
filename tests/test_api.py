@@ -498,6 +498,7 @@ def test_list_scenarios_endpoint(client, auth):
 
 def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
     call = {}
+    cache_clears = []
 
     async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
         call.update(
@@ -515,6 +516,7 @@ def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
         }
 
     monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
     r = client.post(
         "/admin/documents",
         files={"file": ("../notes.md", b"general notes", "text/markdown")},
@@ -535,6 +537,7 @@ def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
         "doc_key": None,
         "ocr": False,
     }
+    assert cache_clears == [True]
 
 
 def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
@@ -693,3 +696,35 @@ def test_upload_unsupported_type_400(client, auth):
         headers=auth,
     )
     assert r.status_code == 400
+
+
+def test_delete_document_clears_answer_cache(client, auth, monkeypatch):
+    cache_clears = []
+
+    async def _delete(file_id):
+        assert file_id == "chemistry-book"
+        return True
+
+    monkeypatch.setattr(routes.ingestion, "delete_document", _delete)
+    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
+
+    r = client.delete("/admin/documents/chemistry-book", headers=auth)
+
+    assert r.status_code == 200
+    assert r.json() == {"deleted": True, "file_id": "chemistry-book"}
+    assert cache_clears == [True]
+
+
+def test_delete_missing_document_does_not_clear_answer_cache(client, auth, monkeypatch):
+    cache_clears = []
+
+    async def _delete(file_id):
+        return False
+
+    monkeypatch.setattr(routes.ingestion, "delete_document", _delete)
+    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
+
+    r = client.delete("/admin/documents/missing", headers=auth)
+
+    assert r.status_code == 404
+    assert cache_clears == []

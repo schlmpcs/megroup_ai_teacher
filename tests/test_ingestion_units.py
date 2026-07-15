@@ -165,6 +165,47 @@ def test_html_to_text_drops_script_and_style():
     assert "{x}" not in out
 
 
+def test_pdf_cleanup_removes_okulyk_notice_and_page_artifacts(monkeypatch):
+    book_text = (
+        "Химиялық элементтердің периодтық жүйесі атом құрылысы мен элементтердің "
+        "қасиеттері арасындағы байланысты көрсетеді."
+    )
+    notice = (
+        "*Книга предоставлена исключительно в образовательных целях согласно "
+        "Приказа Министра образования и науки Республики Казахстан от 17 мая "
+        "2019 года № 217 Все учебники Казахстана ищите на сайтах OKULYK.COM и "
+        "OKULYK.KZ*"
+    )
+    wrapped_notice = notice.replace(
+        "согласно Приказа", "согласно\nПриказа"
+    ).replace("Республики Казахстан", "Республики Казахстан\n")
+    extracted = "\n".join(
+        [wrapped_notice, "page64", "| page65 | | 65 |", "1 2 3 4 5", book_text]
+    )
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: extracted)
+
+    text = ingestion.to_markdown("Химия 8.pdf", b"%PDF-fake")
+
+    assert text == book_text
+    assert "OKULYK" not in text
+    assert "page64" not in text
+    assert "1 2 3 4 5" not in text
+
+
+def test_pdf_cleanup_preserves_repeated_textbook_paragraphs():
+    paragraph = (
+        "Атом ядросы протондар мен нейтрондардан тұрады, ал электрондар ядроны "
+        "айнала қозғалады. Бұл модель химиялық байланыстарды, валенттілікті және "
+        "заттардың реакцияға түсу заңдылықтарын түсіндіруге көмектеседі."
+    )
+    extracted = "\n".join([paragraph] * 8)
+
+    cleaned = ingestion._clean_pdf_extraction(extracted)
+
+    assert cleaned.count(paragraph) == 8
+    assert not ingestion._is_low_quality_pdf_extraction(extracted, cleaned)
+
+
 def test_empty_document_removes_stale_chunks(monkeypatch):
     # A doc that now extracts to nothing (image-only EPUB) must delete any
     # chunks a previous ingest left behind, and must not call the embedder.

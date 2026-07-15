@@ -44,6 +44,17 @@ def test_ttl_cache_disabled():
     assert not c.enabled
 
 
+def test_ttl_cache_clear_removes_all_entries():
+    c = TTLCache(max_size=2, ttl_s=60)
+    c.put("a", 1)
+    c.put("b", 2)
+
+    c.clear()
+
+    assert c.get("a") is None
+    assert c.get("b") is None
+
+
 # ── Answer cache in generate_answer / stream_answer ─────────────────────────
 
 

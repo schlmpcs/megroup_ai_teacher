@@ -47,3 +47,8 @@ class TTLCache:
         self._data.move_to_end(key)
         while len(self._data) > self.max_size:
             self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        """Remove every cached entry immediately."""
+
+        self._data.clear()

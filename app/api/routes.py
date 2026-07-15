@@ -29,6 +29,7 @@ from app.services.corpus_meta import build_upload_metadata, compose_lab_id
 from app.services.llm import (
     LLMTimeoutError,
     LLMError,
+    clear_answer_cache,
     generate_answer,
     rephrase_hint,
     stream_answer,
@@ -729,6 +730,7 @@ async def upload_document_endpoint(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except LLMError as exc:
         _handle_llm_error(exc)
+    clear_answer_cache()
     if structured_metadata_supplied:
         return {**result, "metadata": metadata}
     return result
@@ -752,6 +754,7 @@ async def delete_document_endpoint(file_id: str):
         _handle_llm_error(exc)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    clear_answer_cache()
     return {"deleted": True, "file_id": file_id}
 
 

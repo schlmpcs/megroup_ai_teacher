@@ -48,6 +48,50 @@ from app.services.errors import (  # noqa: F401 - re-exported for backwards comp
 logger = logging.getLogger("assistant.llm")
 
 _WS_RE = re.compile(r"\s+")
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+_KAZAKH_CHAR_RE = re.compile(r"[әғқңөұүһі]", re.IGNORECASE)
+_KAZAKH_WORD_RE = re.compile(
+    r"\b(?:қандай|қалай|қайда|қайсы|қанша|неге|деген|туралы|атақты|ғалым|"
+    r"болады|керек|қажет|үшін|және|немесе|бар|жоқ)\b",
+    re.IGNORECASE,
+)
+_RUSSIAN_WORD_RE = re.compile(
+    r"\b(?:что|какой|какая|какие|как|где|когда|почему|зачем|кто|есть|"
+    r"известн\w*|учен\w*|назов\w*|расскаж\w*)\b",
+    re.IGNORECASE,
+)
+
+# Precision-biased subject signals. Ambiguous terms such as "атом", "масса"
+# and "диффузия" are deliberately omitted because they occur across subjects.
+_SUBJECT_QUERY_RES: dict[str, re.Pattern[str]] = {
+    "chemistry": re.compile(
+        r"(?:хими\w*|химик\w*|реакци\w*|молекул\w*|элемент\w*|кислот\w*|"
+        r"қышқыл\w*|щелоч\w*|сілті\w*|периодическ\w*|периодтық\w*|"
+        r"менделе\w*|авогадро\w*|окислен\w*|тотығ\w*)",
+        re.IGNORECASE,
+    ),
+    "physics": re.compile(
+        r"(?:физик\w*|ньютон\w*|эйнштейн\w*|энштейн\w*|механик\w*|"
+        r"электр\w*|напряж\w*|қысым\w*|давлен\w*|жылдамдық\w*|скорост\w*|"
+        r"оптик\w*|жарық\w*|гравитац\w*)",
+        re.IGNORECASE,
+    ),
+    "biology": re.compile(
+        r"(?:биолог\w*|жасуш\w*|клетк\w*|организм\w*|өсімдік\w*|растени\w*|"
+        r"животн\w*|генет\w*|эволюц\w*|анатом\w*|фотосинтез\w*|"
+        r"экосистем\w*|днк\w*)",
+        re.IGNORECASE,
+    ),
+}
+
+_BOILERPLATE_RE = re.compile(
+    r"(?:okulyk(?:\.kz)?|оқулық(?:тар)?|учебники\s+казахстана)",
+    re.IGNORECASE,
+)
+
+_GENERAL_KNOWLEDGE_MARKER = "[[GENERAL_KNOWLEDGE]]"
+_GROUNDED_MARKER = "[[GROUNDED]]"
+_ANSWER_MODE_MARKERS = (_GENERAL_KNOWLEDGE_MARKER, _GROUNDED_MARKER)
 
 # Precision-biased RU/KK intent signals for questions whose authoritative source
 # is the current lab instruction. General theory wording such as "почему" or
@@ -92,15 +136,18 @@ _BASE_SYSTEM_PROMPT = (
     "2. Объяснять теоретический материал по теме лабораторной работы.\n\n"
     "Правила:\n"
     "1. Отвечай на том же языке, на котором задан вопрос (русский или казахский).\n"
-    "2. Опирайся ТОЛЬКО на материалы из базы знаний (найденные документы) и на "
-    "описание текущего сценария ниже. Не придумывай факты.\n"
-    "3. Если ответа нет ни в документах, ни в сценарии — честно скажи об этом "
-    "одной фразой и не выдумывай.\n"
-    "4. Отвечай кратко и по существу: обычно 1–4 предложения. Говори тепло и "
+    "2. Материалы базы знаний, инструкция и описание сценария ниже являются "
+    "приоритетными и авторитетными источниками. Не противоречь им.\n"
+    "3. Общие научные знания разрешено использовать только когда ниже явно "
+    "включён специальный режим. Без такого указания опирайся ТОЛЬКО на "
+    "предоставленные материалы.\n"
+    "4. Если ответа нет в разрешённых источниках, честно скажи об этом одной "
+    "фразой и не выдумывай.\n"
+    "5. Отвечай кратко и по существу: обычно 1–4 предложения. Говори тепло и "
     "понятно, как учитель школьнику.\n"
-    "5. НЕ добавляй в конце строку «Источник: …» — источники прикрепляются "
+    "6. НЕ добавляй в конце строку «Источник: …», источники прикрепляются "
     "автоматически отдельно.\n"
-    "6. Предыдущие реплики диалога используй только для понимания контекста, "
+    "7. Предыдущие реплики диалога используй только для понимания контекста, "
     "а не как источник фактов.\n"
 )
 
@@ -111,6 +158,8 @@ def build_system_prompt(
     knowledge_context: Optional[str] = None,
     lab_instruction: Optional[str] = None,
     lab_incomplete: bool = False,
+    answer_language: Optional[str] = None,
+    allow_general_knowledge: bool = False,
 ) -> str:
     """Assemble the system prompt, appending the grounding blocks if present.
 
@@ -123,6 +172,13 @@ def build_system_prompt(
     unavailable so it answers theory-only instead of inventing steps.
     """
     prompt = _BASE_SYSTEM_PROMPT
+    if answer_language == "kk":
+        prompt += (
+            "\nЯЗЫК ОТВЕТА: казахский. Жауапты толық қазақ тілінде жаз. "
+            "Орыс тіліне ауыспа.\n"
+        )
+    elif answer_language == "ru":
+        prompt += "\nЯЗЫК ОТВЕТА: русский. Отвечай полностью на русском языке.\n"
     if lab_instruction and lab_instruction.strip():
         prompt += (
             "\n--- ИНСТРУКЦИЯ К ТЕКУЩЕЙ ЛАБОРАТОРНОЙ РАБОТЕ ---\n"
@@ -162,10 +218,86 @@ def build_system_prompt(
             "Это живое состояние от тренажёра. На вопросы «что дальше», «что "
             "сейчас делать», «что у меня в руках» отвечай с опорой на него.\n"
         )
+    if allow_general_knowledge:
+        prompt += (
+            "\n--- РЕЖИМ РЕЗЕРВНОГО ОБЩЕНАУЧНОГО ОТВЕТА ---\n"
+            "Сначала оцени, содержат ли найденные документы прямую и достаточную "
+            "информацию для ответа на вопрос. Если да, отвечай строго по ним и "
+            f"начни ответ с маркера {_GROUNDED_MARKER}. Если документов нет, они "
+            "повреждены, состоят из служебного текста или не отвечают на вопрос, "
+            "можно использовать только надёжные общеизвестные научные знания и "
+            f"нужно начать ответ с маркера {_GENERAL_KNOWLEDGE_MARKER}. Не смешивай "
+            "два режима. Маркер ставь первым, до любых других символов. После "
+            "маркера сразу дай обычный ответ на языке вопроса.\n"
+            "--- КОНЕЦ РЕЖИМА ---\n"
+        )
     return prompt
 
 
 # ── Local hybrid retrieval ────────────────────────────────────────────────────
+
+
+def _infer_query_language(query: str) -> str:
+    """Infer the supported answer language (Kazakh or Russian) from the query."""
+    text = query or ""
+    kazakh_score = len(_KAZAKH_CHAR_RE.findall(text)) * 2
+    kazakh_score += len(_KAZAKH_WORD_RE.findall(text))
+    russian_score = len(_RUSSIAN_WORD_RE.findall(text))
+    if kazakh_score > russian_score:
+        return "kk"
+    if russian_score > kazakh_score:
+        return "ru"
+    return (
+        settings.DEFAULT_LANGUAGE
+        if settings.DEFAULT_LANGUAGE in {"ru", "kk"}
+        else "ru"
+    )
+
+
+def _infer_query_subject(query: str) -> Optional[str]:
+    """Infer a school subject only when the query contains a strong signal."""
+    scores = {
+        subject: len(pattern.findall(query or ""))
+        for subject, pattern in _SUBJECT_QUERY_RES.items()
+    }
+    best_subject, best_score = max(scores.items(), key=lambda item: item[1])
+    tied = sum(score == best_score for score in scores.values()) > 1
+    return best_subject if best_score > 0 and not tied else None
+
+
+def _infer_query_context(query: str) -> tuple[Optional[str], str]:
+    """Return ``(subject, language)`` inferred from a standalone question."""
+    return _infer_query_subject(query), _infer_query_language(query)
+
+
+def _is_usable_knowledge_text(text: str) -> bool:
+    """Reject empty, watermark-only and severely repetitive retrieval text."""
+    normalized = _WS_RE.sub(" ", text or "").strip()
+    words = [word.casefold() for word in _WORD_RE.findall(normalized)]
+    if len(words) < 4 or sum(len(word) for word in words) < 20:
+        return False
+    if len(_BOILERPLATE_RE.findall(normalized)) >= 3:
+        return False
+    if len(words) >= 30 and len(set(words)) / len(words) < 0.12:
+        return False
+
+    lines = [_WS_RE.sub(" ", line).strip().casefold() for line in (text or "").splitlines()]
+    substantial_lines = [line for line in lines if len(line) >= 12]
+    if (
+        len(substantial_lines) >= 4
+        and len(set(substantial_lines)) / len(substantial_lines) < 0.35
+    ):
+        return False
+    return True
+
+
+def _usable_theory_chunks(chunks: list[dict]) -> list[dict]:
+    """Keep only retrieved chunks containing plausible educational content."""
+    return [
+        chunk
+        for chunk in chunks
+        if _is_usable_knowledge_text((chunk.get("payload") or {}).get("text") or "")
+    ]
 
 
 async def _search(query_filter: Any, dense, sparse_indices, sparse_values) -> list[dict]:
@@ -468,6 +600,86 @@ def _answer_citations(
     return _citations_from_chunks(ordered_chunks)
 
 
+def _general_fallback_allowed(
+    query: str,
+    scenario_context: Optional[str],
+    scenario_state: Optional[str],
+    lab_instruction: Optional[str],
+    lab_incomplete: bool,
+) -> bool:
+    """Whether this request may fall back to reliable general science facts."""
+    if not settings.ALLOW_GENERAL_KNOWLEDGE_FALLBACK:
+        return False
+    if any(
+        value and value.strip()
+        for value in (scenario_context, scenario_state, lab_instruction)
+    ):
+        return False
+    # A missing lab procedure must never be replaced by invented generic steps.
+    if lab_incomplete and _is_lab_procedure_query(query):
+        return False
+    return True
+
+
+def _parse_answer_mode(
+    text: str,
+    *,
+    allow_general_knowledge: bool,
+    default_general: bool = False,
+) -> tuple[str, bool]:
+    """Strip the private answer-mode marker and report general-knowledge use."""
+    answer = (text or "").strip()
+    if not allow_general_knowledge:
+        return answer, False
+    if answer.startswith(_GENERAL_KNOWLEDGE_MARKER):
+        return answer[len(_GENERAL_KNOWLEDGE_MARKER) :].lstrip(), True
+    if answer.startswith(_GROUNDED_MARKER):
+        return answer[len(_GROUNDED_MARKER) :].lstrip(), False
+    # Be conservative when the model omitted the requested marker: empty
+    # retrieval cannot produce a grounded answer, while non-empty retrieval
+    # keeps its citations unless the model explicitly selected general mode.
+    return answer, default_general
+
+
+class _StreamingAnswerModeParser:
+    """Suppress a possibly split private answer-mode marker from SSE deltas."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.buffer = ""
+        self.resolved = not enabled
+
+    def feed(self, delta: str) -> str:
+        if self.resolved:
+            return delta
+        self.buffer += delta
+        candidate = self.buffer.lstrip()
+        for marker in _ANSWER_MODE_MARKERS:
+            if candidate.startswith(marker):
+                self.resolved = True
+                remainder = candidate[len(marker) :].lstrip()
+                self.buffer = ""
+                return remainder
+        if any(marker.startswith(candidate) for marker in _ANSWER_MODE_MARKERS):
+            return ""
+        self.resolved = True
+        buffered = self.buffer
+        self.buffer = ""
+        return buffered
+
+    def finish(self) -> str:
+        if self.resolved:
+            return ""
+        self.resolved = True
+        buffered = self.buffer
+        self.buffer = ""
+        cleaned, _ = _parse_answer_mode(
+            buffered,
+            allow_general_knowledge=self.enabled,
+        )
+        return cleaned
+
+
 def _response_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
     if text:
@@ -532,6 +744,11 @@ def _log_generation(tag: str, query: str, result: AnswerResult) -> None:
 _answer_cache = TTLCache(settings.ANSWER_CACHE_SIZE, settings.ANSWER_CACHE_TTL_S)
 
 
+def clear_answer_cache() -> None:
+    """Drop cached answers after the knowledge corpus changes."""
+    _answer_cache.clear()
+
+
 def _answer_cache_key(
     query: str,
     scenario_context: Optional[str],
@@ -557,6 +774,75 @@ def _tier_kwargs() -> dict:
     """Optional OpenAI service tier (e.g. "priority" for faster first-token)."""
     tier = settings.OPENAI_SERVICE_TIER
     return {"service_tier": tier} if tier else {}
+
+
+@dataclass
+class _AnswerGrounding:
+    system_prompt: str
+    theory_chunks: list[dict]
+    lab_source_chunks: list[dict]
+    allow_general_knowledge: bool
+
+
+async def _prepare_answer_grounding(
+    query: str,
+    scenario_context: Optional[str],
+    scenario_state: Optional[str],
+    lab: Optional[dict],
+) -> _AnswerGrounding:
+    """Build identical retrieval and fallback state for both generation paths."""
+    inferred_subject, answer_language = _infer_query_context(query)
+    (
+        lab_instruction,
+        lab_incomplete,
+        query_filter,
+        retrieval_lang,
+        fallback_filter,
+        lab_source_chunks,
+    ) = await _lab_grounding(lab)
+
+    if not lab and inferred_subject:
+        query_filter = vectorstore.meta_filter(
+            doc_type="textbook", subject=inferred_subject
+        )
+    if not lab:
+        # Apply language preference together with an inferred subject. For
+        # subject-ambiguous questions, a global language-only filter can hide
+        # the best cross-language semantic hit; the answer prompt is still
+        # locked to the detected query language.
+        retrieval_lang = answer_language if inferred_subject else None
+    elif not retrieval_lang:
+        retrieval_lang = answer_language
+
+    retrieved = await _retrieve(
+        query,
+        query_filter=query_filter,
+        lang=retrieval_lang,
+        fallback_filter=fallback_filter,
+    )
+    theory_chunks = _usable_theory_chunks(retrieved)
+    allow_general_knowledge = _general_fallback_allowed(
+        query,
+        scenario_context,
+        scenario_state,
+        lab_instruction,
+        lab_incomplete,
+    )
+    system_prompt = build_system_prompt(
+        scenario_context,
+        scenario_state,
+        knowledge_context=_format_knowledge(theory_chunks),
+        lab_instruction=lab_instruction,
+        lab_incomplete=lab_incomplete,
+        answer_language=answer_language,
+        allow_general_knowledge=allow_general_knowledge,
+    )
+    return _AnswerGrounding(
+        system_prompt=system_prompt,
+        theory_chunks=theory_chunks,
+        lab_source_chunks=lab_source_chunks,
+        allow_general_knowledge=allow_general_knowledge,
+    )
 
 
 # ── Core completion ────────────────────────────────────────────────────────
@@ -597,26 +883,11 @@ async def generate_answer(
             _log_generation("answer_cached", query, cached)
             return cached
 
-    (
-        lab_instruction,
-        lab_incomplete,
-        query_filter,
-        lang,
-        fallback_filter,
-        lab_source_chunks,
-    ) = (
-        await _lab_grounding(lab)
-    )
-    chunks = await _retrieve(
-        query, query_filter=query_filter, lang=lang, fallback_filter=fallback_filter
-    )
-    knowledge = _format_knowledge(chunks)
-    system_prompt = build_system_prompt(
+    grounding = await _prepare_answer_grounding(
+        query,
         scenario_context,
         scenario_state,
-        knowledge_context=knowledge,
-        lab_instruction=lab_instruction,
-        lab_incomplete=lab_incomplete,
+        lab,
     )
     raw_history = chat_history if chat_history is not None else [{"role": "user", "content": query}]
     history = trim_history(
@@ -629,7 +900,7 @@ async def generate_answer(
     try:
         response = await client.responses.create(
             model=settings.OPENAI_MODEL,
-            instructions=system_prompt,
+            instructions=grounding.system_prompt,
             input=input_messages,
             max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
@@ -638,13 +909,23 @@ async def generate_answer(
     except openai.APIError as exc:
         raise _map_openai_error(exc) from exc
 
-    answer = _response_text(response)
+    answer, used_general_knowledge = _parse_answer_mode(
+        _response_text(response),
+        allow_general_knowledge=grounding.allow_general_knowledge,
+        default_general=not grounding.theory_chunks,
+    )
     if not answer:
         raise LLMMalformedResponseError("OpenAI returned an empty answer")
 
     result = AnswerResult(
         answer=answer,
-        citations=_answer_citations(query, chunks, lab_source_chunks),
+        citations=(
+            []
+            if used_general_knowledge
+            else _answer_citations(
+                query, grounding.theory_chunks, grounding.lab_source_chunks
+            )
+        ),
         usage=_usage_dict(response),
     )
     _log_generation("answer", query, result)
@@ -684,26 +965,11 @@ async def stream_answer(
             yield {"type": "done", "citations": cached.citations, "usage": cached.usage}
             return
 
-    (
-        lab_instruction,
-        lab_incomplete,
-        query_filter,
-        lang,
-        fallback_filter,
-        lab_source_chunks,
-    ) = (
-        await _lab_grounding(lab)
-    )
-    chunks = await _retrieve(
-        query, query_filter=query_filter, lang=lang, fallback_filter=fallback_filter
-    )
-    knowledge = _format_knowledge(chunks)
-    system_prompt = build_system_prompt(
+    grounding = await _prepare_answer_grounding(
+        query,
         scenario_context,
         scenario_state,
-        knowledge_context=knowledge,
-        lab_instruction=lab_instruction,
-        lab_incomplete=lab_incomplete,
+        lab,
     )
     raw_history = chat_history if chat_history is not None else [{"role": "user", "content": query}]
     history = trim_history(
@@ -713,10 +979,11 @@ async def stream_answer(
     )
     input_messages = build_input_messages(history)
 
+    marker_parser = _StreamingAnswerModeParser(grounding.allow_general_knowledge)
     try:
         async with client.responses.stream(
             model=settings.OPENAI_MODEL,
-            instructions=system_prompt,
+            instructions=grounding.system_prompt,
             input=input_messages,
             max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
@@ -726,17 +993,33 @@ async def stream_answer(
                 if getattr(event, "type", None) == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
                     if delta:
-                        yield {"type": "delta", "text": delta}
+                        visible_delta = marker_parser.feed(delta)
+                        if visible_delta:
+                            yield {"type": "delta", "text": visible_delta}
             final = await stream.get_final_response()
+            trailing = marker_parser.finish()
+            if trailing:
+                yield {"type": "delta", "text": trailing}
     except openai.APIError as exc:
         mapped = _map_openai_error(exc)
         logger.error("Streaming LLM error: %s", mapped, exc_info=True)
         yield {"type": "error", "message": str(mapped)}
         return
 
+    answer, used_general_knowledge = _parse_answer_mode(
+        _response_text(final),
+        allow_general_knowledge=grounding.allow_general_knowledge,
+        default_general=not grounding.theory_chunks,
+    )
     result = AnswerResult(
-        answer=_response_text(final),
-        citations=_answer_citations(query, chunks, lab_source_chunks),
+        answer=answer,
+        citations=(
+            []
+            if used_general_knowledge
+            else _answer_citations(
+                query, grounding.theory_chunks, grounding.lab_source_chunks
+            )
+        ),
         usage=_usage_dict(final),
     )
     _log_generation("answer_stream", query, result)

@@ -35,6 +35,7 @@ import re
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import Counter
 from html import unescape as _html_unescape
 from pathlib import Path
 from urllib.parse import unquote
@@ -68,6 +69,24 @@ _SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
 # its only "text" is stray Latin ids / page numbers left over from the markup,
 # which would otherwise be indexed as a handful of useless noise chunks.
 _WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
+
+# Tokens and known artifacts used to assess PDF text-layer quality. Some
+# chemistry PDFs have a broken text layer made almost entirely of the OKULYK
+# redistribution notice and synthetic page labels. That text has plenty of
+# Cyrillic words, so word count alone cannot distinguish it from book content.
+_INFO_TOKEN_RE = re.compile(r"[^\W_]{2,}", re.UNICODE)
+_OKULYK_RE = re.compile(r"(?i)\bokulyk\.(?:com|kz)\b")
+_PAGE_TOKEN_RE = re.compile(r"(?i)(?<!\w)page\s*\d{1,5}(?!\w)")
+_MARKDOWN_RULE_RE = re.compile(r"^[\s|:+\-_*`#>]+$")
+_KNOWN_BOILERPLATE_PREFIXES = (
+    "книга предоставлена исключительно в образовательных целях",
+    "согласно приказа министра образования и науки республики казахстан",
+    "приказа министра образования и науки республики казахстан",
+    "республики казахстан от 17 мая 2019 года",
+    "от 17 мая 2019 года № 217",
+    "все учебники казахстана ищите на сайтах",
+    "все учебники казахстана на",
+)
 
 # Headings worth carrying into citation metadata. Markdown headings are kept
 # verbatim by markitdown; the plain-text alternatives cover the most common
@@ -215,6 +234,141 @@ def _count_words(text: str) -> int:
     return len(_WORD_RE.findall(text))
 
 
+def _information_tokens(text: str) -> list[str]:
+    """Return case-folded word/number tokens for extraction-quality checks."""
+    return [token.casefold() for token in _INFO_TOKEN_RE.findall(text)]
+
+
+def _is_pdf_artifact_line(line: str) -> bool:
+    """Whether ``line`` is a known watermark, page label or table artifact."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    folded = re.sub(r"\s+", " ", stripped).casefold().strip(" *_`#>|-")
+    if _OKULYK_RE.search(folded):
+        return True
+    if any(folded.startswith(prefix) for prefix in _KNOWN_BOILERPLATE_PREFIXES):
+        return True
+    if _MARKDOWN_RULE_RE.fullmatch(stripped) and any(ch in stripped for ch in "|-_"):
+        return True
+
+    # Covers `page64`, `| page65 | | 65 |`, and long rows/sequences made only
+    # from page numbers and Markdown table punctuation. A lone number is kept
+    # because it may be an exercise number rather than a page marker.
+    plain = re.sub(r"[|*_`#>:()\[\]{}+\-/\\]", " ", stripped)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if re.fullmatch(r"(?i)page\s*\d{1,5}(?:\s+\d{1,5})*", plain):
+        return True
+    numeric_parts = re.findall(r"\d{1,5}", plain)
+    without_numbers = re.sub(r"\d{1,5}", "", plain).strip()
+    return not without_numbers and len(numeric_parts) >= 4
+
+
+def _clean_pdf_extraction(text: str) -> str:
+    """Remove known PDF text-layer boilerplate without rewriting book prose.
+
+    Explicit OKULYK/legal/page artifacts are always removed. Unknown repeated
+    lines are removed only when short, non-sentence lines overwhelmingly
+    dominate the extraction. This deliberately keeps repeated definitions,
+    worked examples and other normal textbook paragraphs.
+    """
+    if not text:
+        return ""
+
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        if _is_pdf_artifact_line(raw_line):
+            continue
+        # A page token can occasionally be prefixed/suffixed to useful text on
+        # the same extracted line. Remove that token but retain the real text.
+        line = _PAGE_TOKEN_RE.sub(" ", raw_line)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    if not lines:
+        return ""
+
+    keys = [re.sub(r"\s+", " ", line).casefold() for line in lines]
+    counts = Counter(keys)
+    token_counts = {
+        key: len(_information_tokens(line))
+        for key, line in zip(keys, lines, strict=True)
+    }
+    total_tokens = sum(token_counts[key] for key in keys)
+    repeated_keys = {
+        key
+        for key, count in counts.items()
+        if count >= 4
+        and 0 < token_counts[key] <= 12
+        and len(key) <= 140
+        and not re.search(r"[.!?…][\s*_`]*$", key)
+    }
+    repeated_tokens = sum(counts[key] * token_counts[key] for key in repeated_keys)
+    repeated_vocabulary = {
+        token for key in repeated_keys for token in _information_tokens(key)
+    }
+    if (
+        repeated_keys
+        and total_tokens
+        and repeated_tokens / total_tokens >= 0.75
+        and len(repeated_vocabulary) <= 24
+    ):
+        lines = [line for line, key in zip(lines, keys, strict=True) if key not in repeated_keys]
+
+    return "\n".join(lines).strip()
+
+
+def _is_low_quality_pdf_extraction(raw_text: str, cleaned_text: str) -> bool:
+    """Detect thin or overwhelmingly repetitive PDF text-layer extraction."""
+    clean_cyrillic_words = _count_words(cleaned_text)
+    if clean_cyrillic_words < _EPUB_MIN_WORDS:
+        return True
+
+    raw_tokens = _information_tokens(raw_text)
+    clean_tokens = _information_tokens(cleaned_text)
+    if len(raw_tokens) >= 100 and len(clean_tokens) / len(raw_tokens) < 0.35:
+        return True
+
+    # Catch unknown watermark phrases repeated hundreds of times even when they
+    # contain enough Cyrillic words to pass the old threshold. Thresholds are
+    # intentionally strict so repeated textbook paragraphs remain usable.
+    if len(clean_tokens) >= 100:
+        lexical_diversity = len(set(clean_tokens)) / len(clean_tokens)
+        window_count = len(clean_tokens) - 5
+        unique_windows = {
+            tuple(clean_tokens[i : i + 6]) for i in range(window_count)
+        }
+        window_diversity = len(unique_windows) / window_count
+        if lexical_diversity < 0.035 and window_diversity < 0.08:
+            return True
+    return False
+
+
+def _materially_better_pdf_text(
+    raw_candidate: str,
+    cleaned_candidate: str,
+    raw_baseline: str,
+    cleaned_baseline: str,
+) -> bool:
+    """Whether cleaned OCR output is a usable improvement over the text layer."""
+    candidate_low_quality = _is_low_quality_pdf_extraction(
+        raw_candidate, cleaned_candidate
+    )
+    baseline_low_quality = _is_low_quality_pdf_extraction(raw_baseline, cleaned_baseline)
+    if baseline_low_quality and not candidate_low_quality:
+        return True
+    if candidate_low_quality:
+        return False
+
+    candidate_tokens = _information_tokens(cleaned_candidate)
+    baseline_tokens = _information_tokens(cleaned_baseline)
+    return len(candidate_tokens) >= max(
+        len(baseline_tokens) + 25, len(baseline_tokens) * 1.2
+    )
+
+
 def _html_to_text(html: str) -> str:
     """Strip an (x)html document to readable text (drops script/style, entities)."""
     html = _SCRIPT_STYLE_RE.sub(" ", html)
@@ -357,9 +511,10 @@ def to_markdown(
     ``.txt`` pass through unchanged. Raises ``ValueError`` for unsupported
     extensions.
 
-    When ``ocr`` is set and a scanned EPUB/PDF extracts to ~no Cyrillic text, the
-    page-images are OCR'd (Tesseract, ``lang``-aware) instead of yielding nothing.
-    OCR is opt-in and ingest-time only; it is never invoked on the serving path.
+    PDF text is cleaned of known redistribution/page boilerplate before it is
+    returned. When ``ocr`` is set and a scanned EPUB/PDF extraction is thin or
+    overwhelmingly repetitive, the page images are OCR'd (Tesseract,
+    ``lang``-aware). OCR is opt-in and ingest-time only.
     """
     suffix = Path(filename).suffix.lower()
 
@@ -382,23 +537,32 @@ def to_markdown(
 
     if suffix == ".pdf":
         if md is not None:
-            text = md
+            raw_text = md
         else:
             reader = pypdf.PdfReader(io.BytesIO(content))
-            text = "\n".join(p.extract_text() or "" for p in reader.pages)
-        # Scanned PDFs extract ~no Cyrillic words; OCR the rendered pages when
-        # asked, keeping the result only if it actually recovered more text.
-        if ocr and _count_words(text) < _EPUB_MIN_WORDS:
+            raw_text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        text = _clean_pdf_extraction(raw_text)
+        low_quality = _is_low_quality_pdf_extraction(raw_text, text)
+        # OCR thin or corrupt text layers when asked, then compare the cleaned
+        # candidates so a larger watermark-heavy OCR result cannot win.
+        if ocr and low_quality:
             tlang = _tesseract_lang(lang)
             logger.info(
-                "PDF '%s' has ~no text (%d words); running OCR (lang=%s)",
-                filename, _count_words(text), tlang,
+                "PDF '%s' has low-quality text (%d raw/%d cleaned words); "
+                "running OCR (lang=%s)",
+                filename,
+                _count_words(raw_text),
+                _count_words(text),
+                tlang,
             )
-            ocr_text = _ocr_pdf(content, tlang)
+            raw_ocr_text = _ocr_pdf(content, tlang)
+            ocr_text = _clean_pdf_extraction(raw_ocr_text)
             logger.info(
-                "OCR recovered %d words from PDF '%s'", _count_words(ocr_text), filename
+                "OCR recovered %d cleaned words from PDF '%s'",
+                _count_words(ocr_text),
+                filename,
             )
-            if _count_words(ocr_text) > _count_words(text):
+            if _materially_better_pdf_text(raw_ocr_text, ocr_text, raw_text, text):
                 return ocr_text
         return text
 

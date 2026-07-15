@@ -520,6 +520,31 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
 # ── llm: language-priority retrieval ─────────────────────────────────────────
 
 
+async def test_prepare_grounding_infers_subject_and_language_without_lab(monkeypatch):
+    captured = {}
+
+    async def _retrieve(query, query_filter=None, lang=None, fallback_filter=None):
+        captured["query_filter"] = query_filter
+        captured["lang"] = lang
+        captured["fallback_filter"] = fallback_filter
+        return []
+
+    monkeypatch.setattr(llm, "_retrieve", _retrieve)
+
+    grounding = await llm._prepare_answer_grounding(
+        "қандай атақты химиктер бар?", None, None, None
+    )
+
+    conditions = {
+        condition.key: condition.match.value
+        for condition in captured["query_filter"].must
+    }
+    assert conditions == {"doc_type": "textbook", "subject": "chemistry"}
+    assert captured["lang"] == "kk"
+    assert captured["fallback_filter"] is None
+    assert grounding.allow_general_knowledge is True
+
+
 def _chunk(lang, text, score=0.9):
     return {"score": score, "payload": {"doc_id": text, "filename": f"{text}.pdf",
                                         "chunk_index": 0, "text": text, "lang": lang}}
