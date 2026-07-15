@@ -323,6 +323,59 @@ async def test_generate_answer_grounded_mode_keeps_retrieved_citation(monkeypatc
     assert result.citations[0]["file_id"] == "chemists"
 
 
+async def test_grounded_missing_evidence_refusal_retries_as_uncited_general(monkeypatch):
+    chunk = _chunk(
+        "chemistry",
+        "chemistry.pdf",
+        "Күкірт қышқылы зертханада сақтықпен қолданылады.",
+    )
+    responses = iter(
+        [
+            SimpleNamespace(
+                output_text=(
+                    "[[GROUNDED]] Өкінішке орай, берілген материалдарда "
+                    "атақты химиктер туралы ақпарат жоқ."
+                ),
+                usage=SimpleNamespace(
+                    input_tokens=10, output_tokens=8, total_tokens=18
+                ),
+            ),
+            SimpleNamespace(
+                output_text=(
+                    "[[GENERAL_KNOWLEDGE]] Атақты химиктерге Дмитрий Менделеев, "
+                    "Мария Кюри және Антуан Лавуазье жатады."
+                ),
+                usage=SimpleNamespace(
+                    input_tokens=12, output_tokens=10, total_tokens=22
+                ),
+            ),
+        ]
+    )
+    calls = []
+
+    async def _retrieve(query, **kwargs):
+        return [chunk]
+
+    async def _create(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(llm, "_retrieve", _retrieve)
+    monkeypatch.setattr(llm.client.responses, "create", _create)
+
+    result = await llm.generate_answer("қандай атақты химиктер бар?")
+
+    assert len(calls) == 2
+    assert "ПРИНУДИТЕЛЬНЫЙ ОБЩЕНАУЧНЫЙ ОТВЕТ" in calls[1]["instructions"]
+    assert result.answer.startswith("Атақты химиктерге Дмитрий Менделеев")
+    assert result.citations == []
+    assert result.usage == {
+        "input_tokens": 22,
+        "output_tokens": 18,
+        "total_tokens": 40,
+    }
+
+
 async def test_authoritative_scenario_disables_general_fallback(monkeypatch):
     captured = {}
 
@@ -345,32 +398,22 @@ async def test_authoritative_scenario_disables_general_fallback(monkeypatch):
     assert result.answer == "Нет данных в сценарии."
 
 
-async def test_stream_answer_suppresses_split_general_marker_and_citations(monkeypatch):
-    class _Stream:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        def __aiter__(self):
-            async def _events():
-                for delta in ("[[GENERAL_", "KNOWLEDGE]] ", "Атақты химиктер бар."):
-                    yield SimpleNamespace(type="response.output_text.delta", delta=delta)
-
-            return _events()
-
-        async def get_final_response(self):
-            return SimpleNamespace(
-                output_text="[[GENERAL_KNOWLEDGE]] Атақты химиктер бар.",
-                usage=None,
-            )
-
+async def test_stream_answer_uses_checked_completion_for_general_fallback(monkeypatch):
     async def _retrieve(query, **kwargs):
         return []
 
+    async def _create(**kwargs):
+        return SimpleNamespace(
+            output_text="[[GENERAL_KNOWLEDGE]] Атақты химиктер бар.",
+            usage=None,
+        )
+
+    def _stream_must_not_run(**kwargs):
+        raise AssertionError("fallback-eligible streaming must use checked completion")
+
     monkeypatch.setattr(llm, "_retrieve", _retrieve)
-    monkeypatch.setattr(llm.client.responses, "stream", lambda **kwargs: _Stream())
+    monkeypatch.setattr(llm.client.responses, "create", _create)
+    monkeypatch.setattr(llm.client.responses, "stream", _stream_must_not_run)
 
     events = [event async for event in llm.stream_answer("қандай атақты химиктер бар?")]
 

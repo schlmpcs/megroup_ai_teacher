@@ -91,7 +91,15 @@ _BOILERPLATE_RE = re.compile(
 
 _GENERAL_KNOWLEDGE_MARKER = "[[GENERAL_KNOWLEDGE]]"
 _GROUNDED_MARKER = "[[GROUNDED]]"
-_ANSWER_MODE_MARKERS = (_GENERAL_KNOWLEDGE_MARKER, _GROUNDED_MARKER)
+_MISSING_EVIDENCE_REFUSAL_RE = re.compile(
+    r"(?:"
+    r"(?:материал|құжат|баз)[^\n]{0,220}(?:ақпарат|мәлімет|тізім)[^\n]{0,80}жоқ"
+    r"|(?:в\s+)?(?:материал|документ|баз)[^\n]{0,220}нет\s+"
+    r"(?:информац|сведен|данн)"
+    r"|не\s+могу\s+(?:ответить|помочь)[^\n]{0,120}(?:материал|документ|баз)"
+    r")",
+    re.IGNORECASE,
+)
 
 # Precision-biased RU/KK intent signals for questions whose authoritative source
 # is the current lab instruction. General theory wording such as "почему" or
@@ -645,43 +653,24 @@ def _parse_answer_mode(
     return answer, default_general
 
 
-class _StreamingAnswerModeParser:
-    """Suppress a possibly split private answer-mode marker from SSE deltas."""
+def _is_missing_evidence_refusal(answer: str) -> bool:
+    """Whether an answer refuses specifically because retrieved evidence is absent."""
+    normalized = _WS_RE.sub(" ", answer or "").strip()
+    return bool(normalized and _MISSING_EVIDENCE_REFUSAL_RE.search(normalized))
 
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
-        self.buffer = ""
-        self.resolved = not enabled
 
-    def feed(self, delta: str) -> str:
-        if self.resolved:
-            return delta
-        self.buffer += delta
-        candidate = self.buffer.lstrip()
-        for marker in _ANSWER_MODE_MARKERS:
-            if candidate.startswith(marker):
-                self.resolved = True
-                remainder = candidate[len(marker) :].lstrip()
-                self.buffer = ""
-                return remainder
-        if any(marker.startswith(candidate) for marker in _ANSWER_MODE_MARKERS):
-            return ""
-        self.resolved = True
-        buffered = self.buffer
-        self.buffer = ""
-        return buffered
-
-    def finish(self) -> str:
-        if self.resolved:
-            return ""
-        self.resolved = True
-        buffered = self.buffer
-        self.buffer = ""
-        cleaned, _ = _parse_answer_mode(
-            buffered,
-            allow_general_knowledge=self.enabled,
-        )
-        return cleaned
+def _force_general_knowledge_prompt(system_prompt: str) -> str:
+    """Override a mistaken grounded refusal for a fallback-eligible request."""
+    return (
+        system_prompt
+        + "\n--- ПРИНУДИТЕЛЬНЫЙ ОБЩЕНАУЧНЫЙ ОТВЕТ ---\n"
+        "Предыдущая попытка ошибочно отказалась отвечать из-за отсутствия факта "
+        "в документах. Теперь не оценивай документы и не упоминай их. Ответь на "
+        "вопрос с помощью надёжных общеизвестных научных знаний. Обязательно "
+        f"начни с маркера {_GENERAL_KNOWLEDGE_MARKER}. Егер сұрақ қазақ тілінде "
+        "болса, толық қазақ тілінде нақты жауап бер және бас тартпа.\n"
+        "--- КОНЕЦ ПРИНУДИТЕЛЬНОГО РЕЖИМА ---\n"
+    )
 
 
 def _response_text(response: Any) -> str:
@@ -849,6 +838,78 @@ async def _prepare_answer_grounding(
     )
 
 
+def _combined_usage(*responses: Any) -> dict:
+    """Sum token usage across an initial completion and an optional retry."""
+    usages = [_usage_dict(response) for response in responses]
+    usages = [usage for usage in usages if usage]
+    if not usages:
+        return {}
+    input_tokens = sum(usage.get("input_tokens", 0) for usage in usages)
+    output_tokens = sum(usage.get("output_tokens", 0) for usage in usages)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+async def _complete_answer(
+    query: str,
+    grounding: _AnswerGrounding,
+    input_messages: list[dict],
+    max_tokens: Optional[int],
+) -> AnswerResult:
+    """Create a checked completion and retry grounded refusals as general science."""
+
+    async def _create(instructions: str):
+        try:
+            return await client.responses.create(
+                model=settings.OPENAI_MODEL,
+                instructions=instructions,
+                input=input_messages,
+                max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
+                temperature=settings.LLM_TEMPERATURE,
+                **_tier_kwargs(),
+            )
+        except openai.APIError as exc:
+            raise _map_openai_error(exc) from exc
+
+    responses = [await _create(grounding.system_prompt)]
+    answer, used_general_knowledge = _parse_answer_mode(
+        _response_text(responses[-1]),
+        allow_general_knowledge=grounding.allow_general_knowledge,
+        default_general=not grounding.theory_chunks,
+    )
+    if (
+        grounding.allow_general_knowledge
+        and not used_general_knowledge
+        and _is_missing_evidence_refusal(answer)
+    ):
+        responses.append(
+            await _create(_force_general_knowledge_prompt(grounding.system_prompt))
+        )
+        answer, used_general_knowledge = _parse_answer_mode(
+            _response_text(responses[-1]),
+            allow_general_knowledge=True,
+            default_general=True,
+        )
+
+    if not answer:
+        raise LLMMalformedResponseError("OpenAI returned an empty answer")
+
+    return AnswerResult(
+        answer=answer,
+        citations=(
+            []
+            if used_general_knowledge
+            else _answer_citations(
+                query, grounding.theory_chunks, grounding.lab_source_chunks
+            )
+        ),
+        usage=_combined_usage(*responses),
+    )
+
+
 # ── Core completion ────────────────────────────────────────────────────────
 
 
@@ -901,37 +962,7 @@ async def generate_answer(
     )
     input_messages = build_input_messages(history)
 
-    try:
-        response = await client.responses.create(
-            model=settings.OPENAI_MODEL,
-            instructions=grounding.system_prompt,
-            input=input_messages,
-            max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
-            temperature=settings.LLM_TEMPERATURE,
-            **_tier_kwargs(),
-        )
-    except openai.APIError as exc:
-        raise _map_openai_error(exc) from exc
-
-    answer, used_general_knowledge = _parse_answer_mode(
-        _response_text(response),
-        allow_general_knowledge=grounding.allow_general_knowledge,
-        default_general=not grounding.theory_chunks,
-    )
-    if not answer:
-        raise LLMMalformedResponseError("OpenAI returned an empty answer")
-
-    result = AnswerResult(
-        answer=answer,
-        citations=(
-            []
-            if used_general_knowledge
-            else _answer_citations(
-                query, grounding.theory_chunks, grounding.lab_source_chunks
-            )
-        ),
-        usage=_usage_dict(response),
-    )
+    result = await _complete_answer(query, grounding, input_messages, max_tokens)
     _log_generation("answer", query, result)
     if cache_key is not None:
         _answer_cache.put(cache_key, result)
@@ -983,7 +1014,20 @@ async def stream_answer(
     )
     input_messages = build_input_messages(history)
 
-    marker_parser = _StreamingAnswerModeParser(grounding.allow_general_knowledge)
+    if grounding.allow_general_knowledge:
+        try:
+            result = await _complete_answer(query, grounding, input_messages, max_tokens)
+        except LLMError as exc:
+            logger.error("Fallback completion error: %s", exc, exc_info=True)
+            yield {"type": "error", "message": str(exc)}
+            return
+        _log_generation("answer_stream_checked", query, result)
+        if cache_key is not None and result.answer:
+            _answer_cache.put(cache_key, result)
+        yield {"type": "delta", "text": result.answer}
+        yield {"type": "done", "citations": result.citations, "usage": result.usage}
+        return
+
     try:
         async with client.responses.stream(
             model=settings.OPENAI_MODEL,
@@ -997,32 +1041,18 @@ async def stream_answer(
                 if getattr(event, "type", None) == "response.output_text.delta":
                     delta = getattr(event, "delta", "")
                     if delta:
-                        visible_delta = marker_parser.feed(delta)
-                        if visible_delta:
-                            yield {"type": "delta", "text": visible_delta}
+                        yield {"type": "delta", "text": delta}
             final = await stream.get_final_response()
-            trailing = marker_parser.finish()
-            if trailing:
-                yield {"type": "delta", "text": trailing}
     except openai.APIError as exc:
         mapped = _map_openai_error(exc)
         logger.error("Streaming LLM error: %s", mapped, exc_info=True)
         yield {"type": "error", "message": str(mapped)}
         return
 
-    answer, used_general_knowledge = _parse_answer_mode(
-        _response_text(final),
-        allow_general_knowledge=grounding.allow_general_knowledge,
-        default_general=not grounding.theory_chunks,
-    )
     result = AnswerResult(
-        answer=answer,
-        citations=(
-            []
-            if used_general_knowledge
-            else _answer_citations(
-                query, grounding.theory_chunks, grounding.lab_source_chunks
-            )
+        answer=_response_text(final),
+        citations=_answer_citations(
+            query, grounding.theory_chunks, grounding.lab_source_chunks
         ),
         usage=_usage_dict(final),
     )
