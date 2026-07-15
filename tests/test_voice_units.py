@@ -7,7 +7,6 @@ GPU service in this environment.
 import httpx
 import pytest
 
-from app.core.config import settings
 from app.services import voice
 from app.services.errors import (
     LLMError,
@@ -62,12 +61,25 @@ async def test_transcribe_posts_multipart_and_returns_text(monkeypatch):
 
 
 async def test_transcribe_defaults_language(monkeypatch):
-    fake = _FakeHTTP(_FakeResponse(json_body={"text": "ok"}))
+    fake = _FakeHTTP(_FakeResponse(json_body={"text": "ok", "language": "ru"}))
     monkeypatch.setattr(voice, "_http", lambda: fake)
 
     await voice.transcribe(b"x")
 
-    assert fake.calls[0][1]["data"] == {"language": settings.DEFAULT_LANGUAGE}
+    assert fake.calls[0][1]["data"] == {"language": "auto"}
+
+
+async def test_transcribe_with_language_returns_detected_language(monkeypatch):
+    fake = _FakeHTTP(
+        _FakeResponse(json_body={"text": "  Сәлем  ", "language": "kk"})
+    )
+    monkeypatch.setattr(voice, "_http", lambda: fake)
+
+    text, language = await voice.transcribe_with_language(b"x")
+
+    assert text == "Сәлем"
+    assert language == "kk"
+    assert fake.calls[0][1]["data"] == {"language": "auto"}
 
 
 async def test_transcribe_missing_text_raises(monkeypatch):

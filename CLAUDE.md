@@ -130,9 +130,9 @@ routes.py
   `RETRIEVAL_TOP_K`, `RETRIEVAL_CANDIDATES`, `RETRIEVAL_SCORE_THRESHOLD`,
   `CHUNK_SIZE`, `CHUNK_OVERLAP`, `CORPUS_ROOT`, `LABS_MANIFEST`. Voice knobs:
   `VOICE_BASE_URL`,
-  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S`, `VOICE_TTS_RU_DEFAULT_BACKEND`
-  (STT/TTS language follows
-  `DEFAULT_LANGUAGE`). (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
+  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S`, `VOICE_TTS_RU_DEFAULT_BACKEND`.
+  Omitted STT language auto-detects RU/KK; omitted standalone TTS language
+  follows `DEFAULT_LANGUAGE`. (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
   `TTS_MODEL`/`TTS_VOICE`/`TTS_FORMAT`/`TTS_INSTRUCTIONS` are removed.)
 - Keep the proxy stateless. There is no app DB; KB state lives in Qdrant.
 - Run `pytest` (fast, fully mocked, no network/GPU) before declaring done.

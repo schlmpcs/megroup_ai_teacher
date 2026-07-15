@@ -90,7 +90,8 @@ class Settings(BaseSettings):
     # The GPU `voice` container (docker-compose service) serves STT (Whisper
     # ru/kk/auto) and TTS (Qwen3-TTS/Supertonic ru + MMS kaz) over plain HTTP. In compose
     # the api reaches it at http://voice:8001; the default below targets the
-    # host-mapped port for local dev. STT/TTS language follows DEFAULT_LANGUAGE.
+    # host-mapped port for local dev. Omitted STT language auto-detects RU/KK;
+    # omitted standalone TTS language follows DEFAULT_LANGUAGE.
     # VOICE_VERIFY_SSL is irrelevant over internal HTTP but kept for the client.
     VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False

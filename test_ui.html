@@ -162,7 +162,7 @@
       <h2>/stt: Speech → Text</h2>
       <p class="hint">Record from mic or upload an audio file.</p>
       <div class="row">
-        <div><label class="field">Language</label><select id="sttLang"><option>ru</option><option>kk</option><option value="auto">auto</option></select></div>
+        <div><label class="field">Language</label><select id="sttLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option></select></div>
       </div>
       <label class="field">Record from microphone</label>
       <div class="row">
@@ -197,7 +197,7 @@
       <h2>/voice_ask: Full Voice Pipeline</h2>
       <p class="hint">Audio question → STT → grounded answer → TTS. Reports per-stage latency (≤5s target).</p>
       <div class="row">
-        <div><label class="field">Language</label><select id="vaLang"><option>ru</option><option>kk</option><option value="auto">auto</option></select></div>
+        <div><label class="field">Language</label><select id="vaLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option></select></div>
         <div><label class="field">Scenario ID (optional)</label><input type="text" id="vaScenario" list="scenarioList" /></div>
         <div><label class="field">Voice (optional)</label><input type="text" id="vaVoice" placeholder="default" /></div>
       </div>
@@ -474,7 +474,7 @@ async function doStt() {
   if (!audio) return renderError(el, 'No audio: record or upload a file first.');
   const fd = new FormData();
   fd.append('file', audio.blob, audio.name);
-  fd.append('language', $('sttLang').value);
+  if ($('sttLang').value) fd.append('language', $('sttLang').value);
   el.innerHTML = '<p class="hint">…transcribing</p>';
   try {
     const { res, ms } = await apiFetch('/stt', { method: 'POST', headers: authHeaders(), body: fd });
@@ -513,13 +513,13 @@ async function doVoiceAsk() {
   if (!audio) return renderError(el, 'No audio: record or upload a file first.');
   const fd = new FormData();
   fd.append('file', audio.blob, audio.name);
-  fd.append('language', $('vaLang').value);
+  if ($('vaLang').value) fd.append('language', $('vaLang').value);
   if ($('vaScenario').value) fd.append('scenario_id', $('vaScenario').value);
   if ($('vaVoice').value) fd.append('voice', $('vaVoice').value);
   if ($('vaSubject').value) fd.append('subject', $('vaSubject').value);
   if ($('vaGrade').value) fd.append('grade', $('vaGrade').value);
   if ($('vaLabNum').value) fd.append('lab_number', $('vaLabNum').value);
-  fd.append('lang', $('vaLang').value === 'auto' ? 'ru' : $('vaLang').value);
+  if ($('vaLang').value) fd.append('lang', $('vaLang').value);
   el.innerHTML = '<p class="hint">…running STT → LLM → TTS</p>';
   try {
     const { res, ms } = await apiFetch('/voice_ask', { method: 'POST', headers: authHeaders(), body: fd });

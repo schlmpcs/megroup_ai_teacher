@@ -345,19 +345,23 @@ def test_hint_level_out_of_range_422(client, auth):
 
 
 def test_stt(client, auth, monkeypatch):
-    async def _transcribe(
+    calls = []
+
+    async def _transcribe_with_language(
         audio_bytes, filename="audio.webm", language=None, prompt=None
     ):
-        return "распознанный текст"
+        calls.append(language)
+        return "танылған мәтін", "kk"
 
-    monkeypatch.setattr(routes, "transcribe", _transcribe)
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe_with_language)
     r = client.post(
         "/stt",
         files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
         headers=auth,
     )
     assert r.status_code == 200
-    assert r.json()["text"] == "распознанный текст"
+    assert r.json() == {"text": "танылған мәтін", "language": "kk"}
+    assert calls == ["auto"]
 
 
 def test_stt_empty_file_400(client, auth):
@@ -411,10 +415,14 @@ def test_tts_selects_qwen(client, auth, monkeypatch):
 
 
 def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
-    async def _transcribe(
+    transcribe_languages = []
+    synthesize_languages = []
+
+    async def _transcribe_with_language(
         audio_bytes, filename="audio.webm", language=None, prompt=None
     ):
-        return "Зачем нагревать пробирку?"
+        transcribe_languages.append(language)
+        return "Зачем нагревать пробирку?", "ru"
 
     async def _synth(
         text,
@@ -424,9 +432,10 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
         language=None,
         backend=None,
     ):
+        synthesize_languages.append(language)
         return b"SPOKEN", "audio/wav"
 
-    monkeypatch.setattr(routes, "transcribe", _transcribe)
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe_with_language)
     monkeypatch.setattr(routes, "synthesize", _synth)
 
     r = client.post(
@@ -451,7 +460,10 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     assert r.status_code == 200
     body = r.json()
     assert body["question"] == "Зачем нагревать пробирку?"
+    assert body["language"] == "ru"
     assert body["answer"].endswith("[scenario] [state]")
+    assert transcribe_languages == ["auto"]
+    assert synthesize_languages == ["ru"]
     state = fake_answer.calls[-1]["scenario_state"]
     assert "ID текущего шага: heat-water" in state
     assert "Индекс текущего шага: 3" in state
@@ -467,6 +479,48 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     assert "tts" in body["observability"]["latency_ms"]
 
 
+def test_voice_ask_uses_detected_language_for_tts_and_lab(
+    client, auth, monkeypatch, fake_answer
+):
+    transcribe_languages = []
+    synthesize_languages = []
+
+    async def _transcribe_with_language(
+        audio_bytes, filename="audio.webm", language=None, prompt=None
+    ):
+        transcribe_languages.append(language)
+        return "Келесі қадам қандай?", "kk"
+
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
+        synthesize_languages.append(language)
+        return b"SPOKEN", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe_with_language)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        data={"subject": "physics", "grade": "10", "lab_number": "2"},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "kk"
+    assert transcribe_languages == ["auto"]
+    assert synthesize_languages == ["kk"]
+    lab = fake_answer.calls[-1]["lab"]
+    assert lab["lang"] == "kk"
+    assert lab["lab_id"] == "physics-10-kk-02"
+
+
 def test_voice_ask_rejects_oversized_scene_field(client, auth):
     r = client.post(
         "/voice_ask",
@@ -478,10 +532,10 @@ def test_voice_ask_rejects_oversized_scene_field(client, auth):
 
 
 def test_voice_ask_stream(client, auth, monkeypatch):
-    async def _transcribe(
+    async def _transcribe_with_language(
         audio_bytes, filename="audio.webm", language=None, prompt=None
     ):
-        return "Зачем нагревать пробирку?"
+        return "Зачем нагревать пробирку?", "ru"
 
     async def _stream(
         query,
@@ -509,7 +563,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
     ):
         return f"WAV:{text}".encode(), "audio/wav"
 
-    monkeypatch.setattr(routes, "transcribe", _transcribe)
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe_with_language)
     monkeypatch.setattr(routes, "stream_answer", _stream)
     monkeypatch.setattr(routes, "synthesize", _synth)
 
@@ -523,7 +577,11 @@ def test_voice_ask_stream(client, auth, monkeypatch):
     assert r.headers["content-type"].startswith("text/event-stream")
     events = _sse_events(r.text)
 
-    assert events[0] == {"type": "question", "text": "Зачем нагревать пробирку?"}
+    assert events[0] == {
+        "type": "question",
+        "text": "Зачем нагревать пробирку?",
+        "language": "ru",
+    }
     deltas = [e["text"] for e in events if e["type"] == "delta"]
     assert "".join(deltas) == "Нагрев ускоряет реакцию. Молекулы движутся быстрее."
     # one audio frame per sentence, in order, carrying the spoken text

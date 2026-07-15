@@ -88,20 +88,20 @@ def _map_http_error(exc: Exception) -> Exception:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-async def transcribe(
+async def transcribe_with_language(
     audio_bytes: bytes,
     filename: str = "audio.wav",
     language: Optional[str] = None,
-    prompt: Optional[str] = None,  # noqa: ARG001 — accepted for call-site compat
-) -> str:
-    """Transcribe recorded mic audio to text via the sidecar.
+    prompt: Optional[str] = None,  # noqa: ARG001, accepted for call-site compat
+) -> tuple[str, str]:
+    """Transcribe audio and return ``(text, resolved_language)``.
 
     ``language`` is ``"ru"``, ``"kk"`` or ``"auto"`` (Whisper language
-    detection); it defaults to ``DEFAULT_LANGUAGE``. ``prompt`` is ignored — the
-    local Whisper backend does not take a decoding prompt — but kept in the
+    detection); omission defaults to ``"auto"``. ``prompt`` is ignored because the
+    local Whisper backend does not take a decoding prompt, but it is kept in the
     signature so callers need not special-case the backend.
     """
-    lang = language or settings.DEFAULT_LANGUAGE
+    lang = language or "auto"
     files = {"audio": (filename, audio_bytes, "application/octet-stream")}
 
     try:
@@ -116,7 +116,32 @@ async def transcribe(
     text = payload.get("text") if isinstance(payload, dict) else None
     if not isinstance(text, str):
         raise LLMMalformedResponseError("Voice sidecar transcription returned no text")
-    return text.strip()
+
+    resolved_language = payload.get("language")
+    if resolved_language not in {"ru", "kk"}:
+        if lang in {"ru", "kk"}:
+            resolved_language = lang
+        else:
+            raise LLMMalformedResponseError(
+                "Voice sidecar transcription returned no resolved language"
+            )
+    return text.strip(), resolved_language
+
+
+async def transcribe(
+    audio_bytes: bytes,
+    filename: str = "audio.wav",
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+) -> str:
+    """Transcribe recorded mic audio, auto-detecting language when omitted."""
+    text, _ = await transcribe_with_language(
+        audio_bytes,
+        filename=filename,
+        language=language,
+        prompt=prompt,
+    )
+    return text
 
 
 async def synthesize(

@@ -41,7 +41,7 @@ from app.services.scenarios import (
     get_scenario_context,
     list_scenarios,
 )
-from app.services.voice import synthesize, transcribe
+from app.services.voice import synthesize, transcribe_with_language
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = logging.getLogger("assistant.api")
@@ -489,17 +489,17 @@ async def stt_endpoint(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
 ):
-    """Speech-to-text: mic audio in → recognised text out."""
+    """Speech-to-text with automatic RU/KK detection when language is omitted."""
     raw = await _read_upload(file)
     try:
-        text = await transcribe(
+        text, resolved_language = await transcribe_with_language(
             raw,
             filename=file.filename or "audio.webm",
-            language=language or settings.DEFAULT_LANGUAGE,
+            language=language or "auto",
         )
     except LLMError as exc:
         _handle_llm_error(exc)
-    return {"text": text}
+    return {"text": text, "language": resolved_language}
 
 
 @router.post("/tts")
@@ -584,25 +584,32 @@ async def voice_ask_endpoint(
             last_action_result=last_action_result,
         )
     )
-    lab = _lab_dict(
-        Lab(subject=subject, grade=grade, lang=lang or "ru", lab_number=lab_number)
-        if subject and grade is not None
-        else None
-    )
     raw = await _read_upload(file)
     timings: dict = {}
-    tts_language = language or settings.DEFAULT_LANGUAGE
+    requested_stt_language = language or "auto"
 
     t0 = time.time()
     try:
-        question = await transcribe(
+        question, resolved_language = await transcribe_with_language(
             raw,
             filename=file.filename or "audio.webm",
-            language=language or settings.DEFAULT_LANGUAGE,
+            language=requested_stt_language,
         )
         timings["stt"] = (time.time() - t0) * 1000
     except LLMError as exc:
         _handle_llm_error(exc)
+
+    tts_language = resolved_language
+    lab = _lab_dict(
+        Lab(
+            subject=subject,
+            grade=grade,
+            lang=lang or resolved_language,
+            lab_number=lab_number,
+        )
+        if subject and grade is not None
+        else None
+    )
 
     if stream:
 
@@ -610,7 +617,9 @@ async def voice_ask_endpoint(
             # ponytail: TTS awaited inline per sentence (deltas buffer in the
             # transport meanwhile); add a queue+task pipeline if TTS ever
             # becomes the bottleneck.
-            yield _sse({"type": "question", "text": question})
+            yield _sse(
+                {"type": "question", "text": question, "language": resolved_language}
+            )
             buf = ""
             seq = 0
 
@@ -683,7 +692,7 @@ async def voice_ask_endpoint(
         audio, media_type = await synthesize(
             result.answer,
             voice=voice,
-            language=language or settings.DEFAULT_LANGUAGE,
+            language=tts_language,
             backend=tts_backend,
         )
         timings["tts"] = (time.time() - t0) * 1000
@@ -693,6 +702,7 @@ async def voice_ask_endpoint(
     timings["total"] = sum(timings.values())
     return {
         "question": question,
+        "language": resolved_language,
         "answer": result.answer,
         "citations": result.citations,
         "primary_source": result.primary_source,
