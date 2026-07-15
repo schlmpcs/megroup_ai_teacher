@@ -28,6 +28,17 @@ def test_build_system_prompt_with_scenario_state():
     assert "Зажечь спиртовку" in prompt
 
 
+def test_build_system_prompt_strict_lab_scope_rejects_unrelated_topics():
+    prompt = llm.build_system_prompt(
+        "Сценарий: нагрев воды",
+        strict_lab_scope=True,
+    )
+
+    assert "СТРОГИЕ ГРАНИЦЫ" in prompt
+    assert "другой теме" in prompt
+    assert "НЕ делает посторонний вопрос" in prompt
+
+
 def test_build_system_prompt_state_omitted_when_blank():
     prompt = llm.build_system_prompt("Сценарий: тест", "   ")
     assert "ТЕКУЩЕЕ СОСТОЯНИЕ СЦЕНЫ" not in prompt
@@ -139,6 +150,71 @@ def test_lab_procedure_query_intent_is_precision_biased_for_ru_and_kk():
     assert llm._is_lab_procedure_query("Почему вода кипит?") is False
     assert llm._is_lab_procedure_query("Как происходит кипение?") is False
     assert llm._is_lab_procedure_query("Кипение қалай жүреді?") is False
+
+
+def test_lab_scope_rejects_explicitly_different_subject():
+    refusal = llm._lab_scope_refusal(
+        "Как происходит фотосинтез?",
+        {"subject": "physics"},
+        "Нагреть воду и записать показания термометра.",
+        [],
+        "ru",
+    )
+
+    assert refusal == llm._LAB_SCOPE_REFUSALS["ru"]
+
+
+def test_lab_scope_rejects_unrelated_topic_from_same_subject():
+    refusal = llm._lab_scope_refusal(
+        "Как работает электрическая цепь?",
+        {"subject": "physics"},
+        "Нагреть воду и записать температуру кипения.",
+        [
+            _chunk(
+                "electricity",
+                "physics.pdf",
+                "Электрическая цепь состоит из источника тока и проводников.",
+            )
+        ],
+        "ru",
+    )
+
+    assert refusal == llm._LAB_SCOPE_REFUSALS["ru"]
+
+
+def test_lab_scope_allows_theory_when_retrieval_bridges_to_lab_topic():
+    refusal = llm._lab_scope_refusal(
+        "Почему появляются пузырьки?",
+        {"subject": "physics"},
+        "Нагреть воду и наблюдать изменение температуры.",
+        [
+            _chunk(
+                "boiling",
+                "physics.pdf",
+                "Пузырьки появляются в воде при нагревании перед кипением.",
+            )
+        ],
+        "ru",
+    )
+
+    assert refusal is None
+
+
+def test_structured_lab_disables_general_knowledge_fallback(monkeypatch):
+    monkeypatch.setattr(
+        llm.settings,
+        "ALLOW_GENERAL_KNOWLEDGE_FALLBACK",
+        True,
+    )
+
+    assert llm._general_fallback_allowed(
+        "Когда кипит вода?",
+        None,
+        None,
+        None,
+        False,
+        lab_active=True,
+    ) is False
 
 
 def test_answer_citations_order_theory_and_procedure_sources_by_query_intent():
@@ -396,6 +472,90 @@ async def test_authoritative_scenario_disables_general_fallback(monkeypatch):
 
     assert llm._GENERAL_KNOWLEDGE_MARKER not in captured["instructions"]
     assert result.answer == "Нет данных в сценарии."
+
+
+async def test_generate_answer_rejects_unrelated_lab_question_without_openai(
+    monkeypatch,
+):
+    async def _lab_grounding(lab):
+        return (
+            "Нагреть воду и записать температуру кипения.",
+            False,
+            None,
+            "ru",
+            None,
+            [],
+        )
+
+    async def _retrieve(query, **kwargs):
+        return [
+            _chunk(
+                "electricity",
+                "physics.pdf",
+                "Электрическая цепь состоит из источника тока и проводников.",
+            )
+        ]
+
+    async def _create(**kwargs):
+        raise AssertionError("OpenAI must not be called for an unrelated lab question")
+
+    monkeypatch.setattr(llm, "_lab_grounding", _lab_grounding)
+    monkeypatch.setattr(llm, "_retrieve", _retrieve)
+    monkeypatch.setattr(llm.client.responses, "create", _create)
+
+    result = await llm.generate_answer(
+        "Как работает электрическая цепь?",
+        scenario_context="Сценарий нагревания воды и измерения температуры.",
+        lab={"subject": "physics", "grade": 8, "lang": "ru"},
+    )
+
+    assert result.answer == llm._LAB_SCOPE_REFUSALS["ru"]
+    assert result.citations == []
+    assert result.usage == {}
+
+
+async def test_stream_answer_rejects_unrelated_lab_question_without_streaming_openai(
+    monkeypatch,
+):
+    async def _lab_grounding(lab):
+        return (
+            "Нагреть воду и записать температуру кипения.",
+            False,
+            None,
+            "ru",
+            None,
+            [],
+        )
+
+    async def _retrieve(query, **kwargs):
+        return [
+            _chunk(
+                "electricity",
+                "physics.pdf",
+                "Электрическая цепь состоит из источника тока и проводников.",
+            )
+        ]
+
+    def _stream(**kwargs):
+        raise AssertionError("OpenAI stream must not run for an unrelated question")
+
+    monkeypatch.setattr(llm, "_lab_grounding", _lab_grounding)
+    monkeypatch.setattr(llm, "_retrieve", _retrieve)
+    monkeypatch.setattr(llm.client.responses, "stream", _stream)
+
+    events = [
+        event
+        async for event in llm.stream_answer(
+            "Что такое электрическое сопротивление?",
+            scenario_context="Сценарий нагревания воды и измерения температуры.",
+            lab={"subject": "physics", "grade": 8, "lang": "ru"},
+        )
+    ]
+
+    assert events == [
+        {"type": "delta", "text": llm._LAB_SCOPE_REFUSALS["ru"]},
+        {"type": "done", "citations": [], "usage": {}},
+    ]
 
 
 async def test_stream_answer_uses_checked_completion_for_general_fallback(monkeypatch):

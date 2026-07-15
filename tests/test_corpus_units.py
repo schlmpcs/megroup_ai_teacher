@@ -515,6 +515,8 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
     await llm.generate_answer("вопрос", lab=lab)
     assert "инструкция" in captured["instructions"].lower()
     assert "недоступна" in captured["instructions"].lower()
+    assert "СТРОГИЕ ГРАНИЦЫ" in captured["instructions"]
+    assert llm._GENERAL_KNOWLEDGE_MARKER not in captured["instructions"]
 
 
 # ── llm: language-priority retrieval ─────────────────────────────────────────
