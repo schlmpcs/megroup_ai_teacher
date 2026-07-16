@@ -132,6 +132,9 @@ def create_app(
             "tts_models": loaded_language_keys(tts_backend, "tts_"),
             "tts_backends": getattr(tts_backend, "available_backends", {}),
             "tts_default_backends": getattr(tts_backend, "default_backends", {}),
+            "tts_number_normalization": {
+                "ru": settings.tts_normalize_ru_numbers,
+            },
         }
 
     @app.post("/stt/recognize")

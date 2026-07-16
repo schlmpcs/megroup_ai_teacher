@@ -89,6 +89,7 @@ services:
       - TTS_RU_QWEN_ATTENTION=${TTS_RU_QWEN_ATTENTION:-sdpa}
       - TTS_RU_QWEN_MAX_NEW_TOKENS=${TTS_RU_QWEN_MAX_NEW_TOKENS:-2048}
       - TTS_RU_SUPERTONIC_VOICE_STYLE=${TTS_RU_SUPERTONIC_VOICE_STYLE:-M3}
+      - TTS_NORMALIZE_RU_NUMBERS=${TTS_NORMALIZE_RU_NUMBERS:-true}
     restart: unless-stopped
     deploy:
       resources:
@@ -117,6 +118,7 @@ services:
       - OMNIVOICE_MODEL=${OMNIVOICE_MODEL:-shyngys879/KazakhTTS-OmniVoice}
       - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, moderate pitch}
       - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
+      - OMNIVOICE_NORMALIZE_KK_NUMBERS=${OMNIVOICE_NORMALIZE_KK_NUMBERS:-true}
       - OMNIVOICE_AUDIO_TOKENIZER_PATH=/models/hf_cache/higgs-audio-v2-tokenizer
       # The server's direct Hugging Face route intermittently returns 504 for
       # the mandatory Higgs audio tokenizer. This public mirror is configurable

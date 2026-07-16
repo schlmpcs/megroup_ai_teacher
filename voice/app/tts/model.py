@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import io
 import re
 import threading
+from typing import TYPE_CHECKING
 
 import numpy as np
-import scipy.io.wavfile as wav_io
 
-from app.config import Settings
+from .text_normalization import normalize_russian_text, transform_unprotected
+
+if TYPE_CHECKING:
+    from ..config import Settings
 
 _LATIN_TO_CYR = {
     "a": "а",
@@ -66,10 +71,13 @@ _LATIN_TO_CYR = {
 def _transliterate_latin(text: str) -> str:
     """Replace Latin characters in text with Cyrillic equivalents."""
 
-    def replace_word(m: re.Match) -> str:
-        return "".join(_LATIN_TO_CYR.get(ch, ch) for ch in m.group())
+    def transliterate(unprotected: str) -> str:
+        def replace_word(m: re.Match) -> str:
+            return "".join(_LATIN_TO_CYR.get(ch, ch) for ch in m.group())
 
-    return re.sub(r"[A-Za-z]+", replace_word, text)
+        return re.sub(r"[A-Za-z]+", replace_word, unprotected)
+
+    return transform_unprotected(text, transliterate)
 
 
 class LocalTtsBackend:
@@ -180,17 +188,24 @@ class LocalTtsBackend:
         voice: str | None = None,
     ) -> bytes:
         selected = self.select_backend(language, backend)
+        synthesis_text = (
+            normalize_russian_text(text)
+            if language == "ru" and self.settings.tts_normalize_ru_numbers
+            else text
+        )
 
         with self._synthesis_lock:
             if selected == "qwen":
-                return self._synthesize_qwen_ru(text, speed, voice)
+                return self._synthesize_qwen_ru(synthesis_text, speed, voice)
             if selected == "supertonic":
                 return self._synthesize_supertonic_ru(
-                    _transliterate_latin(text), speed, voice
+                    _transliterate_latin(synthesis_text), speed, voice
                 )
             if selected == "mms":
                 normalized_text = (
-                    _transliterate_latin(text) if language == "ru" else text
+                    _transliterate_latin(synthesis_text)
+                    if language == "ru"
+                    else synthesis_text
                 )
                 return self._synthesize_mms(normalized_text, language, speed)
         raise ValueError(f"TTS backend is not loaded: {selected}")
@@ -254,6 +269,8 @@ class LocalTtsBackend:
         )
 
     def _wav_bytes(self, waveform, sample_rate: int, speed: float = 1.0) -> bytes:
+        import scipy.io.wavfile as wav_io
+
         waveform = np.asarray(waveform, dtype=np.float32)
 
         if speed != 1.0:

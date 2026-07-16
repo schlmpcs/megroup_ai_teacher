@@ -9,19 +9,36 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-import torch
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
+
+from .text_normalization import normalize_kazakh_text
 
 logger = logging.getLogger("omnivoice")
 
 
 def _device() -> str:
     requested = os.getenv("DEVICE", "cuda").strip().lower()
-    return requested if requested == "cpu" or torch.cuda.is_available() else "cpu"
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return "cpu"
+    return requested if torch.cuda.is_available() else "cpu"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
 
 
 @dataclass(frozen=True)
@@ -36,6 +53,9 @@ class Settings:
     )
     device: str = _device()
     hf_cache: str = os.getenv("HF_HOME", "/models/hf_cache")
+    normalize_kk_numbers: bool = _env_bool(
+        "OMNIVOICE_NORMALIZE_KK_NUMBERS", True
+    )
 
 
 class SynthesizeRequest(BaseModel):
@@ -83,6 +103,7 @@ class OmniVoiceBackend:
         self._lock = threading.Lock()
 
     def load_model(self) -> None:
+        import torch
         from omnivoice import OmniVoice
         from omnivoice.models import omnivoice as omnivoice_module
 
@@ -117,23 +138,35 @@ class OmniVoiceBackend:
     def synthesize(self, text: str, speed: float) -> bytes:
         if self.model is None:
             raise RuntimeError("OmniVoice model is not loaded")
+        synthesis_text = (
+            normalize_kazakh_text(text)
+            if self.settings.normalize_kk_numbers
+            else text
+        )
         with self._lock:
             audio = self.model.generate(
-                text=text,
+                text=synthesis_text,
                 language="Kazakh",
                 instruct=self.settings.instruct,
                 speed=speed,
                 num_step=self.settings.steps,
             )
-        buffer = io.BytesIO()
-        sf.write(
-            buffer,
-            np.asarray(audio[0], dtype=np.float32),
-            24000,
-            format="WAV",
-            subtype="PCM_16",
-        )
-        return buffer.getvalue()
+        return _encode_wav(audio[0])
+
+
+def _encode_wav(audio) -> bytes:
+    import numpy as np
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(
+        buffer,
+        np.asarray(audio, dtype=np.float32),
+        24000,
+        format="WAV",
+        subtype="PCM_16",
+    )
+    return buffer.getvalue()
 
 
 def create_app(
@@ -157,6 +190,7 @@ def create_app(
             "backend": "omnivoice",
             "profile": settings.instruct,
             "model_loaded": backend.model is not None,
+            "number_normalization": settings.normalize_kk_numbers,
         }
 
     @app.post("/tts/synthesize")

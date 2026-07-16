@@ -1,15 +1,19 @@
 import os
 from dataclasses import dataclass
 
-import torch
+
+def _device() -> str:
+    requested = os.getenv("DEVICE", "cuda").strip().lower()
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return "cpu"
+    return requested if torch.cuda.is_available() else "cpu"
 
 
-_requested_device = os.getenv("DEVICE", "cuda").strip().lower()
-DEVICE = (
-    _requested_device
-    if (_requested_device == "cpu" or torch.cuda.is_available())
-    else "cpu"
-)
+DEVICE = _device()
 
 
 def _csv_env(name: str, default: str) -> tuple[str, ...]:
@@ -18,6 +22,18 @@ def _csv_env(name: str, default: str) -> tuple[str, ...]:
         for item in os.getenv(name, default).split(",")
         if item.strip()
     )
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
 
 
 @dataclass(frozen=True)
@@ -51,6 +67,7 @@ class Settings:
     tts_ru_supertonic_sample_rate: int = int(
         os.getenv("TTS_RU_SUPERTONIC_SAMPLE_RATE", "44100")
     )
+    tts_normalize_ru_numbers: bool = _bool_env("TTS_NORMALIZE_RU_NUMBERS", True)
     device: str = DEVICE
     hf_cache: str = os.getenv("HF_HOME", "/models/hf_cache")
     max_audio_duration_s: int = int(os.getenv("MAX_AUDIO_DURATION_S", "120"))
