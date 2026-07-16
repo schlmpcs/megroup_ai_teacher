@@ -195,7 +195,9 @@ class _FakeTTSClient:
 
 async def test_synthesize_uses_cache(monkeypatch):
     fake = _FakeTTSClient()
+    omnivoice_fake = _FakeTTSClient()
     monkeypatch.setattr(voice, "_http", lambda: fake)
+    monkeypatch.setattr(voice, "_omnivoice_http", lambda: omnivoice_fake)
 
     a1 = await voice.synthesize("Привет", language="ru")
     a2 = await voice.synthesize("Привет", language="ru")
@@ -203,7 +205,7 @@ async def test_synthesize_uses_cache(monkeypatch):
     assert a1 == a2 == (b"WAVBYTES", "audio/wav")
 
     await voice.synthesize("Привет", language="kk")  # different language -> miss
-    assert fake.calls == 2
+    assert omnivoice_fake.calls == 1
 
     await voice.synthesize("Привет", language="ru", backend="qwen")
-    assert fake.calls == 3
+    assert fake.calls == 2

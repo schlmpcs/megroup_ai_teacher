@@ -195,7 +195,7 @@ class HintRequest(BaseModel):
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=settings.MAX_INPUT_CHARS)
     voice: Optional[str] = None
-    backend: Optional[Literal["mms", "qwen", "supertonic"]] = None
+    backend: Optional[Literal["mms", "qwen", "supertonic", "omnivoice"]] = None
     format: Optional[str] = None
     instructions: Optional[str] = None
     language: Optional[str] = None
@@ -546,7 +546,9 @@ async def tts_endpoint(req: TTSRequest, request: Request):
         _handle_llm_error(exc)
     language = req.language or settings.DEFAULT_LANGUAGE
     selected_backend = req.backend or (
-        settings.VOICE_TTS_RU_DEFAULT_BACKEND if language == "ru" else "mms"
+        settings.VOICE_TTS_RU_DEFAULT_BACKEND
+        if language == "ru"
+        else settings.VOICE_TTS_KK_DEFAULT_BACKEND
     )
     return Response(
         content=audio,

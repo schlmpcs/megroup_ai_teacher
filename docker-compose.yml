@@ -11,7 +11,11 @@ services:
       - EMBEDDING_BASE_URL=http://embedder:8080
       # In-repo voice sidecar over the internal compose network (plain HTTP).
       - VOICE_BASE_URL=http://voice:8001
+      # OmniVoice requires Transformers 5.x and is isolated from the Qwen TTS
+      # environment, which is pinned to Transformers 4.57.3.
+      - VOICE_KK_OMNIVOICE_BASE_URL=http://voice-omnivoice:8003
       - VOICE_TTS_RU_DEFAULT_BACKEND=${VOICE_TTS_RU_DEFAULT_BACKEND:-supertonic}
+      - VOICE_TTS_KK_DEFAULT_BACKEND=${VOICE_TTS_KK_DEFAULT_BACKEND:-omnivoice}
     volumes:
       # Mount scenarios so lab descriptions can be edited without a rebuild.
       - ./scenarios:/app/scenarios:ro
@@ -19,6 +23,7 @@ services:
       - qdrant
       - embedder
       - voice
+      - voice-omnivoice
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/health'); "]
@@ -62,7 +67,9 @@ services:
 
   # GPU STT/TTS sidecar (in-repo; formerly the external ../vrrag_ttsstt service).
   # STT = Whisper large-v3-turbo (ru/kk/auto, + kk LoRA); Russian TTS defaults
-  # to Supertonic with Qwen3-TTS 0.6B available explicitly; Kazakh uses MMS.
+  # to Supertonic with Qwen3-TTS 0.6B available explicitly; MMS is the Kazakh
+  # fallback. The higher-quality fixed young male Kazakh voice lives in the
+  # isolated `voice-omnivoice` service below.
   # Requires the NVIDIA Container Toolkit on the host. Listens on 8001
   # internally; the api reaches it at http://voice:8001 over plain HTTP. First
   # boot downloads several GB of models into the voice_hf_cache volume.
@@ -97,7 +104,36 @@ services:
       retries: 3
       start_period: 180s
 
+  # Kazakh TTS uses a separate service because OmniVoice requires Transformers
+  # 5.x while the Russian Qwen backend above is pinned to Transformers 4.57.3.
+  # It exposes only the fixed `male, young adult, moderate pitch` profile.
+  voice-omnivoice:
+    build: ./voice_omnivoice
+    ports:
+      - "8003:8003"
+    volumes:
+      - omnivoice_hf_cache:/models/hf_cache
+    environment:
+      - OMNIVOICE_MODEL=${OMNIVOICE_MODEL:-shyngys879/KazakhTTS-OmniVoice}
+      - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, moderate pitch}
+      - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8003/health'); "]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
 volumes:
   qdrant_data:
   hf_cache:
   voice_hf_cache:
+  omnivoice_hf_cache:

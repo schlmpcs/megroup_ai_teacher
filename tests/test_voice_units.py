@@ -94,7 +94,7 @@ async def test_synthesize_posts_json_and_returns_wav(monkeypatch):
     fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
     monkeypatch.setattr(voice, "_http", lambda: fake)
 
-    audio, media_type = await voice.synthesize("Привет", language="kk")
+    audio, media_type = await voice.synthesize("Привет", language="kk", backend="mms")
 
     assert audio == b"WAVDATA"
     assert media_type == "audio/wav"
@@ -106,6 +106,20 @@ async def test_synthesize_posts_json_and_returns_wav(monkeypatch):
         "language": "kk",
         "speed": 1.0,
         "backend": "mms",
+    }
+
+
+async def test_synthesize_defaults_kazakh_to_omnivoice(monkeypatch):
+    fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
+    monkeypatch.setattr(voice, "_omnivoice_http", lambda: fake)
+
+    await voice.synthesize("Сәлеметсіз бе", language="kk")
+
+    assert fake.calls[0][1]["json"] == {
+        "text": "Сәлеметсіз бе",
+        "language": "kk",
+        "speed": 1.0,
+        "backend": "omnivoice",
     }
 
 

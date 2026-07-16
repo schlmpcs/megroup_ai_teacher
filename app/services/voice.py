@@ -11,9 +11,12 @@ exposes a plain HTTP API:
        -> audio/wav bytes
 
 STT runs a multilingual Whisper (ru/kk/auto). Russian TTS defaults to Supertonic
-and can explicitly select Qwen3-TTS 0.6B; Kazakh uses MMS. The local
-``voice`` control selects the Qwen speaker or Supertonic style. The cloud-era
-``instructions`` / ``response_format`` knobs remain compatibility-only.
+and can explicitly select Qwen3-TTS 0.6B. Kazakh defaults to the fixed young
+male OmniVoice profile, which is served by a separate container because its
+Transformers requirement conflicts with Qwen TTS; MMS remains available as a
+fallback. The local ``voice`` control selects the Qwen speaker or Supertonic
+style. The cloud-era ``instructions`` / ``response_format`` knobs remain
+compatibility-only.
 
 This module mirrors ``embeddings.py``: a lazy shared ``httpx.AsyncClient`` and
 upstream failures mapped onto the shared ``LLMError`` family so routes translate
@@ -54,6 +57,7 @@ _tts_cache = TTLCache(settings.TTS_CACHE_SIZE, settings.ANSWER_CACHE_TTL_S)
 # patch points for other modules' tests are the ``transcribe`` / ``synthesize``
 # functions below (patched on ``app.api.routes``).
 _client: Optional[httpx.AsyncClient] = None
+_omnivoice_client: Optional[httpx.AsyncClient] = None
 
 
 def _http() -> httpx.AsyncClient:
@@ -66,6 +70,18 @@ def _http() -> httpx.AsyncClient:
             verify=settings.VOICE_VERIFY_SSL,
         )
     return _client
+
+
+def _omnivoice_http() -> httpx.AsyncClient:
+    """Return the Kazakh OmniVoice client, creating it on first call."""
+    global _omnivoice_client
+    if _omnivoice_client is None:
+        _omnivoice_client = httpx.AsyncClient(
+            base_url=settings.VOICE_KK_OMNIVOICE_BASE_URL,
+            timeout=settings.VOICE_TIMEOUT_S,
+            verify=settings.VOICE_VERIFY_SSL,
+        )
+    return _omnivoice_client
 
 
 # ── Error mapping ────────────────────────────────────────────────────────────
@@ -156,7 +172,8 @@ async def synthesize(
 
     Russian supports ``qwen`` and ``supertonic`` backends. Supertonic is selected
     by default and ``voice`` chooses its style (or the Qwen speaker). Kazakh
-    stays on MMS. Output is always WAV.
+    defaults to the fixed young-male ``omnivoice`` backend; ``mms`` remains a
+    fallback. Output is always WAV.
     """
     lang = language or settings.DEFAULT_LANGUAGE
     selected_backend = backend
@@ -164,7 +181,7 @@ async def synthesize(
         if lang == "ru":
             selected_backend = settings.VOICE_TTS_RU_DEFAULT_BACKEND
         elif lang == "kk":
-            selected_backend = "mms"
+            selected_backend = settings.VOICE_TTS_KK_DEFAULT_BACKEND
 
     cache_key = (text, lang, selected_backend, voice)
     cached = _tts_cache.get(cache_key)
@@ -177,7 +194,8 @@ async def synthesize(
         body["voice"] = voice
 
     try:
-        response = await _http().post(
+        client = _omnivoice_http() if selected_backend == "omnivoice" else _http()
+        response = await client.post(
             "/tts/synthesize", params={"format": "wav"}, json=body
         )
         response.raise_for_status()

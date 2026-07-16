@@ -88,15 +88,19 @@ class Settings(BaseSettings):
 
     # ── Voice (in-repo STT/TTS sidecar; see ./voice) ─────────────────────────
     # The GPU `voice` container (docker-compose service) serves STT (Whisper
-    # ru/kk/auto) and TTS (Qwen3-TTS/Supertonic ru + MMS kaz) over plain HTTP. In compose
-    # the api reaches it at http://voice:8001; the default below targets the
-    # host-mapped port for local dev. Omitted STT language auto-detects RU/KK;
-    # omitted standalone TTS language follows DEFAULT_LANGUAGE.
+    # ru/kk/auto) and TTS (Qwen3-TTS/Supertonic ru + MMS kaz) over plain HTTP.
+    # Kazakh OmniVoice is isolated in its own service because it requires a
+    # newer Transformers release than the existing Qwen TTS backend. In compose
+    # the api reaches these services by their Docker DNS names; the defaults
+    # below target host-mapped ports for local development. Omitted STT language
+    # auto-detects RU/KK; omitted standalone TTS language follows DEFAULT_LANGUAGE.
     # VOICE_VERIFY_SSL is irrelevant over internal HTTP but kept for the client.
     VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False
     VOICE_TIMEOUT_S: float = 120.0  # generous: covers GPU cold start + ≤120s audio
     VOICE_TTS_RU_DEFAULT_BACKEND: str = "supertonic"
+    VOICE_KK_OMNIVOICE_BASE_URL: str = "http://localhost:8003"
+    VOICE_TTS_KK_DEFAULT_BACKEND: str = "omnivoice"
 
     @field_validator("VOICE_TTS_RU_DEFAULT_BACKEND")
     @classmethod
@@ -105,6 +109,16 @@ class Settings(BaseSettings):
         if normalized not in {"mms", "qwen", "supertonic"}:
             raise ValueError(
                 "VOICE_TTS_RU_DEFAULT_BACKEND must be one of: mms, qwen, supertonic"
+            )
+        return normalized
+
+    @field_validator("VOICE_TTS_KK_DEFAULT_BACKEND")
+    @classmethod
+    def _valid_kazakh_tts_backend(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in {"mms", "omnivoice"}:
+            raise ValueError(
+                "VOICE_TTS_KK_DEFAULT_BACKEND must be one of: mms, omnivoice"
             )
         return normalized
 
