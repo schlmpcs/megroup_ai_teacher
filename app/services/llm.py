@@ -31,7 +31,11 @@ from tenacity import (
 from app.core.config import settings
 from app.services import embeddings, vectorstore
 from app.services.openai_client import client
-from app.services.memory import build_input_messages, trim_history
+from app.services.memory import (
+    build_input_messages,
+    build_retrieval_query,
+    trim_history,
+)
 from app.services.ttl_cache import TTLCache
 
 # Service-layer exceptions live in app/services/errors.py so embeddings/
@@ -894,9 +898,13 @@ async def _prepare_answer_grounding(
     scenario_context: Optional[str],
     scenario_state: Optional[str],
     lab: Optional[dict],
+    retrieval_query: Optional[str] = None,
 ) -> _AnswerGrounding:
     """Build identical retrieval and fallback state for both generation paths."""
+    effective_retrieval_query = retrieval_query or query
     inferred_subject, answer_language = _infer_query_context(query)
+    if not inferred_subject and effective_retrieval_query != query:
+        inferred_subject = _infer_query_subject(effective_retrieval_query)
     (
         lab_instruction,
         lab_incomplete,
@@ -920,7 +928,7 @@ async def _prepare_answer_grounding(
         retrieval_lang = answer_language
 
     retrieved = await _retrieve(
-        query,
+        effective_retrieval_query,
         query_filter=query_filter,
         lang=retrieval_lang,
         fallback_filter=fallback_filter,
@@ -1079,17 +1087,27 @@ async def generate_answer(
             _log_generation("answer_cached", query, cached)
             return cached
 
+    raw_history = (
+        chat_history
+        if chat_history is not None
+        else [{"role": "user", "content": query}]
+    )
+    history = trim_history(
+        raw_history,
+        max_messages=settings.CHAT_MEMORY_MAX_MESSAGES,
+        max_chars=settings.CHAT_MEMORY_HISTORY_CHARS,
+    )
+    retrieval_query = build_retrieval_query(
+        query,
+        history,
+        max_context_chars=settings.CHAT_MEMORY_RETRIEVAL_CONTEXT_CHARS,
+    )
     grounding = await _prepare_answer_grounding(
         query,
         scenario_context,
         scenario_state,
         lab,
-    )
-    raw_history = chat_history if chat_history is not None else [{"role": "user", "content": query}]
-    history = trim_history(
-        raw_history,
-        max_messages=settings.CHAT_MEMORY_MAX_MESSAGES,
-        max_chars=settings.CHAT_MEMORY_HISTORY_CHARS,
+        retrieval_query=retrieval_query,
     )
     input_messages = build_input_messages(history)
 
@@ -1131,23 +1149,35 @@ async def stream_answer(
             yield {"type": "done", "citations": cached.citations, "usage": cached.usage}
             return
 
-    grounding = await _prepare_answer_grounding(
-        query,
-        scenario_context,
-        scenario_state,
-        lab,
+    raw_history = (
+        chat_history
+        if chat_history is not None
+        else [{"role": "user", "content": query}]
     )
-    raw_history = chat_history if chat_history is not None else [{"role": "user", "content": query}]
     history = trim_history(
         raw_history,
         max_messages=settings.CHAT_MEMORY_MAX_MESSAGES,
         max_chars=settings.CHAT_MEMORY_HISTORY_CHARS,
     )
+    retrieval_query = build_retrieval_query(
+        query,
+        history,
+        max_context_chars=settings.CHAT_MEMORY_RETRIEVAL_CONTEXT_CHARS,
+    )
+    grounding = await _prepare_answer_grounding(
+        query,
+        scenario_context,
+        scenario_state,
+        lab,
+        retrieval_query=retrieval_query,
+    )
     input_messages = build_input_messages(history)
 
     if grounding.scope_refusal or grounding.allow_general_knowledge:
         try:
-            result = await _complete_answer(query, grounding, input_messages, max_tokens)
+            result = await _complete_answer(
+                query, grounding, input_messages, max_tokens
+            )
         except LLMError as exc:
             logger.error("Fallback completion error: %s", exc, exc_info=True)
             yield {"type": "error", "message": str(exc)}

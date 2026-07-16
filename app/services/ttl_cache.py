@@ -48,6 +48,11 @@ class TTLCache:
         while len(self._data) > self.max_size:
             self._data.popitem(last=False)
 
+    def delete(self, key: Hashable) -> bool:
+        """Remove one entry and report whether it existed."""
+
+        return self._data.pop(key, None) is not None
+
     def clear(self) -> None:
         """Remove every cached entry immediately."""
 

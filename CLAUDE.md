@@ -4,7 +4,7 @@ dont coauthor commits
 
 ## Repo Purpose
 
-Thin, stateless FastAPI proxy putting an AI assistant inside a school VR lab
+Thin FastAPI proxy putting an AI assistant inside a school VR lab
 simulator (physics / chemistry / biology). Retrieval is now **local + hybrid**:
 the knowledge base lives in a self-hosted **Qdrant** vector store, queried with
 a local **BAAI/bge-m3** GPU embedder (dense + learned-sparse, fused by RRF).
@@ -42,7 +42,7 @@ app/
     corpus_meta.py        # derive subject/grade/lang/lab_id metadata from corpus paths
     voice.py              # httpx client to the in-repo STT/TTS sidecar (./voice)
     ingestion.py          # to_markdown -> chunk+embed (PDF/DOCX/EPUB/TXT/MD) -> Qdrant; bulk ingest + manifest
-    memory.py             # request-scoped chat-history trimming
+    memory.py             # bounded history + ephemeral TTL conversation memory
 embedder/                 # GPU sidecar container (FlagEmbedding BGEM3FlagModel, RTX 3060 / sm_86)
 voice/                    # GPU STT/TTS sidecar (Whisper + Qwen3-TTS/Supertonic/MMS); vendored from ../vrrag_ttsstt
 scripts/manage_corpus.py  # CLI: create-collection / upload / bulk-ingest / gen-manifest / list / status / delete
@@ -134,7 +134,8 @@ routes.py
   Omitted STT language auto-detects RU/KK; omitted standalone TTS language
   follows `DEFAULT_LANGUAGE`. (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
   `TTS_MODEL`/`TTS_VOICE`/`TTS_FORMAT`/`TTS_INSTRUCTIONS` are removed.)
-- Keep the proxy stateless. There is no app DB; KB state lives in Qdrant.
+- There is no app DB. VR conversation memory is ephemeral TTL/LRU process state;
+  deploys and container restarts clear it. KB state lives in Qdrant.
 - Run `pytest` (fast, fully mocked, no network/GPU) before declaring done.
 
 ## Safe commands

@@ -20,6 +20,7 @@ def fake_answer(monkeypatch):
             {
                 "query": query,
                 "scenario_context": scenario_context,
+                "chat_history": chat_history,
                 "scenario_state": scenario_state,
                 "lab": lab,
             }
@@ -69,7 +70,68 @@ def test_ask_returns_answer_and_citations(client, auth, fake_answer):
     body = r.json()
     assert body["answer"].startswith("Ответ на: Что такое кипение?")
     assert body["primary_source"]["filename"] == "physics_8.pdf"
+    assert body["conversation_id"]
     assert body["scenario_id"] is None
+
+
+def test_ask_reuses_conversation_history_for_followup(client, auth, fake_answer):
+    conversation_id = "vr-session-physics-1"
+    first = client.post(
+        "/ask",
+        json={
+            "query": "Что такое кипение?",
+            "conversation_id": conversation_id,
+        },
+        headers=auth,
+    )
+    second = client.post(
+        "/ask",
+        json={
+            "query": "Почему оно начинается?",
+            "conversation_id": conversation_id,
+        },
+        headers=auth,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["conversation_id"] == conversation_id
+    assert fake_answer.calls[-1]["chat_history"] == [
+        {"role": "user", "content": "Что такое кипение?"},
+        {"role": "assistant", "content": "Ответ на: Что такое кипение?"},
+        {"role": "user", "content": "Почему оно начинается?"},
+    ]
+
+
+def test_ask_rejects_invalid_conversation_id(client, auth):
+    r = client.post(
+        "/ask",
+        json={"query": "Привет", "conversation_id": "invalid id with spaces"},
+        headers=auth,
+    )
+    assert r.status_code == 422
+
+
+def test_clear_conversation_forgets_history(client, auth, fake_answer):
+    conversation_id = "vr-session-clear"
+    client.post(
+        "/ask",
+        json={"query": "Первый вопрос", "conversation_id": conversation_id},
+        headers=auth,
+    )
+
+    cleared = client.delete(f"/v1/conversations/{conversation_id}", headers=auth)
+    second = client.post(
+        "/ask",
+        json={"query": "Новый вопрос", "conversation_id": conversation_id},
+        headers=auth,
+    )
+
+    assert cleared.status_code == 200
+    assert cleared.json() == {"conversation_id": conversation_id, "cleared": True}
+    assert second.status_code == 200
+    assert fake_answer.calls[-1]["chat_history"] == [
+        {"role": "user", "content": "Новый вопрос"}
+    ]
 
 
 def test_ask_threads_scenario_context(client, auth, fake_answer):
@@ -205,6 +267,46 @@ def test_ask_stream(client, auth, monkeypatch):
     assert "".join(deltas) == "Кипение — это парообразование."
     done = next(e for e in events if e["type"] == "done")
     assert done["primary_source"]["filename"] == "physics_8.pdf"
+
+
+def test_ask_stream_remembers_answer_for_followup(
+    client, auth, monkeypatch, fake_answer
+):
+    async def _stream(
+        query,
+        scenario_context=None,
+        chat_history=None,
+        max_tokens=None,
+        scenario_state=None,
+        lab=None,
+    ):
+        yield {"type": "delta", "text": "Первый "}
+        yield {"type": "delta", "text": "ответ."}
+        yield {"type": "done", "citations": [], "usage": {}}
+
+    monkeypatch.setattr(routes, "stream_answer", _stream)
+    conversation_id = "ask-stream-followup"
+    first = client.post(
+        "/ask",
+        json={
+            "query": "Первый вопрос",
+            "conversation_id": conversation_id,
+            "stream": True,
+        },
+        headers=auth,
+    )
+    second = client.post(
+        "/ask",
+        json={"query": "А почему?", "conversation_id": conversation_id},
+        headers=auth,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert fake_answer.calls[-1]["chat_history"] == [
+        {"role": "user", "content": "Первый вопрос"},
+        {"role": "assistant", "content": "Первый ответ."},
+        {"role": "user", "content": "А почему?"},
+    ]
 
 
 def test_split_ready():
@@ -479,6 +581,44 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     assert "tts" in body["observability"]["latency_ms"]
 
 
+def test_voice_ask_reuses_conversation_history(client, auth, monkeypatch, fake_answer):
+    questions = iter(["Что такое кипение?", "Почему оно начинается?"])
+
+    async def _transcribe_with_language(
+        audio_bytes, filename="audio.webm", language=None, prompt=None
+    ):
+        return next(questions), "ru"
+
+    async def _synth(
+        text,
+        voice=None,
+        response_format=None,
+        instructions=None,
+        language=None,
+        backend=None,
+    ):
+        return b"SPOKEN", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe_with_language)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    request_args = {
+        "files": {"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        "data": {"conversation_id": "voice-followup-session"},
+        "headers": auth,
+    }
+
+    first = client.post("/voice_ask", **request_args)
+    second = client.post("/voice_ask", **request_args)
+
+    assert first.status_code == second.status_code == 200
+    assert second.json()["conversation_id"] == "voice-followup-session"
+    assert fake_answer.calls[-1]["chat_history"] == [
+        {"role": "user", "content": "Что такое кипение?"},
+        {"role": "assistant", "content": "Ответ на: Что такое кипение?"},
+        {"role": "user", "content": "Почему оно начинается?"},
+    ]
+
+
 def test_voice_ask_uses_detected_language_for_tts_and_lab(
     client, auth, monkeypatch, fake_answer
 ):
@@ -570,7 +710,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
     r = client.post(
         "/voice_ask",
         files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
-        data={"stream": "true"},
+        data={"stream": "true", "conversation_id": "voice-stream-session"},
         headers=auth,
     )
     assert r.status_code == 200
@@ -581,6 +721,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
         "type": "question",
         "text": "Зачем нагревать пробирку?",
         "language": "ru",
+        "conversation_id": "voice-stream-session",
     }
     deltas = [e["text"] for e in events if e["type"] == "delta"]
     assert "".join(deltas) == "Нагрев ускоряет реакцию. Молекулы движутся быстрее."
@@ -597,6 +738,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
     )
     done = next(e for e in events if e["type"] == "done")
     assert done["primary_source"]["filename"] == "chem_8.pdf"
+    assert done["conversation_id"] == "voice-stream-session"
     assert "stt" in done["observability"]["latency_ms"]
     assert "[DONE]" in r.text
 

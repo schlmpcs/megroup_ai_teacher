@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Annotated, List, Literal, NoReturn, Optional
 
@@ -34,7 +35,11 @@ from app.services.llm import (
     rephrase_hint,
     stream_answer,
 )
-from app.services.memory import build_input_messages, latest_user_message
+from app.services.memory import (
+    build_input_messages,
+    conversation_memory,
+    latest_user_message,
+)
 from app.services.scenarios import (
     ScenarioNotFoundError,
     format_scenario_state,
@@ -64,9 +69,14 @@ _consumer_limit = (
 _SCENE_STATE_ID_CHARS = 128
 _SCENE_STATE_ITEM_CHARS = 256
 _SCENE_STATE_MAX_ITEMS = 50
+_CONVERSATION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 
 SceneStateId = Annotated[str, Field(max_length=_SCENE_STATE_ID_CHARS)]
 SceneStateItem = Annotated[str, Field(max_length=_SCENE_STATE_ITEM_CHARS)]
+ConversationId = Annotated[
+    str,
+    Field(min_length=1, max_length=128, pattern=_CONVERSATION_ID_PATTERN),
+]
 
 
 class ScenarioState(BaseModel):
@@ -138,6 +148,7 @@ class Lab(BaseModel):
 
 class AskRequest(BaseModel):
     query: str = Field(min_length=1, max_length=settings.MAX_INPUT_CHARS)
+    conversation_id: Optional[ConversationId] = None
     scenario_id: Optional[str] = None
     max_tokens: Optional[int] = Field(default=None, ge=64, le=4096)
     scenario_state: Optional[ScenarioState] = None
@@ -304,25 +315,38 @@ async def ask_endpoint(req: AskRequest, request: Request):
     """
     scenario_context = _scenario_context_or_404(req.scenario_id)
     scenario_state = _scenario_state_text(req.scenario_state)
+    conversation_id = req.conversation_id or str(uuid.uuid4())
+    chat_history = conversation_memory.history_for(conversation_id, req.query)
 
     if req.stream:
 
         async def event_gen():
+            answer_parts: list[str] = []
             try:
                 async for event in stream_answer(
                     req.query,
                     scenario_context=scenario_context,
+                    chat_history=chat_history,
                     max_tokens=req.max_tokens,
                     scenario_state=scenario_state,
                     lab=_lab_dict(req.lab),
                 ):
-                    if event["type"] == "done":
+                    if event["type"] == "delta":
+                        answer_parts.append(event["text"])
+                        yield _sse(event)
+                    elif event["type"] == "done":
+                        answer = "".join(answer_parts).strip()
+                        if answer:
+                            conversation_memory.remember(
+                                conversation_id, chat_history, answer
+                            )
                         citations = event["citations"]
                         yield _sse(
                             {
                                 "type": "done",
                                 "citations": citations,
                                 "primary_source": citations[0] if citations else None,
+                                "conversation_id": conversation_id,
                                 "scenario_id": req.scenario_id,
                                 "usage": event["usage"],
                             }
@@ -339,6 +363,7 @@ async def ask_endpoint(req: AskRequest, request: Request):
         result = await generate_answer(
             req.query,
             scenario_context=scenario_context,
+            chat_history=chat_history,
             max_tokens=req.max_tokens,
             scenario_state=scenario_state,
             lab=_lab_dict(req.lab),
@@ -346,11 +371,13 @@ async def ask_endpoint(req: AskRequest, request: Request):
     except LLMError as exc:
         _handle_llm_error(exc)
     llm_ms = (time.time() - start) * 1000
+    conversation_memory.remember(conversation_id, chat_history, result.answer)
 
     return {
         "answer": result.answer,
         "citations": result.citations,
         "primary_source": result.primary_source,
+        "conversation_id": conversation_id,
         "scenario_id": req.scenario_id,
         "usage": result.usage,
         "observability": {"latency_ms": {"llm": llm_ms, "total": llm_ms}},
@@ -533,6 +560,12 @@ async def tts_endpoint(req: TTSRequest, request: Request):
 async def voice_ask_endpoint(
     request: Request,
     file: UploadFile = File(...),
+    conversation_id: Optional[str] = Form(
+        None,
+        min_length=1,
+        max_length=128,
+        pattern=_CONVERSATION_ID_PATTERN,
+    ),
     scenario_id: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
     voice: Optional[str] = Form(None),
@@ -568,6 +601,7 @@ async def voice_ask_endpoint(
     ``{"type":"done",...}`` frame with citations, then ``data: [DONE]``. The
     client plays audio frames back-to-back in ``seq`` order.
     """
+    conversation_id = conversation_id or str(uuid.uuid4())
     scenario_context = _scenario_context_or_404(scenario_id)
     scenario_state = _scenario_state_text(
         _scenario_state_from_form(
@@ -600,6 +634,7 @@ async def voice_ask_endpoint(
         _handle_llm_error(exc)
 
     tts_language = resolved_language
+    chat_history = conversation_memory.history_for(conversation_id, question)
     lab = _lab_dict(
         Lab(
             subject=subject,
@@ -618,10 +653,16 @@ async def voice_ask_endpoint(
             # transport meanwhile); add a queue+task pipeline if TTS ever
             # becomes the bottleneck.
             yield _sse(
-                {"type": "question", "text": question, "language": resolved_language}
+                {
+                    "type": "question",
+                    "text": question,
+                    "language": resolved_language,
+                    "conversation_id": conversation_id,
+                }
             )
             buf = ""
             seq = 0
+            answer_parts: list[str] = []
 
             async def tts_frame(text: str) -> str:
                 nonlocal seq
@@ -646,16 +687,23 @@ async def voice_ask_endpoint(
                 async for event in stream_answer(
                     question,
                     scenario_context=scenario_context,
+                    chat_history=chat_history,
                     scenario_state=scenario_state,
                     lab=lab,
                 ):
                     if event["type"] == "delta":
                         yield _sse({"type": "delta", "text": event["text"]})
+                        answer_parts.append(event["text"])
                         buf += event["text"]
                         ready, buf = _split_ready(buf)
                         for sentence in ready:
                             yield await tts_frame(sentence)
                     elif event["type"] == "done":
+                        answer = "".join(answer_parts).strip()
+                        if answer:
+                            conversation_memory.remember(
+                                conversation_id, chat_history, answer
+                            )
                         if buf.strip():
                             yield await tts_frame(buf.strip())
                         citations = event["citations"]
@@ -664,6 +712,7 @@ async def voice_ask_endpoint(
                                 "type": "done",
                                 "citations": citations,
                                 "primary_source": citations[0] if citations else None,
+                                "conversation_id": conversation_id,
                                 "scenario_id": scenario_id,
                                 "usage": event["usage"],
                                 "observability": {"latency_ms": timings},
@@ -683,6 +732,7 @@ async def voice_ask_endpoint(
         result = await generate_answer(
             question,
             scenario_context=scenario_context,
+            chat_history=chat_history,
             scenario_state=scenario_state,
             lab=lab,
         )
@@ -696,6 +746,7 @@ async def voice_ask_endpoint(
             backend=tts_backend,
         )
         timings["tts"] = (time.time() - t0) * 1000
+        conversation_memory.remember(conversation_id, chat_history, result.answer)
     except LLMError as exc:
         _handle_llm_error(exc)
 
@@ -706,10 +757,24 @@ async def voice_ask_endpoint(
         "answer": result.answer,
         "citations": result.citations,
         "primary_source": result.primary_source,
+        "conversation_id": conversation_id,
         "scenario_id": scenario_id,
         "audio_base64": base64.b64encode(audio).decode("ascii"),
         "audio_format": media_type,
         "observability": {"latency_ms": timings},
+    }
+
+
+@router.delete("/v1/conversations/{conversation_id}")
+@limiter.limit(_consumer_limit)
+async def clear_conversation(
+    conversation_id: ConversationId,
+    request: Request,
+):
+    """Forget one ephemeral VR conversation immediately."""
+    return {
+        "conversation_id": conversation_id,
+        "cleared": conversation_memory.clear(conversation_id),
     }
 
 

@@ -55,6 +55,14 @@ def test_ttl_cache_clear_removes_all_entries():
     assert c.get("b") is None
 
 
+def test_ttl_cache_delete_reports_presence():
+    c = TTLCache(max_size=2, ttl_s=60)
+    c.put("a", 1)
+
+    assert c.delete("a") is True
+    assert c.delete("a") is False
+
+
 # ── Answer cache in generate_answer / stream_answer ─────────────────────────
 
 
@@ -115,6 +123,29 @@ async def test_generate_answer_multiturn_not_cached(monkeypatch):
     await llm.generate_answer("А почему?", chat_history=history)
     await llm.generate_answer("А почему?", chat_history=history)
     assert len(fake.responses.calls) == 2
+
+
+async def test_generate_answer_contextualizes_followup_retrieval(monkeypatch):
+    fake = _FakeClient()
+    retrieval_queries = []
+
+    async def _capture_retrieve(query, **kwargs):
+        retrieval_queries.append(query)
+        return []
+
+    monkeypatch.setattr(llm, "client", fake)
+    monkeypatch.setattr(llm, "_retrieve", _capture_retrieve)
+    history = [
+        {"role": "user", "content": "Что такое кипение?"},
+        {"role": "assistant", "content": "Это переход жидкости в пар."},
+        {"role": "user", "content": "Почему оно начинается?"},
+    ]
+
+    await llm.generate_answer("Почему оно начинается?", chat_history=history)
+
+    assert len(retrieval_queries) == 1
+    assert "Что такое кипение?" in retrieval_queries[0]
+    assert retrieval_queries[0].endswith("Почему оно начинается?")
 
 
 async def test_generate_answer_passes_service_tier(monkeypatch):

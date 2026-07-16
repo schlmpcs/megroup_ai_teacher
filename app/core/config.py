@@ -119,9 +119,14 @@ class Settings(BaseSettings):
     ALLOW_GENERAL_KNOWLEDGE_FALLBACK: bool = True
     SCENARIOS_DIR: str = "./scenarios"
 
-    # Chat memory — request-scoped, no persistence.
+    # Chat memory. Client-supplied /v1/chat/completions history and ephemeral
+    # server-side VR conversations share the same per-conversation bounds.
+    # The server store is TTL/LRU in-process and is cleared on deploy/restart.
+    CHAT_MEMORY_MAX_CONVERSATIONS: int = 1024
+    CHAT_MEMORY_TTL_S: float = 7200.0
     CHAT_MEMORY_MAX_MESSAGES: int = 16
     CHAT_MEMORY_HISTORY_CHARS: int = 6000
+    CHAT_MEMORY_RETRIEVAL_CONTEXT_CHARS: int = 1200
 
     # ── CORS / limits ────────────────────────────────────────────────────────
     CORS_ORIGINS: str = "*"
