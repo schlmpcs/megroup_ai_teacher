@@ -117,6 +117,10 @@ services:
       - OMNIVOICE_MODEL=${OMNIVOICE_MODEL:-shyngys879/KazakhTTS-OmniVoice}
       - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, moderate pitch}
       - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
+      # The server's direct Hugging Face route intermittently returns 504 for
+      # the mandatory Higgs audio tokenizer. This public mirror is configurable
+      # through .env and used only by the isolated OmniVoice container.
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
     restart: unless-stopped
     deploy:
       resources:
