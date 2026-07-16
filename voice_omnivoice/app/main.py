@@ -7,6 +7,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -30,6 +31,9 @@ class Settings:
         "OMNIVOICE_INSTRUCT", "male, young adult, moderate pitch"
     )
     steps: int = int(os.getenv("OMNIVOICE_STEPS", "24"))
+    audio_tokenizer_path: str = os.getenv(
+        "OMNIVOICE_AUDIO_TOKENIZER_PATH", "/models/hf_cache/higgs-audio-v2-tokenizer"
+    )
     device: str = _device()
     hf_cache: str = os.getenv("HF_HOME", "/models/hf_cache")
 
@@ -80,8 +84,29 @@ class OmniVoiceBackend:
 
     def load_model(self) -> None:
         from omnivoice import OmniVoice
+        from omnivoice.models import omnivoice as omnivoice_module
 
         dtype = torch.float16 if self.settings.device.startswith("cuda") else torch.float32
+        tokenizer_path = Path(self.settings.audio_tokenizer_path)
+        if not (tokenizer_path / "config.json").is_file():
+            raise RuntimeError(
+                "OmniVoice audio tokenizer is missing at "
+                f"{self.settings.audio_tokenizer_path}. Download "
+                "eustlb/higgs-audio-v2-tokenizer into that mounted path."
+            )
+
+        # OmniVoice otherwise always calls snapshot_download() for this public
+        # dependency, even when the model itself is already local. Let deploys
+        # mount a verified local copy so a transient Hugging Face failure cannot
+        # make the service unavailable.
+        resolve_model_path = omnivoice_module._resolve_model_path
+
+        def resolve_local_tokenizer(name_or_path: str) -> str:
+            if name_or_path == "eustlb/higgs-audio-v2-tokenizer":
+                return str(tokenizer_path)
+            return resolve_model_path(name_or_path)
+
+        omnivoice_module._resolve_model_path = resolve_local_tokenizer
         self.model = OmniVoice.from_pretrained(
             self.settings.model,
             device_map="cuda:0" if self.settings.device.startswith("cuda") else "cpu",
