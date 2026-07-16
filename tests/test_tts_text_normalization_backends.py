@@ -29,11 +29,19 @@ def test_omnivoice_model_receives_normalized_kazakh_text(monkeypatch):
     backend.model = _FakeOmniVoiceModel()
     monkeypatch.setattr(omnivoice_main, "_encode_wav", lambda audio: b"WAV")
 
-    result = backend.synthesize("H2O молекуласында 2 сутек атомы бар.", 1.0)
+    result = backend.synthesize(
+        "А. Қ. Байтұрсынұлы: H2O молекуласында 2 сутек атомы "
+        "және AI бар.",
+        1.0,
+    )
 
     assert result == b"WAV"
     call = backend.model.calls[0]
-    assert call["text"] == "H2O молекуласында екі сутек атомы бар."
+    assert call["text"] == (
+        "а қы Байтұрсынұлы: H2O молекуласында "
+        "екі сутек атомы "
+        "және эй ай бар."
+    )
     assert call["language"] == "Kazakh"
     assert call["instruct"] == "male, young adult, moderate pitch"
     assert "normalize_text" not in call
@@ -45,9 +53,9 @@ def test_omnivoice_normalization_can_be_disabled(monkeypatch):
     backend.model = _FakeOmniVoiceModel()
     monkeypatch.setattr(omnivoice_main, "_encode_wav", lambda audio: b"WAV")
 
-    backend.synthesize("25 °C", 1.0)
+    backend.synthesize("AI 25 °C", 1.0)
 
-    assert backend.model.calls[0]["text"] == "25 °C"
+    assert backend.model.calls[0]["text"] == "AI 25 °C"
 
 
 def _russian_backend(monkeypatch, selected_backend: str, *, enabled: bool = True):
@@ -89,21 +97,23 @@ def test_every_russian_backend_receives_normalized_text(
     backend, captured = _russian_backend(monkeypatch, selected_backend)
 
     result = backend.synthesize(
-        "В молекуле H2O есть 2 атома водорода.",
+        "А. С. Пушкин: в молекуле H2O есть 2 атома и AI.",
         language="ru",
         backend=selected_backend,
     )
 
     assert result == b"WAV"
-    assert captured == ["В молекуле H2O есть два атома водорода."]
+    assert captured == [
+        "а эс Пушкин: в молекуле H2O есть два атома и эй ай."
+    ]
 
 
 def test_russian_normalization_can_be_disabled(monkeypatch):
     backend, captured = _russian_backend(monkeypatch, "qwen", enabled=False)
 
-    backend.synthesize("25 °C", language="ru", backend="qwen")
+    backend.synthesize("AI 25 °C", language="ru", backend="qwen")
 
-    assert captured == ["25 °C"]
+    assert captured == ["AI 25 °C"]
 
 
 def test_russian_transliteration_preserves_non_linguistic_tokens(monkeypatch):

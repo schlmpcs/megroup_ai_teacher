@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from .text_normalization import normalize_kazakh_text
+from .abbreviation_normalization import normalize_kazakh_tts_text
 
 logger = logging.getLogger("omnivoice")
 
@@ -139,7 +139,7 @@ class OmniVoiceBackend:
         if self.model is None:
             raise RuntimeError("OmniVoice model is not loaded")
         synthesis_text = (
-            normalize_kazakh_text(text)
+            normalize_kazakh_tts_text(text)
             if self.settings.normalize_kk_numbers
             else text
         )

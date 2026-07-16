@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .text_normalization import normalize_russian_text, transform_unprotected
+from .abbreviation_normalization import normalize_russian_tts_text
+from .text_normalization import transform_unprotected
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -189,7 +190,7 @@ class LocalTtsBackend:
     ) -> bytes:
         selected = self.select_backend(language, backend)
         synthesis_text = (
-            normalize_russian_text(text)
+            normalize_russian_tts_text(text)
             if language == "ru" and self.settings.tts_normalize_ru_numbers
             else text
         )
