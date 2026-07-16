@@ -79,9 +79,9 @@
   <main>
     <div class="config">
       <label>Base URL</label>
-      <input type="text" id="baseUrl" value="http://localhost:8000" />
+      <input type="text" id="baseUrl" value="https://megroup-b560m-hdv-m-2.tail7dd37a.ts.net" />
       <label>API Key</label>
-      <input type="password" id="apiKey" value="" placeholder="INTERNAL_API_KEY" autocomplete="off" />
+      <input type="password" id="apiKey" value="" placeholder="INTERNAL_API_KEY (saved only in this browser)" autocomplete="off" />
     </div>
 
     <!-- HEALTH -->
@@ -179,13 +179,13 @@
     <!-- TTS -->
     <section class="panel" data-panel="tts">
       <h2>/tts: Text → Speech</h2>
-      <p class="hint">Synthesize teacher-tone audio. Voice/format are sidecar-dependent (leave blank for defaults).</p>
+      <p class="hint">Kazakh defaults to the fixed young-male OmniVoice profile; Russian defaults to Supertonic.</p>
       <label class="field">Text</label>
-      <textarea id="ttsText">Здравствуйте! Сегодня мы проведём лабораторную работу по нагреванию воды.</textarea>
+      <textarea id="ttsText">Сәлеметсіз бе! Бүгін біз зертханалық жұмысты бастаймыз.</textarea>
       <div class="row">
-        <div><label class="field">Language</label><select id="ttsLang"><option value="">default</option><option>ru</option><option>kk</option></select></div>
-        <div><label class="field">Backend</label><select id="ttsBackend"><option value="">default (Supertonic)</option><option value="supertonic">Supertonic</option><option value="qwen">Qwen3-TTS 0.6B</option><option value="mms">MMS</option></select></div>
-        <div><label class="field">Voice (optional)</label><input type="text" id="ttsVoice" placeholder="sidecar default" /></div>
+        <div><label class="field">Language</label><select id="ttsLang"><option value="">default</option><option>ru</option><option selected>kk</option></select></div>
+        <div><label class="field">Backend</label><select id="ttsBackend"><option value="">default</option><option value="omnivoice" selected>OmniVoice young male (Kazakh)</option><option value="mms">MMS (Kazakh fallback)</option><option value="supertonic">Supertonic (Russian)</option><option value="qwen">Qwen3-TTS 0.6B (Russian)</option></select></div>
+        <div><label class="field">Voice (optional)</label><input type="text" id="ttsVoice" placeholder="fixed for OmniVoice" /></div>
         <div><label class="field">Format (optional)</label><input type="text" id="ttsFormat" placeholder="wav" /></div>
       </div>
       <button class="go" onclick="doTts()">Synthesize</button>
@@ -231,6 +231,15 @@ const $ = id => document.getElementById(id);
 const baseUrl = () => $('baseUrl').value.replace(/\/+$/, '');
 const apiKey = () => $('apiKey').value.trim();
 const authHeaders = (extra={}) => ({ 'Authorization': 'Bearer ' + apiKey(), ...extra });
+
+const API_KEY_STORAGE = 'vr-ai-assistant-test-console-api-key';
+const savedApiKey = localStorage.getItem(API_KEY_STORAGE);
+if (savedApiKey) $('apiKey').value = savedApiKey;
+$('apiKey').addEventListener('change', () => {
+  const key = apiKey();
+  if (key) localStorage.setItem(API_KEY_STORAGE, key);
+  else localStorage.removeItem(API_KEY_STORAGE);
+});
 
 // ── Nav ──
 const tabs = [
