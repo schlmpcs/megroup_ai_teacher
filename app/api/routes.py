@@ -24,6 +24,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from app.core.config import settings
+from app.core.languages import LanguageCode, SpeechRecognitionLanguage
 from app.core.security import verify_api_key
 from app.services import ingestion
 from app.services.corpus_meta import build_upload_metadata, compose_lab_id
@@ -33,6 +34,7 @@ from app.services.llm import (
     clear_answer_cache,
     generate_answer,
     rephrase_hint,
+    resolve_answer_language,
     stream_answer,
 )
 from app.services.memory import (
@@ -46,7 +48,7 @@ from app.services.scenarios import (
     get_scenario_context,
     list_scenarios,
 )
-from app.services.voice import synthesize, transcribe_with_language
+from app.services.voice import resolve_tts_backend, synthesize, transcribe_with_language
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 logger = logging.getLogger("assistant.api")
@@ -142,7 +144,7 @@ class Lab(BaseModel):
 
     subject: Literal["physics", "chemistry", "biology"]
     grade: int = Field(ge=7, le=11)
-    lang: Literal["ru", "kk"] = "ru"
+    lang: LanguageCode = "ru"
     lab_number: Optional[int] = Field(default=None, ge=1, le=20)
 
 
@@ -153,6 +155,7 @@ class AskRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=None, ge=64, le=4096)
     scenario_state: Optional[ScenarioState] = None
     lab: Optional[Lab] = None
+    language: Optional[LanguageCode] = None
     stream: bool = False
 
     @model_validator(mode="after")
@@ -176,6 +179,7 @@ class ChatCompletionRequest(BaseModel):
     scenario_id: Optional[str] = None
     scenario_state: Optional[ScenarioState] = None
     lab: Optional[Lab] = None
+    language: Optional[LanguageCode] = None
 
     @model_validator(mode="after")
     def _latest_is_user(self):
@@ -190,6 +194,7 @@ class HintRequest(BaseModel):
     hint_level: int = Field(ge=1, le=3)
     scenario_id: Optional[str] = None
     scenario_state: Optional[ScenarioState] = None
+    language: Optional[LanguageCode] = None
 
 
 class TTSRequest(BaseModel):
@@ -198,7 +203,7 @@ class TTSRequest(BaseModel):
     backend: Optional[Literal["mms", "qwen", "supertonic", "omnivoice"]] = None
     format: Optional[str] = None
     instructions: Optional[str] = None
-    language: Optional[str] = None
+    language: Optional[LanguageCode] = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -217,11 +222,13 @@ def _scenario_context_or_404(scenario_id: Optional[str]) -> Optional[str]:
         ) from exc
 
 
-def _scenario_state_text(state: Optional[ScenarioState]) -> Optional[str]:
+def _scenario_state_text(
+    state: Optional[ScenarioState], language: LanguageCode = "ru"
+) -> Optional[str]:
     """Render live scene state into a prompt block, or None if nothing useful."""
     if state is None:
         return None
-    text = format_scenario_state(**state.model_dump())
+    text = format_scenario_state(**state.model_dump(), language=language)
     return text or None
 
 
@@ -314,7 +321,13 @@ async def ask_endpoint(req: AskRequest, request: Request):
     ``{"type":"error","message":...}`` frames.
     """
     scenario_context = _scenario_context_or_404(req.scenario_id)
-    scenario_state = _scenario_state_text(req.scenario_state)
+    lab = _lab_dict(req.lab)
+    response_language = resolve_answer_language(
+        req.query,
+        explicit_language=req.language,
+        lab_language=(lab or {}).get("lang"),
+    )
+    scenario_state = _scenario_state_text(req.scenario_state, response_language)
     conversation_id = req.conversation_id or str(uuid.uuid4())
     chat_history = conversation_memory.history_for(conversation_id, req.query)
 
@@ -329,7 +342,8 @@ async def ask_endpoint(req: AskRequest, request: Request):
                     chat_history=chat_history,
                     max_tokens=req.max_tokens,
                     scenario_state=scenario_state,
-                    lab=_lab_dict(req.lab),
+                    lab=lab,
+                    answer_language=response_language,
                 ):
                     if event["type"] == "delta":
                         answer_parts.append(event["text"])
@@ -349,6 +363,7 @@ async def ask_endpoint(req: AskRequest, request: Request):
                                 "conversation_id": conversation_id,
                                 "scenario_id": req.scenario_id,
                                 "usage": event["usage"],
+                                "language": event.get("language", response_language),
                             }
                         )
                     else:
@@ -366,7 +381,8 @@ async def ask_endpoint(req: AskRequest, request: Request):
             chat_history=chat_history,
             max_tokens=req.max_tokens,
             scenario_state=scenario_state,
-            lab=_lab_dict(req.lab),
+            lab=lab,
+            answer_language=response_language,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
@@ -379,6 +395,7 @@ async def ask_endpoint(req: AskRequest, request: Request):
         "primary_source": result.primary_source,
         "conversation_id": conversation_id,
         "scenario_id": req.scenario_id,
+        "language": response_language,
         "usage": result.usage,
         "observability": {"latency_ms": {"llm": llm_ms, "total": llm_ms}},
     }
@@ -402,9 +419,15 @@ def _sse_chat_chunk(
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     """OpenAI-compatible chat endpoint with scenario + file-search grounding."""
     scenario_context = _scenario_context_or_404(req.scenario_id)
-    scenario_state = _scenario_state_text(req.scenario_state)
     history = build_input_messages([m.model_dump() for m in req.messages])
     user_query = latest_user_message(history) or ""
+    lab = _lab_dict(req.lab)
+    response_language = resolve_answer_language(
+        user_query,
+        explicit_language=req.language,
+        lab_language=(lab or {}).get("lang"),
+    )
+    scenario_state = _scenario_state_text(req.scenario_state, response_language)
 
     if req.stream:
 
@@ -417,7 +440,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     chat_history=history,
                     max_tokens=req.max_tokens,
                     scenario_state=scenario_state,
-                    lab=_lab_dict(req.lab),
+                    lab=lab,
+                    answer_language=response_language,
                 ):
                     if event["type"] == "delta":
                         yield _sse_chat_chunk(req.model, {"content": event["text"]})
@@ -427,6 +451,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                             "primary_source": event["citations"][0]
                             if event["citations"]
                             else None,
+                            "language": event.get("language", response_language),
                         }
                         yield f"data: {json.dumps({'metadata': meta}, ensure_ascii=False)}\n\n"
                         yield _sse_chat_chunk(req.model, {}, finish_reason="stop")
@@ -451,7 +476,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             chat_history=history,
             max_tokens=req.max_tokens,
             scenario_state=scenario_state,
-            lab=_lab_dict(req.lab),
+            lab=lab,
+            answer_language=response_language,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
@@ -474,6 +500,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "citations": result.citations,
             "primary_source": result.primary_source,
             "scenario_id": req.scenario_id,
+            "language": response_language,
             "observability": {"latency_ms": {"llm": llm_ms, "total": llm_ms}},
         },
     }
@@ -484,17 +511,26 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 async def hint_endpoint(req: HintRequest, request: Request):
     """Rephrase a simulator-provided hint at the given verbosity level."""
     scenario_context = _scenario_context_or_404(req.scenario_id)
-    scenario_state = _scenario_state_text(req.scenario_state)
+    response_language = resolve_answer_language(
+        req.hint_text, explicit_language=req.language
+    )
+    scenario_state = _scenario_state_text(req.scenario_state, response_language)
     try:
         hint = await rephrase_hint(
             req.hint_text,
             req.hint_level,
             scenario_context=scenario_context,
             scenario_state=scenario_state,
+            answer_language=response_language,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
-    return {"hint": hint, "hint_level": req.hint_level, "scenario_id": req.scenario_id}
+    return {
+        "hint": hint,
+        "hint_level": req.hint_level,
+        "scenario_id": req.scenario_id,
+        "language": response_language,
+    }
 
 
 async def _read_upload(file: UploadFile) -> bytes:
@@ -514,15 +550,15 @@ async def _read_upload(file: UploadFile) -> bytes:
 async def stt_endpoint(
     request: Request,
     file: UploadFile = File(...),
-    language: Optional[str] = Form(None),
+    language: SpeechRecognitionLanguage = Form("auto"),
 ):
-    """Speech-to-text with automatic RU/KK detection when language is omitted."""
+    """Speech-to-text with automatic RU/KK/EN detection when language is omitted."""
     raw = await _read_upload(file)
     try:
         text, resolved_language = await transcribe_with_language(
             raw,
             filename=file.filename or "audio.webm",
-            language=language or "auto",
+            language=language,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
@@ -533,27 +569,29 @@ async def stt_endpoint(
 @limiter.limit(_consumer_limit)
 async def tts_endpoint(req: TTSRequest, request: Request):
     """Text-to-speech: returns synthesized audio bytes (teacher-tone voice)."""
+    language = req.language or settings.DEFAULT_LANGUAGE
+    try:
+        selected_backend = resolve_tts_backend(language, req.backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     try:
         audio, media_type = await synthesize(
             req.text,
             voice=req.voice,
             response_format=req.format,
             instructions=req.instructions,
-            language=req.language,
-            backend=req.backend,
+            language=language,
+            backend=selected_backend,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
-    language = req.language or settings.DEFAULT_LANGUAGE
-    selected_backend = req.backend or (
-        settings.VOICE_TTS_RU_DEFAULT_BACKEND
-        if language == "ru"
-        else settings.VOICE_TTS_KK_DEFAULT_BACKEND
-    )
     return Response(
         content=audio,
         media_type=media_type,
-        headers={"X-TTS-Backend": selected_backend},
+        headers={
+            "X-TTS-Backend": selected_backend,
+            "Content-Language": language,
+        },
     )
 
 
@@ -569,9 +607,12 @@ async def voice_ask_endpoint(
         pattern=_CONVERSATION_ID_PATTERN,
     ),
     scenario_id: Optional[str] = Form(None),
-    language: Optional[str] = Form(None),
+    language: SpeechRecognitionLanguage = Form("auto"),
+    response_language: Optional[LanguageCode] = Form(None),
     voice: Optional[str] = Form(None),
-    tts_backend: Optional[Literal["mms", "qwen", "supertonic"]] = Form(None),
+    tts_backend: Optional[Literal["mms", "qwen", "supertonic", "omnivoice"]] = Form(
+        None
+    ),
     current_step_id: Optional[str] = Form(None),
     current_step_index: Optional[int] = Form(None),
     current_step: Optional[str] = Form(None),
@@ -583,9 +624,9 @@ async def voice_ask_endpoint(
     allowed_actions: Optional[List[str]] = Form(None),
     last_action: Optional[str] = Form(None),
     last_action_result: Optional[str] = Form(None),
-    subject: Optional[str] = Form(None),
+    subject: Optional[Literal["physics", "chemistry", "biology"]] = Form(None),
     grade: Optional[int] = Form(None),
-    lang: Optional[str] = Form(None),
+    lang: Optional[LanguageCode] = Form(None),
     lab_number: Optional[int] = Form(None),
     stream: bool = Form(False),
 ):
@@ -605,24 +646,22 @@ async def voice_ask_endpoint(
     """
     conversation_id = conversation_id or str(uuid.uuid4())
     scenario_context = _scenario_context_or_404(scenario_id)
-    scenario_state = _scenario_state_text(
-        _scenario_state_from_form(
-            current_step_id=current_step_id,
-            current_step_index=current_step_index,
-            current_step=current_step,
-            next_step_id=next_step_id,
-            next_step=next_step,
-            completed_steps=completed_steps,
-            held_items=held_items,
-            visible_items=visible_items,
-            allowed_actions=allowed_actions,
-            last_action=last_action,
-            last_action_result=last_action_result,
-        )
+    scenario_state_model = _scenario_state_from_form(
+        current_step_id=current_step_id,
+        current_step_index=current_step_index,
+        current_step=current_step,
+        next_step_id=next_step_id,
+        next_step=next_step,
+        completed_steps=completed_steps,
+        held_items=held_items,
+        visible_items=visible_items,
+        allowed_actions=allowed_actions,
+        last_action=last_action,
+        last_action_result=last_action_result,
     )
     raw = await _read_upload(file)
     timings: dict = {}
-    requested_stt_language = language or "auto"
+    requested_stt_language = language
 
     t0 = time.time()
     try:
@@ -635,7 +674,9 @@ async def voice_ask_endpoint(
     except LLMError as exc:
         _handle_llm_error(exc)
 
-    tts_language = resolved_language
+    answer_language = response_language or resolved_language
+    tts_language = answer_language
+    scenario_state = _scenario_state_text(scenario_state_model, answer_language)
     chat_history = conversation_memory.history_for(conversation_id, question)
     lab = _lab_dict(
         Lab(
@@ -647,6 +688,10 @@ async def voice_ask_endpoint(
         if subject and grade is not None
         else None
     )
+    try:
+        selected_tts_backend = resolve_tts_backend(tts_language, tts_backend)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if stream:
 
@@ -659,6 +704,7 @@ async def voice_ask_endpoint(
                     "type": "question",
                     "text": question,
                     "language": resolved_language,
+                    "response_language": answer_language,
                     "conversation_id": conversation_id,
                 }
             )
@@ -672,7 +718,7 @@ async def voice_ask_endpoint(
                     text,
                     voice=voice,
                     language=tts_language,
-                    backend=tts_backend,
+                    backend=selected_tts_backend,
                 )
                 seq += 1
                 return _sse(
@@ -682,6 +728,8 @@ async def voice_ask_endpoint(
                         "text": text,
                         "audio_base64": base64.b64encode(audio).decode("ascii"),
                         "audio_format": media_type,
+                        "language": tts_language,
+                        "backend": selected_tts_backend,
                     }
                 )
 
@@ -692,6 +740,7 @@ async def voice_ask_endpoint(
                     chat_history=chat_history,
                     scenario_state=scenario_state,
                     lab=lab,
+                    answer_language=answer_language,
                 ):
                     if event["type"] == "delta":
                         yield _sse({"type": "delta", "text": event["text"]})
@@ -717,6 +766,8 @@ async def voice_ask_endpoint(
                                 "conversation_id": conversation_id,
                                 "scenario_id": scenario_id,
                                 "usage": event["usage"],
+                                "language": event.get("language", answer_language),
+                                "stt_language": resolved_language,
                                 "observability": {"latency_ms": timings},
                             }
                         )
@@ -737,6 +788,7 @@ async def voice_ask_endpoint(
             chat_history=chat_history,
             scenario_state=scenario_state,
             lab=lab,
+            answer_language=answer_language,
         )
         timings["llm"] = (time.time() - t0) * 1000
 
@@ -745,7 +797,7 @@ async def voice_ask_endpoint(
             result.answer,
             voice=voice,
             language=tts_language,
-            backend=tts_backend,
+            backend=selected_tts_backend,
         )
         timings["tts"] = (time.time() - t0) * 1000
         conversation_memory.remember(conversation_id, chat_history, result.answer)
@@ -755,7 +807,8 @@ async def voice_ask_endpoint(
     timings["total"] = sum(timings.values())
     return {
         "question": question,
-        "language": resolved_language,
+        "language": answer_language,
+        "stt_language": resolved_language,
         "answer": result.answer,
         "citations": result.citations,
         "primary_source": result.primary_source,
@@ -763,6 +816,7 @@ async def voice_ask_endpoint(
         "scenario_id": scenario_id,
         "audio_base64": base64.b64encode(audio).decode("ascii"),
         "audio_format": media_type,
+        "tts_backend": selected_tts_backend,
         "observability": {"latency_ms": timings},
     }
 
@@ -797,7 +851,7 @@ async def upload_document_endpoint(
     doc_type: Optional[Literal["textbook", "lab_instruction"]] = Form(None),
     subject: Optional[Literal["physics", "chemistry", "biology"]] = Form(None),
     grade: Optional[int] = Form(None, ge=7, le=11),
-    lang: Optional[Literal["ru", "kk"]] = Form(None),
+    lang: Optional[LanguageCode] = Form(None),
     lab_number: Optional[int] = Form(None, ge=1, le=99),
     ocr: bool = Form(False),
 ):

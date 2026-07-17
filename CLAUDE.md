@@ -9,7 +9,7 @@ simulator (physics / chemistry / biology). Retrieval is now **local + hybrid**:
 the knowledge base lives in a self-hosted **Qdrant** vector store, queried with
 a local **BAAI/bge-m3** GPU embedder (dense + learned-sparse, fused by RRF).
 Voice (STT/TTS) is now also **local**: an in-repo GPU sidecar (Whisper
-ru/kk/auto + Supertonic default/Qwen3-TTS 0.6B selectable for ru + MMS kaz,
+ru/kk/en/auto + shared Supertonic default/Qwen3-TTS 0.6B for ru/en + MMS kaz,
 the `voice` compose service in `./voice`,
 vendored from the former `../vrrag_ttsstt`) reached over HTTP.
 Only generation (answers/hints) still uses **OpenAI cloud** (Responses API).
@@ -86,8 +86,9 @@ routes.py
   mapped onto the same `LLMError` family) and patched the same way in tests.
   Voice no longer touches OpenAI. `voice.transcribe`/`voice.synthesize` POST to
   the in-repo `voice` sidecar (`./voice`, the `voice` compose service) at
-  `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out). Russian TTS
-  defaults to Supertonic; `backend=qwen` selects Qwen3-TTS 0.6B explicitly.
+  `VOICE_BASE_URL` (plain HTTP over the compose network, WAV out). Russian and
+  English share loaded Supertonic and Qwen3-TTS 0.6B instances; Supertonic is
+  their default. Kazakh keeps its existing OmniVoice/MMS routing.
 - Responses API param is `max_output_tokens` (not `max_tokens`).
 - Qdrant collection has one point per chunk with two named vectors: `dense`
   (1024-d, cosine, configured by `EMBEDDING_DIM`) and `sparse` (learned-sparse
@@ -114,10 +115,12 @@ routes.py
   `lab_instruction`), `subject`, `grade`, `lang`, and (for labs) `lab_id` /
   `lab_number`, derived from the corpus path by `corpus_meta.parse_path`. Bulk
   ingest the whole tree with `manage_corpus.py bulk-ingest [CORPUS_ROOT]`.
-- Prompts/answers are Russian-first; the model mirrors the question language.
-  bge-m3 is multilingual (strong on Russian + Kazakh), so retrieval matches.
-  Corpus is bilingual (рус/каз); `lang` is `ru`/`kk` (the `русс` typo folder maps
-  to `ru`).
+- Prompts explicitly support Russian, Kazakh, and English. Response language is
+  separate from `lab.lang`, which remains the corpus preference and exact
+  `lab_id` component. bge-m3 remains the multilingual embedding model.
+- Corpus `lang` is `ru`/`kk`/`en` (the `русс` typo folder maps to `ru`; English
+  folder aliases include `en`, `eng`, and `english`). Production English source
+  documents must be supplied and ingested separately.
 
 ## Working here
 
@@ -130,8 +133,9 @@ routes.py
   `RETRIEVAL_TOP_K`, `RETRIEVAL_CANDIDATES`, `RETRIEVAL_SCORE_THRESHOLD`,
   `CHUNK_SIZE`, `CHUNK_OVERLAP`, `CORPUS_ROOT`, `LABS_MANIFEST`. Voice knobs:
   `VOICE_BASE_URL`,
-  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S`, `VOICE_TTS_RU_DEFAULT_BACKEND`.
-  Omitted STT language auto-detects RU/KK; omitted standalone TTS language
+  `VOICE_VERIFY_SSL`, `VOICE_TIMEOUT_S`, `VOICE_TTS_RU_DEFAULT_BACKEND`,
+  `VOICE_TTS_EN_DEFAULT_BACKEND`.
+  Omitted STT language auto-detects RU/KK/EN; omitted standalone TTS language
   follows `DEFAULT_LANGUAGE`. (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
   `TTS_MODEL`/`TTS_VOICE`/`TTS_FORMAT`/`TTS_INSTRUCTIONS` are removed.)
 - There is no app DB. VR conversation memory is ephemeral TTL/LRU process state;

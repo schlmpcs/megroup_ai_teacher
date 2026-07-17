@@ -63,12 +63,10 @@ _TAG_RE = re.compile(r"<[^>]+>")
 # Drop <script>/<style> bodies before stripping tags so their contents never
 # leak into the extracted text.
 _SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
-# A "word" for the image-only heuristic: a run of 2+ Cyrillic letters (the whole
-# block, so both Russian and Kazakh). The school corpus is entirely Cyrillic, so
-# a multi-MB EPUB that yields ~no Cyrillic words is a scanned/image-only book —
-# its only "text" is stray Latin ids / page numbers left over from the markup,
-# which would otherwise be indexed as a handful of useless noise chunks.
-_WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
+# A word for image-only and extraction-quality heuristics: two or more Unicode
+# letters, excluding digits and underscores. This recognizes English, Russian,
+# and Kazakh prose while still ignoring page numbers and markup identifiers.
+_WORD_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
 
 # Tokens and known artifacts used to assess PDF text-layer quality. Some
 # chemistry PDFs have a broken text layer made almost entirely of the OKULYK
@@ -90,10 +88,10 @@ _KNOWN_BOILERPLATE_PREFIXES = (
 
 # Headings worth carrying into citation metadata. Markdown headings are kept
 # verbatim by markitdown; the plain-text alternatives cover the most common
-# chapter/section labels in the Russian and Kazakh school corpus.
+# chapter/section labels in the Russian, Kazakh, and English school corpus.
 _HEADING_RE = re.compile(
     r"(?im)^\s*(?:(?P<markdown>#{1,6})\s+)?"
-    r"(?P<title>(?:(?:глава|раздел|параграф|тарау|бөлім)\b|\xa7)"
+    r"(?P<title>(?:(?:глава|раздел|параграф|тарау|бөлім|chapter|section|unit|lesson)\b|\xa7)"
     r"[^\r\n]{0,150})\s*$"
 )
 
@@ -115,7 +113,9 @@ _IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
 
 def _tesseract_lang(lang: str | None) -> str:
     """Map the corpus ``lang`` code to Tesseract model name(s)."""
-    return {"ru": "rus", "kk": "kaz"}.get(lang or "", "rus+kaz")
+    return {"ru": "rus", "kk": "kaz", "en": "eng"}.get(
+        lang or "", "rus+kaz+eng"
+    )
 
 
 def _ocr_image(image, lang: str) -> str:
@@ -322,8 +322,8 @@ def _clean_pdf_extraction(text: str) -> str:
 
 def _is_low_quality_pdf_extraction(raw_text: str, cleaned_text: str) -> bool:
     """Detect thin or overwhelmingly repetitive PDF text-layer extraction."""
-    clean_cyrillic_words = _count_words(cleaned_text)
-    if clean_cyrillic_words < _EPUB_MIN_WORDS:
+    clean_words = _count_words(cleaned_text)
+    if clean_words < _EPUB_MIN_WORDS:
         return True
 
     raw_tokens = _information_tokens(raw_text)
@@ -628,7 +628,11 @@ def _section_markers(text: str) -> list[tuple[int, str, str]]:
             continue
         prefix = _normalize_text(text[: match.start()])
         offset = len(prefix) + (1 if prefix else 0)
-        kind = "chapter" if title.casefold().startswith(("глава", "тарау")) else "section"
+        kind = (
+            "chapter"
+            if title.casefold().startswith(("глава", "тарау", "chapter", "unit"))
+            else "section"
+        )
         markers.append((offset, kind, title))
     return markers
 
@@ -839,6 +843,7 @@ async def bulk_ingest_tree(
         "filtered": 0,
         "errors": [],
         "documents": [],
+        "documents_by_language": {},
     }
     for path in files:
         if only and only not in str(path):
@@ -859,6 +864,11 @@ async def bulk_ingest_tree(
             continue
         summary["ready" if result["status"] == "ready" else "empty"] += 1
         summary["documents"].append({**meta, **result})
+        language = meta.get("lang")
+        if language:
+            summary["documents_by_language"][language] = (
+                summary["documents_by_language"].get(language, 0) + 1
+            )
     logger.info(
         "Bulk ingest of %s: %d ready, %d empty, %d skipped, %d filtered, %d errors",
         root, summary["ready"], summary["empty"], summary["skipped"],
@@ -879,6 +889,8 @@ def build_manifest(root: str) -> dict:
     labs: dict[str, dict] = {}
     missing_metadata: list[str] = []
     textbooks = 0
+    textbooks_by_language: dict[str, int] = {}
+    labs_by_language: dict[str, int] = {}
 
     for path in iter_corpus_files(root):
         meta = corpus_meta.parse_path(str(path), corpus_root=root)
@@ -887,6 +899,11 @@ def build_manifest(root: str) -> dict:
             continue
         if meta["doc_type"] == "textbook":
             textbooks += 1
+            language = meta.get("lang")
+            if language:
+                textbooks_by_language[language] = (
+                    textbooks_by_language.get(language, 0) + 1
+                )
             continue
         lab_id = meta.get("lab_id")
         if not lab_id:
@@ -907,11 +924,16 @@ def build_manifest(root: str) -> dict:
             "chars": chars,
             "status": "complete" if chars >= _STUB_CHARS else "stub",
         }
+        language = meta.get("lang")
+        if language:
+            labs_by_language[language] = labs_by_language.get(language, 0) + 1
 
     return {
         "labs": dict(sorted(labs.items())),
         "missing_metadata": sorted(missing_metadata),
         "textbooks": textbooks,
+        "textbooks_by_language": dict(sorted(textbooks_by_language.items())),
+        "labs_by_language": dict(sorted(labs_by_language.items())),
     }
 
 

@@ -6,7 +6,26 @@ from typing import Any
 
 import numpy as np
 
-from app.config import Settings
+from ..config import Settings
+
+
+def normalize_detected_language(value: str) -> str:
+    """Map Whisper language names or tokens to supported canonical codes."""
+    normalized = str(value or "").strip().lower()
+    aliases = {
+        "kazakh": "kk",
+        "<|kk|>": "kk",
+        "kk": "kk",
+        "russian": "ru",
+        "<|ru|>": "ru",
+        "ru": "ru",
+        "english": "en",
+        "<|en|>": "en",
+        "en": "en",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    raise ValueError(f"unsupported detected speech language: {value or 'unknown'}")
 
 
 class LocalWhisperSttBackend:
@@ -51,11 +70,17 @@ class LocalWhisperSttBackend:
             language="russian",
             task="transcribe",
         )
+        en_processor = WhisperProcessor.from_pretrained(
+            self.settings.stt_kk_base_model,
+            cache_dir=self.settings.hf_cache,
+            language="english",
+            task="transcribe",
+        )
 
-        self._processors = {"kk": kk_processor, "ru": ru_processor}
+        self._processors = {"kk": kk_processor, "ru": ru_processor, "en": en_processor}
         self._model = shared_model
         self._inference_lock = threading.Lock()
-        self.loaded = ["stt_kk", "stt_ru"]
+        self.loaded = ["stt_kk", "stt_ru", "stt_en"]
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> dict:
         import torch
@@ -64,7 +89,11 @@ class LocalWhisperSttBackend:
         if audio.shape[0] > self.settings.max_audio_duration_s * sampling_rate:
             raise ValueError(f"audio duration exceeds {self.settings.max_audio_duration_s} seconds")
 
-        resolved_language = self._detect_language(audio, sampling_rate) if language == "auto" else language
+        resolved_language = (
+            self._detect_language(audio, sampling_rate)
+            if language == "auto"
+            else language
+        )
         processor = self._processors[resolved_language]
         torch_device = self.settings.device
 
@@ -87,7 +116,9 @@ class LocalWhisperSttBackend:
                     with torch.no_grad():
                         predicted_ids = self._model.generate(
                             input_features,
-                            language="russian",
+                            language={"ru": "russian", "en": "english"}[
+                                resolved_language
+                            ],
                             task="transcribe",
                             max_new_tokens=225,
                         )
@@ -123,11 +154,14 @@ class LocalWhisperSttBackend:
                 with torch.no_grad():
                     detected = self._model.detect_language(inputs)
 
-        lang_str = "russian"
+        lang_str = ""
         if torch.is_tensor(detected) and detected.numel() > 0:
             lang_id = int(detected[0].item())
             lang_to_id = getattr(getattr(self._model, "generation_config", None), "lang_to_id", {}) or {}
-            lang_str = next((lang for lang, token_id in lang_to_id.items() if token_id == lang_id), lang_str)
+            lang_str = next(
+                (lang for lang, token_id in lang_to_id.items() if token_id == lang_id),
+                lang_str,
+            )
         elif detected:
             first = detected[0]
             if isinstance(first, tuple) and len(first) > 1:
@@ -135,8 +169,7 @@ class LocalWhisperSttBackend:
             elif first and isinstance(first[0], tuple) and len(first[0]) > 1:
                 lang_str = str(first[0][1])
 
-        normalized = lang_str.lower()
-        return "kk" if "kazakh" in normalized or "<|kk|>" in normalized or normalized == "kk" else "ru"
+        return normalize_detected_language(lang_str)
 
     def _decode_audio(self, audio_bytes: bytes) -> tuple[np.ndarray, int]:
         import librosa

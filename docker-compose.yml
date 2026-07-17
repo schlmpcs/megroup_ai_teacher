@@ -15,6 +15,7 @@ services:
       # environment, which is pinned to Transformers 4.57.3.
       - VOICE_KK_OMNIVOICE_BASE_URL=http://voice-omnivoice:8003
       - VOICE_TTS_RU_DEFAULT_BACKEND=${VOICE_TTS_RU_DEFAULT_BACKEND:-supertonic}
+      - VOICE_TTS_EN_DEFAULT_BACKEND=${VOICE_TTS_EN_DEFAULT_BACKEND:-supertonic}
       - VOICE_TTS_KK_DEFAULT_BACKEND=${VOICE_TTS_KK_DEFAULT_BACKEND:-omnivoice}
     volumes:
       # Mount scenarios so lab descriptions can be edited without a rebuild.
@@ -66,9 +67,9 @@ services:
       start_period: 180s
 
   # GPU STT/TTS sidecar (in-repo; formerly the external ../vrrag_ttsstt service).
-  # STT = Whisper large-v3-turbo (ru/kk/auto, + kk LoRA); Russian TTS defaults
-  # to Supertonic with Qwen3-TTS 0.6B available explicitly; MMS is the Kazakh
-  # fallback. The higher-quality fixed young male Kazakh voice lives in the
+  # STT = Whisper large-v3-turbo (ru/kk/en/auto, + kk LoRA). Russian and English
+  # share Supertonic and Qwen3-TTS 0.6B model instances. MMS is the Kazakh fallback.
+  # The higher-quality fixed young male Kazakh voice lives in the
   # isolated `voice-omnivoice` service below.
   # Requires the NVIDIA Container Toolkit on the host. Listens on 8001
   # internally; the api reaches it at http://voice:8001 over plain HTTP. First
@@ -82,6 +83,7 @@ services:
       - voice_hf_cache:/models/hf_cache
     environment:
       - TTS_RU_BACKEND=${TTS_RU_BACKEND:-supertonic}
+      - TTS_EN_BACKEND=${TTS_EN_BACKEND:-supertonic}
       - TTS_RU_BACKENDS=${TTS_RU_BACKENDS:-supertonic,qwen}
       - TTS_RU_QWEN_MODEL=${TTS_RU_QWEN_MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}
       - TTS_RU_QWEN_SPEAKER=${TTS_RU_QWEN_SPEAKER:-Aiden}
@@ -90,6 +92,7 @@ services:
       - TTS_RU_QWEN_MAX_NEW_TOKENS=${TTS_RU_QWEN_MAX_NEW_TOKENS:-2048}
       - TTS_RU_SUPERTONIC_VOICE_STYLE=${TTS_RU_SUPERTONIC_VOICE_STYLE:-M3}
       - TTS_NORMALIZE_RU_NUMBERS=${TTS_NORMALIZE_RU_NUMBERS:-true}
+      - TTS_NORMALIZE_EN_NUMBERS=${TTS_NORMALIZE_EN_NUMBERS:-true}
     restart: unless-stopped
     deploy:
       resources:

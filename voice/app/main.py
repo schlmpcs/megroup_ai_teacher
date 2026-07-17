@@ -8,10 +8,10 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from app.config import Settings, get_settings
-from app.stt.language import normalize_stt_language
-from app.tts.language import normalize_tts_language
-from app.ui import register_ui
+from .config import Settings, get_settings
+from .stt.language import normalize_stt_language
+from .tts.language import normalize_tts_language
+from .ui import register_ui
 
 logger = logging.getLogger(__name__)
 
@@ -82,13 +82,13 @@ class SynthesizeRequest(BaseModel):
 
 
 def _default_stt_backend(settings: Settings) -> SttBackend:
-    from app.stt.model import LocalWhisperSttBackend
+    from .stt.model import LocalWhisperSttBackend
 
     return LocalWhisperSttBackend(settings)
 
 
 def _default_tts_backend(settings: Settings) -> TtsBackend:
-    from app.tts.model import LocalTtsBackend
+    from .tts.model import LocalTtsBackend
 
     return LocalTtsBackend(settings)
 
@@ -128,12 +128,14 @@ def create_app(
 
         return {
             "status": "ok",
+            "supported_languages": ["ru", "kk", "en"],
             "stt_models": loaded_language_keys(stt_backend, "stt_"),
             "tts_models": loaded_language_keys(tts_backend, "tts_"),
             "tts_backends": getattr(tts_backend, "available_backends", {}),
             "tts_default_backends": getattr(tts_backend, "default_backends", {}),
             "tts_number_normalization": {
                 "ru": settings.tts_normalize_ru_numbers,
+                "en": settings.tts_normalize_en_numbers,
             },
         }
 
@@ -198,7 +200,10 @@ def create_app(
         return Response(
             content=wav_bytes,
             media_type="audio/wav",
-            headers={"X-TTS-Backend": selected_backend},
+            headers={
+                "X-TTS-Backend": selected_backend,
+                "Content-Language": req.language,
+            },
         )
 
     return app

@@ -12,5 +12,5 @@ librosa>=0.10.0
 soundfile>=0.12.0
 scipy>=1.11.0
 numpy>=1.26.0
-supertonic>=0.1.0
+supertonic==1.3.1
 qwen-tts==0.1.1

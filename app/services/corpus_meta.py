@@ -22,15 +22,30 @@ import unicodedata
 from pathlib import PurePath
 from typing import Optional
 
+from app.core.languages import SUPPORTED_LANGUAGES
+
 # Folder markers that separate the two corpus tiers.
 LAB_ROOT_MARKER = "Лабораторные работы"
 TEXTBOOK_ROOT_MARKER = "Школьный материал"
+LAB_ROOT_MARKERS = (
+    LAB_ROOT_MARKER,
+    "Laboratory works",
+    "Lab instructions",
+)
+TEXTBOOK_ROOT_MARKERS = (
+    TEXTBOOK_ROOT_MARKER,
+    "School materials",
+    "Textbooks",
+)
 
 # Russian subject folder name -> canonical (ascii) subject slug.
 _SUBJECTS = {
     "физика": "physics",
     "химия": "chemistry",
     "биология": "biology",
+    "physics": "physics",
+    "chemistry": "chemistry",
+    "biology": "biology",
 }
 
 # Language folder / filename token -> canonical lang code. "русс" is a real
@@ -41,6 +56,9 @@ _LANGS = {
     "ру": "ru",
     "каз": "kk",
     "қаз": "kk",
+    "en": "en",
+    "eng": "en",
+    "english": "en",
 }
 
 _GRADE_RE = re.compile(r"(\d{1,2})")
@@ -48,7 +66,7 @@ _LABNUM_RE = re.compile(r"№?\s*(\d{1,2})")
 
 _UPLOAD_DOC_TYPES = {"textbook", "lab_instruction"}
 _UPLOAD_SUBJECTS = {"physics", "chemistry", "biology"}
-_UPLOAD_LANGS = {"ru", "kk"}
+_UPLOAD_LANGS = frozenset(SUPPORTED_LANGUAGES)
 
 
 def _norm(token: str) -> str:
@@ -170,7 +188,7 @@ def build_upload_metadata(
     if subject not in _UPLOAD_SUBJECTS:
         raise ValueError("subject must be physics, chemistry or biology")
     if lang not in _UPLOAD_LANGS:
-        raise ValueError("lang must be ru or kk")
+        raise ValueError("lang must be ru, kk or en")
     grade = _upload_int(grade, "grade", 7, 11)
 
     basename = _upload_basename(filename)
@@ -209,14 +227,16 @@ def parse_path(path: str, corpus_root: Optional[str] = None) -> Optional[dict]:
     p = PurePath(path)
     parts = list(p.parts)
 
-    def _find(marker: str) -> Optional[int]:
+    def _find(markers: tuple[str, ...]) -> Optional[int]:
         for i, part in enumerate(parts):
-            if _norm(part).startswith(_norm(marker)):
-                return i
+            normalized = _norm(part)
+            for marker in markers:
+                if normalized.startswith(_norm(marker)):
+                    return i
         return None
 
-    lab_idx = _find(LAB_ROOT_MARKER)
-    book_idx = _find(TEXTBOOK_ROOT_MARKER)
+    lab_idx = _find(LAB_ROOT_MARKERS)
+    book_idx = _find(TEXTBOOK_ROOT_MARKERS)
 
     if corpus_root:
         try:
@@ -229,11 +249,13 @@ def parse_path(path: str, corpus_root: Optional[str] = None) -> Optional[dict]:
     meta: dict = {"source": source, "filename": p.name}
 
     if lab_idx is not None:
-        # …/<marker>/<Subject>/<Subject N класс>/<lang>/<file>
+        # Common layouts place subject, grade, and language below the tier in
+        # that order. Scanning the tail also accepts English naming variants and
+        # harmless intermediate folders without weakening metadata validation.
         tail = parts[lab_idx + 1 :]
-        subject = _subject_of(tail[0]) if len(tail) >= 1 else None
-        grade = _grade_of(tail[1]) if len(tail) >= 2 else None
-        lang = _lang_of(tail[2]) if len(tail) >= 3 else None
+        subject = next((_subject_of(token) for token in tail if _subject_of(token)), None)
+        grade = _grade_of(*tail[:-1])
+        lang = next((_lang_of(token) for token in tail if _lang_of(token)), None)
         lab_number = _lab_number_of(p.name)
         meta.update(
             doc_type="lab_instruction",
@@ -247,11 +269,11 @@ def parse_path(path: str, corpus_root: Optional[str] = None) -> Optional[dict]:
         return meta
 
     if book_idx is not None:
-        # …/<marker>/<Subject>/<lang>/<file with grade in name>
+        # Textbook layouts commonly use <Subject>/<lang>/<grade in filename>.
         tail = parts[book_idx + 1 :]
-        subject = _subject_of(tail[0]) if len(tail) >= 1 else None
-        lang = _lang_of(tail[1]) if len(tail) >= 2 else _lang_of(p.name)
-        grade = _grade_of(p.name)
+        subject = next((_subject_of(token) for token in tail if _subject_of(token)), None)
+        lang = next((_lang_of(token) for token in tail if _lang_of(token)), None)
+        grade = _grade_of(*tail)
         meta.update(
             doc_type="textbook",
             subject=subject,

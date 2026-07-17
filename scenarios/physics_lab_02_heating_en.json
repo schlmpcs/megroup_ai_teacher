@@ -1,0 +1,38 @@
+{
+  "scenario_name": "Heating a liquid and measuring its boiling temperature",
+  "language": "en",
+  "subject": "Physics",
+  "topic": "Thermal phenomena, boiling, and the boiling temperature of water",
+  "lab_number": "Laboratory activity No. 2",
+  "environment_description": "A virtual school laboratory. On the table are a retort stand with a clamp, an alcohol burner, a test tube containing water, a thermometer, and matches. The sink is on the left wall and the fume hood is on the right.",
+  "objects": [
+    "alcohol burner",
+    "test tube containing water",
+    "thermometer",
+    "retort stand with clamp",
+    "matches",
+    "safety glasses"
+  ],
+  "action_sequence": [
+    "1. Put on safety glasses",
+    "2. Secure the test tube containing water in the stand clamp",
+    "3. Lower the thermometer into the test tube without touching its walls or bottom",
+    "4. Light the alcohol burner with a match",
+    "5. Heat the test tube while observing the thermometer reading",
+    "6. Record the temperature when boiling begins",
+    "7. Extinguish the alcohol burner with its cap without blowing out the flame"
+  ],
+  "current_step_hint": "The simulator determines the current step and supplies it separately when needed.",
+  "risks": [
+    "Burns from the hot test tube or alcohol burner flame",
+    "Cracking the test tube through uneven heating",
+    "Ignition risk if the burner is blown out by mouth"
+  ],
+  "common_mistakes": [
+    "The thermometer touches the bottom of the test tube, producing an artificially high reading",
+    "The alcohol burner is blown out instead of being extinguished with its cap",
+    "The test tube is heated only at the bottom without gentle movement"
+  ],
+  "correct_behavior": "Heat evenly, keep the thermometer bulb within the liquid, and always extinguish the alcohol burner with its cap. Pure water boils at about 100 °C under normal atmospheric pressure.",
+  "regulations": "Physics laboratory safety instructions; Grade 8 physics textbook, chapter on thermal phenomena."
+}

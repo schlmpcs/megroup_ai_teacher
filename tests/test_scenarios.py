@@ -90,3 +90,29 @@ def test_get_scenario_context_none_for_no_id():
 def test_list_scenarios_includes_example():
     ids = [s["scenario_id"] for s in scenarios.list_scenarios()]
     assert "physics_lab_02_heating" in ids
+
+
+def test_english_scenario_uses_localized_labels_and_is_listed_with_language():
+    doc = scenarios.load_scenario("physics_lab_02_heating_en")
+    text = scenarios.format_scenario_context(doc)
+    listing = {
+        item["scenario_id"]: item for item in scenarios.list_scenarios()
+    }
+
+    assert "Scenario: Heating a liquid" in text
+    assert "Action sequence:" in text
+    assert "- safety glasses" in text
+    assert listing["physics_lab_02_heating_en"]["language"] == "en"
+
+
+def test_english_live_state_preserves_client_values():
+    text = scenarios.format_scenario_state(
+        current_step="Light the alcohol burner",
+        visible_items=["thermometer", "test tube"],
+        allowed_actions=["light burner"],
+        language="en",
+    )
+
+    assert "current_step: Light the alcohol burner" in text
+    assert "visible_items: thermometer, test tube" in text
+    assert "allowed_actions: light burner" in text

@@ -16,7 +16,9 @@ server's INTERNAL_API_KEY; do not hardcode it):
 
   EVAL_BASE_URL   e.g. http://megroup-b560m-hdv-m-2:8001   (required)
   EVAL_API_KEY    the server's INTERNAL_API_KEY            (required)
-  EVAL_WORKERS    concurrent requests (default 4)
+  EVAL_WORKERS          concurrent requests (default 4)
+  EVAL_QUESTIONS_FILE   Markdown question file (default test_questions.md)
+  EVAL_LANGUAGE         answer and lab language: ru, kk, or en (default ru)
 """
 import json
 import os
@@ -31,8 +33,10 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+from app.core.languages import SUPPORTED_LANGUAGES
+
 REPO = Path(__file__).resolve().parents[2]
-SRC = REPO / "test_questions.md"
+SRC = Path(os.environ.get("EVAL_QUESTIONS_FILE", str(REPO / "test_questions.md")))
 OUT = REPO / "eval_results.md"
 JSON_OUT = REPO / "eval_results.json"
 SLIM_OUT = REPO / "eval_slim.json"
@@ -41,15 +45,34 @@ BATCH_DIR = REPO / "eval_batches"
 BASE_URL = os.environ.get("EVAL_BASE_URL", "").rstrip("/")
 API_KEY = os.environ.get("EVAL_API_KEY", "")
 MAX_WORKERS = int(os.environ.get("EVAL_WORKERS", "4"))
+EVAL_LANGUAGE = os.environ.get("EVAL_LANGUAGE", "ru").strip().lower()
+if EVAL_LANGUAGE not in SUPPORTED_LANGUAGES:
+    raise ValueError("EVAL_LANGUAGE must be one of: ru, kk, en")
 BATCH_SIZE = 15
 
-SUBJECT_MAP = {"Физика": "physics", "Химия": "chemistry", "Биология": "biology"}
+SUBJECT_MAP = {
+    "Физика": "physics",
+    "Химия": "chemistry",
+    "Биология": "biology",
+    "Physics": "physics",
+    "Chemistry": "chemistry",
+    "Biology": "biology",
+}
 
-subject_re = re.compile(r"^(Физика|Химия|Биология)\s*$")
-grade_re = re.compile(r"^(Физика|Химия|Биология)\s+(\d+)\s+класс\s*$")
-lab_re = re.compile(r"^Лабораторная работа\s+№\s*(\d+)\s*[\u2014\-–]+\s*(.*)$")
+_SUBJECT_NAMES = "|".join(SUBJECT_MAP)
+subject_re = re.compile(rf"^({_SUBJECT_NAMES})\s*$")
+grade_re = re.compile(
+    rf"^(?:(Физика|Химия|Биология)\s+(\d+)\s+класс|"
+    rf"(Physics|Chemistry|Biology)\s+Grade\s+(\d+))\s*$",
+    re.IGNORECASE,
+)
+lab_re = re.compile(
+    r"^(?:Лабораторная работа\s+№|Lab(?:oratory)?\s+(?:work|activity)\s+(?:No\.?|#))"
+    r"\s*(\d+)\s*[\u2014\-–:]+\s*(.*)$",
+    re.IGNORECASE,
+)
 q_re = re.compile(r"^(\d+)\s*\.\s*(.*)$")
-otvet_re = re.compile(r"^Ответ:\s*")
+otvet_re = re.compile(r"^(?:Ответ|Answer|Expected):\s*", re.IGNORECASE)
 
 
 def parse(text):
@@ -68,9 +91,12 @@ def parse(text):
         m = grade_re.match(raw)
         if m:
             flush()
-            subject_ru = m.group(1)
-            subject = SUBJECT_MAP[subject_ru]
-            grade = int(m.group(2))
+            subject_ru = m.group(1) or m.group(3)
+            canonical_label = next(
+                label for label in SUBJECT_MAP if label.casefold() == subject_ru.casefold()
+            )
+            subject = SUBJECT_MAP[canonical_label]
+            grade = int(m.group(2) or m.group(4))
             continue
         m = subject_re.match(raw)
         if m:
@@ -107,11 +133,15 @@ def parse(text):
 
 
 def ask(rec, timeout=180):
-    lab = {"subject": rec["subject"], "grade": rec["grade"], "lang": "ru"}
+    lab = {
+        "subject": rec["subject"],
+        "grade": rec["grade"],
+        "lang": EVAL_LANGUAGE,
+    }
     n = rec["lab_number"]
     if n is not None and 1 <= n <= 20:
         lab["lab_number"] = n
-    body = {"query": rec["question"], "lab": lab}
+    body = {"query": rec["question"], "language": EVAL_LANGUAGE, "lab": lab}
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         BASE_URL + "/ask",
@@ -179,24 +209,38 @@ def retry_errors(records, results):
 def render(records, results):
     errors = sum(1 for r in results if r is None or "error" in r)
     L = ["# Eval Results: VR AI Assistant\n"]
-    L.append("- **Source:** `test_questions.md`")
+    L.append(f"- **Source:** `{SRC}`")
+    L.append(f"- **Language:** `{EVAL_LANGUAGE}`")
     L.append(f"- **Endpoint:** `POST /ask` @ `{BASE_URL}`")
     L.append(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     L.append(f"- **Questions:** {len(records)}  |  **Errors:** {errors}\n")
     L.append("Each question was sent with lab context (`subject`, `grade`, "
-             "`lang=ru`, and `lab_number` when ≤20). Compare **Expected** "
+             f"`lang={EVAL_LANGUAGE}`, and `lab_number` when <=20). Compare **Expected** "
              "against **LLM answer**.\n")
     cur_grade_key = cur_lab_key = None
     for rec, res in zip(records, results):
         gk = (rec["subject_ru"], rec["grade"])
         if gk != cur_grade_key:
             cur_grade_key, cur_lab_key = gk, None
-            L.append(f"\n## {rec['subject_ru']}: {rec['grade']} класс")
+            grade_label = (
+                f"{rec['subject_ru']}: Grade {rec['grade']}"
+                if EVAL_LANGUAGE == "en"
+                else f"{rec['subject_ru']}: {rec['grade']} класс"
+            )
+            L.append(f"\n## {grade_label}")
         lk = (rec["lab_number"], rec["lab_title"])
         if lk != cur_lab_key:
             cur_lab_key = lk
-            L.append(f"\n### Лабораторная работа №{rec['lab_number']}: {rec['lab_title']}")
-            sent = f"subject={rec['subject']}, grade={rec['grade']}, lang=ru"
+            lab_label = (
+                f"Laboratory activity No. {rec['lab_number']}"
+                if EVAL_LANGUAGE == "en"
+                else f"Лабораторная работа №{rec['lab_number']}"
+            )
+            L.append(f"\n### {lab_label}: {rec['lab_title']}")
+            sent = (
+                f"subject={rec['subject']}, grade={rec['grade']}, "
+                f"lang={EVAL_LANGUAGE}, language={EVAL_LANGUAGE}"
+            )
             n = rec["lab_number"]
             sent += f", lab_number={n}" if (n and 1 <= n <= 20) else " (lab_number omitted)"
             L.append(f"*lab context sent: {sent}*")
@@ -226,6 +270,7 @@ def write_slim_and_batches(records, results):
             "id": i, "subject": rec["subject"], "subject_ru": rec["subject_ru"],
             "grade": rec["grade"], "lab": rec["lab_number"], "q": rec["question"],
             "expected": rec["expected"], "answer": ans,
+            "language": EVAL_LANGUAGE,
         })
     SLIM_OUT.write_text(json.dumps(slim, ensure_ascii=False), encoding="utf-8")
 

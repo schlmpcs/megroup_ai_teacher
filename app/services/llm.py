@@ -29,6 +29,12 @@ from tenacity import (
 )
 
 from app.core.config import settings
+from app.core.languages import (
+    LANGUAGE_NAMES,
+    LanguageCode,
+    is_language_code,
+    normalize_language_code,
+)
 from app.services import embeddings, vectorstore
 from app.services.openai_client import client
 from app.services.memory import (
@@ -64,6 +70,39 @@ _RUSSIAN_WORD_RE = re.compile(
     r"известн\w*|учен\w*|назов\w*|расскаж\w*)\b",
     re.IGNORECASE,
 )
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+_ENGLISH_SIGNAL_RE = re.compile(
+    r"\b(?:what|which|where|when|why|who|how|is|are|was|were|do|does|did|"
+    r"should|can|could|would|will|i|you|we|they|my|your|please|need|help|"
+    r"show|tell|explain|calculate|measure|heat|the|this|that|these|those|a|an|of|to|in|"
+    r"on|for|with|from|into|next|current|purpose|perform|experiment|lab|"
+    r"laboratory|physics|chemistry|biology|chemical|reaction|molecule|"
+    r"temperature|boiling|force|energy|motion|acceleration|gravity|voltage|"
+    r"pressure|acid|cell|organism|photosynthesis)\b",
+    re.IGNORECASE,
+)
+_ENGLISH_SINGLE_WORD_SIGNALS = {
+    "biology",
+    "boiling",
+    "chemistry",
+    "density",
+    "electricity",
+    "energy",
+    "evaporation",
+    "force",
+    "gravity",
+    "molecule",
+    "photosynthesis",
+    "physics",
+    "temperature",
+}
+_LATIN_NON_PROSE_RE = re.compile(
+    r"(?i:\b(?:https?://|www\.)\S+)|(?i:\b\S+@\S+\.\S+\b)|"
+    r"(?<!\w)(?:[^\s/\\]+[/\\])*[^\s/\\]+\.[A-Za-z0-9]{1,12}(?!\w)|"
+    r"(?<!\w)[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_.-]*(?!\w)|"
+    r"(?<!\w)\d+[A-Za-z][A-Za-z0-9_.-]*(?!\w)|"
+    r"(?<!\w)[A-Z]{2,}(?!\w)"
+)
 
 # Precision-biased subject signals. Ambiguous terms such as "атом", "масса"
 # and "диффузия" are deliberately omitted because they occur across subjects.
@@ -71,19 +110,28 @@ _SUBJECT_QUERY_RES: dict[str, re.Pattern[str]] = {
     "chemistry": re.compile(
         r"(?:хими\w*|химик\w*|реакци\w*|молекул\w*|элемент\w*|кислот\w*|"
         r"қышқыл\w*|щелоч\w*|сілті\w*|периодическ\w*|периодтық\w*|"
-        r"менделе\w*|авогадро\w*|окислен\w*|тотығ\w*)",
+        r"менделе\w*|авогадро\w*|окислен\w*|тотығ\w*|"
+        r"\bchem(?:istry|ical|ist)s?\b|\breaction\w*\b|\bmolecule\w*\b|"
+        r"\belement\w*\b|\bacid\w*\b|\balkali\w*\b|\bperiodic\w*\b|"
+        r"\bmendeleev\w*\b|\bavogadro\w*\b|\boxidation\w*\b)",
         re.IGNORECASE,
     ),
     "physics": re.compile(
         r"(?:физик\w*|ньютон\w*|эйнштейн\w*|энштейн\w*|механик\w*|"
         r"электр\w*|напряж\w*|қысым\w*|давлен\w*|жылдамдық\w*|скорост\w*|"
-        r"оптик\w*|жарық\w*|гравитац\w*)",
+        r"оптик\w*|жарық\w*|гравитац\w*|\bphysics?\b|\bnewton\w*\b|"
+        r"\bmechanic\w*\b|\belectric\w*\b|\bvoltage\w*\b|\bpressure\w*\b|"
+        r"\bvelocity\w*\b|\bacceleration\w*\b|\bmomentum\w*\b|\bforce\w*\b|"
+        r"\benergy\b|\bmotion\b|\boptics?\b|\bgravity\w*\b)",
         re.IGNORECASE,
     ),
     "biology": re.compile(
         r"(?:биолог\w*|жасуш\w*|клетк\w*|организм\w*|өсімдік\w*|растени\w*|"
         r"животн\w*|генет\w*|эволюц\w*|анатом\w*|фотосинтез\w*|"
-        r"экосистем\w*|днк\w*)",
+        r"экосистем\w*|днк\w*|\bbiology\b|\bbiological\w*\b|\bcell(?:s|ular)?\b|"
+        r"\borganism\w*\b|\bplant\w*\b|\banimal\w*\b|\bgenetic\w*\b|"
+        r"\bevolution\w*\b|\banatomy\b|\bphotosynthesis\b|\becosystem\w*\b|"
+        r"\bdna\b)",
         re.IGNORECASE,
     ),
 }
@@ -98,6 +146,7 @@ _GROUNDED_MARKER = "[[GROUNDED]]"
 _LAB_SCOPE_REFUSALS = {
     "ru": "Я могу отвечать только на вопросы, связанные с текущей лабораторной работой.",
     "kk": "Мен тек ағымдағы зертханалық жұмысқа қатысты сұрақтарға жауап бере аламын.",
+    "en": "I can only answer questions related to the current laboratory activity.",
 }
 # Generic prompt/scenario words must not make an unrelated question look related
 # merely because both texts mention a lab, a question, or a current step.
@@ -125,6 +174,19 @@ _LAB_SCOPE_GENERIC_PREFIXES = (
     "опыт",
     "цель",
     "шаг",
+    "activity",
+    "answer",
+    "current",
+    "experiment",
+    "lab",
+    "laborator",
+    "purpose",
+    "question",
+    "scenario",
+    "step",
+    "student",
+    "theor",
+    "work",
 )
 _MISSING_EVIDENCE_REFUSAL_RE = re.compile(
     r"(?:"
@@ -132,11 +194,16 @@ _MISSING_EVIDENCE_REFUSAL_RE = re.compile(
     r"|(?:в\s+)?(?:материал|документ|баз)[^\n]{0,220}нет\s+"
     r"(?:информац|сведен|данн)"
     r"|не\s+могу\s+(?:ответить|помочь)[^\n]{0,120}(?:материал|документ|баз)"
+    r"|(?:materials?|documents?|sources?|evidence)[^\n]{0,160}"
+    r"(?:do(?:es)?\s+not|don't|doesn't|cannot|can't)[^\n]{0,80}"
+    r"(?:contain|provide|include|have)[^\n]{0,80}(?:information|answer|evidence)"
+    r"|(?:i\s+)?(?:cannot|can't|am\s+unable\s+to)\s+(?:answer|help)"
+    r"[^\n]{0,120}(?:materials?|documents?|sources?|evidence)"
     r")",
     re.IGNORECASE,
 )
 
-# Precision-biased RU/KK intent signals for questions whose authoritative source
+# Precision-biased RU/KK/EN intent signals for questions whose authoritative source
 # is the current lab instruction. General theory wording such as "почему" or
 # "как происходит" deliberately does not match, even when a lab is active.
 _LAB_PROCEDURE_QUERY_RE = re.compile(
@@ -162,6 +229,13 @@ _LAB_PROCEDURE_QUERY_RE = re.compile(
     r"|қалай\s+(?:орындау|жасау|бастау|жалғастыру|аяқтау)"
     r"|қайда\s+(?:қою|құю|орналастыру)"
     r"|(?:зертханалық\s+)?жұмыстың\s+мақсаты"
+    r"|what\s+(?:should|do)\s+i\s+do\s+(?:next|now)"
+    r"|what\s+is\s+(?:the\s+)?(?:current|next)\s+step"
+    r"|how\s+(?:do|should|can)\s+i\s+(?:perform|conduct|start|continue|finish)\s+"
+    r"(?:this\s+)?(?:experiment|lab(?:oratory)?(?:\s+activity|\s+work)?)"
+    r"|what\s+is\s+the\s+purpose\s+of\s+(?:this\s+)?(?:experiment|lab(?:oratory)?(?:\s+activity|\s+work)?)"
+    r"|(?:describe|list)\s+the\s+(?:main\s+)?(?:steps|procedure)"
+    r"|where\s+(?:should|do)\s+i\s+(?:put|place|pour|move)"
     r")",
     re.IGNORECASE,
 )
@@ -170,28 +244,24 @@ _LAB_PROCEDURE_QUERY_RE = re.compile(
 # ── Prompt construction ──────────────────────────────────────────────────────
 
 _BASE_SYSTEM_PROMPT = (
-    "Ты — дружелюбный ИИ-ассистент внутри школьного VR-тренажёра для "
-    "лабораторных работ по физике, химии и биологии. Ты выступаешь в роли "
-    "терпеливого учителя-помощника.\n\n"
-    "Твои задачи:\n"
-    "1. Подсказывать ученику по текущему сценарию: что делать дальше, как "
-    "выполнить действие, зачем нужен этот этап.\n"
-    "2. Объяснять теоретический материал по теме лабораторной работы.\n\n"
-    "Правила:\n"
-    "1. Отвечай на том же языке, на котором задан вопрос (русский или казахский).\n"
-    "2. Материалы базы знаний, инструкция и описание сценария ниже являются "
-    "приоритетными и авторитетными источниками. Не противоречь им.\n"
-    "3. Общие научные знания разрешено использовать только когда ниже явно "
-    "включён специальный режим. Без такого указания опирайся ТОЛЬКО на "
-    "предоставленные материалы.\n"
-    "4. Если ответа нет в разрешённых источниках, честно скажи об этом одной "
-    "фразой и не выдумывай.\n"
-    "5. Отвечай кратко и по существу: обычно 1–4 предложения. Говори тепло и "
-    "понятно, как учитель школьнику.\n"
-    "6. НЕ добавляй в конце строку «Источник: …», источники прикрепляются "
-    "автоматически отдельно.\n"
-    "7. Предыдущие реплики диалога используй только для понимания контекста, "
-    "а не как источник фактов.\n"
+    "You are a friendly teaching assistant inside a school VR laboratory for "
+    "physics, chemistry, and biology. Help the student understand the current "
+    "activity, its safe next actions, and the theory directly related to it.\n\n"
+    "Rules:\n"
+    "1. The requested answer language is stated explicitly below and must be "
+    "followed. Supported answer languages are Russian, Kazakh, and English.\n"
+    "2. The retrieved knowledge, laboratory instruction, static scenario, and "
+    "live scene state are authoritative. Do not contradict them. Evidence may "
+    "be written in another supported language. Translate it faithfully into the "
+    "requested answer language without changing facts, measurements, or steps.\n"
+    "3. General scientific knowledge is allowed only when a special fallback "
+    "mode below explicitly enables it. Otherwise use only the supplied evidence.\n"
+    "4. If the permitted evidence does not support an answer, say so briefly and "
+    "do not invent details.\n"
+    "5. Usually answer in 1 to 4 concise sentences, in a warm teacher-like tone.\n"
+    "6. Do not append a source line. Citations are attached separately.\n"
+    "7. Use earlier conversation turns only to resolve context, never as factual "
+    "evidence.\n"
 )
 
 
@@ -201,7 +271,7 @@ def build_system_prompt(
     knowledge_context: Optional[str] = None,
     lab_instruction: Optional[str] = None,
     lab_incomplete: bool = False,
-    answer_language: Optional[str] = None,
+    answer_language: Optional[LanguageCode] = None,
     allow_general_knowledge: bool = False,
     strict_lab_scope: bool = False,
 ) -> str:
@@ -217,83 +287,85 @@ def build_system_prompt(
     lab requests set ``strict_lab_scope`` so unrelated textbook topics remain out
     of scope even if retrieval happens to return a matching fragment.
     """
+    language = answer_language or normalize_language_code(
+        settings.DEFAULT_LANGUAGE, field="DEFAULT_LANGUAGE"
+    )
     prompt = _BASE_SYSTEM_PROMPT
-    if answer_language == "kk":
-        prompt += (
-            "\nЯЗЫК ОТВЕТА: казахский. Жауапты толық қазақ тілінде жаз. "
-            "Орыс тіліне ауыспа.\n"
-        )
-    elif answer_language == "ru":
-        prompt += "\nЯЗЫК ОТВЕТА: русский. Отвечай полностью на русском языке.\n"
+    language_rules = {
+        "ru": "Write the entire answer in Russian. Do not switch languages.",
+        "kk": "Write the entire answer in Kazakh. Do not switch languages.",
+        "en": "Write the entire answer in English. Do not switch languages.",
+    }
+    prompt += (
+        f"\nANSWER LANGUAGE: {LANGUAGE_NAMES[language]}. "
+        f"{language_rules[language]}\n"
+    )
     if strict_lab_scope:
+        refusal = _LAB_SCOPE_REFUSALS[language]
         prompt += (
-            "\n--- СТРОГИЕ ГРАНИЦЫ ТЕКУЩЕЙ ЛАБОРАТОРНОЙ РАБОТЫ ---\n"
-            "Отвечай только на вопросы о текущей лабораторной работе: её цели, "
-            "оборудовании, безопасности, действиях, наблюдениях, результатах и "
-            "теории, которая непосредственно помогает понять именно эту работу. "
-            "Вопросы о другой теме, другой лабораторной работе, другом школьном "
-            "предмете или посторонних вещах не отвечай по существу. Наличие "
-            "подходящего фрагмента учебника само по себе НЕ делает посторонний "
-            "вопрос относящимся к текущей работе. Для постороннего вопроса ответь "
-            "только одной короткой фразой на языке пользователя: «Я могу отвечать "
-            "только на вопросы, связанные с текущей лабораторной работой.»\n"
-            "--- КОНЕЦ СТРОГИХ ГРАНИЦ ---\n"
+            "\n--- STRICT CURRENT LABORATORY SCOPE ---\n"
+            "Answer only questions about the current laboratory activity: its "
+            "purpose, equipment, safety, actions, observations, results, and the "
+            "theory needed to understand this exact activity. Do not substantively "
+            "answer questions about another topic, laboratory activity, school "
+            "subject, or unrelated matter. A matching textbook fragment alone does "
+            "not make an unrelated question in scope. For an out-of-scope question, "
+            f"return exactly this one sentence: {refusal}\n"
+            "--- END STRICT SCOPE ---\n"
         )
     if lab_instruction and lab_instruction.strip():
         prompt += (
-            "\n--- ИНСТРУКЦИЯ К ТЕКУЩЕЙ ЛАБОРАТОРНОЙ РАБОТЕ ---\n"
+            "\n--- CURRENT LABORATORY INSTRUCTION ---\n"
             f"{lab_instruction.strip()}\n"
-            "--- КОНЕЦ ИНСТРУКЦИИ ---\n"
-            "Это официальная методичка текущей лабораторной работы. На вопросы "
-            "о шагах, цели и порядке действий отвечай строго по ней.\n"
+            "--- END LABORATORY INSTRUCTION ---\n"
+            "This is the official procedure for the current activity. For steps, "
+            "purpose, and action order, follow it exactly. It may be translated "
+            "faithfully into the requested answer language.\n"
         )
     elif lab_incomplete:
         prompt += (
-            "\nВНИМАНИЕ: пошаговая инструкция для текущей лабораторной работы "
-            "недоступна. Не выдумывай шаги — отвечай только на теоретические "
-            "вопросы по базе знаний, а про порядок действий честно скажи, что "
-            "точной инструкции у тебя нет.\n"
+            "\nIMPORTANT: the exact procedure for the current laboratory activity "
+            "is unavailable. Do not invent or substitute steps from another "
+            "language or activity. Answer supported theory questions only, and say "
+            "briefly that the exact instruction is unavailable when asked for the "
+            "procedure.\n"
         )
     if knowledge_context and knowledge_context.strip():
         prompt += (
-            "\n--- БАЗА ЗНАНИЙ (найденные документы) ---\n"
+            "\n--- RETRIEVED KNOWLEDGE ---\n"
             f"{knowledge_context.strip()}\n"
-            "--- КОНЕЦ БАЗЫ ЗНАНИЙ ---\n"
-            "Отвечай на теоретические вопросы, опираясь на эти фрагменты. "
-            "Если нужного нет — честно скажи.\n"
+            "--- END RETRIEVED KNOWLEDGE ---\n"
+            "Ground theoretical answers in these excerpts. They may be in Russian, "
+            "Kazakh, or English and may be translated faithfully.\n"
         )
     if scenario_context and scenario_context.strip():
         prompt += (
-            "\n--- ОПИСАНИЕ ТЕКУЩЕГО СЦЕНАРИЯ ---\n"
+            "\n--- CURRENT STATIC SCENARIO ---\n"
             f"{scenario_context.strip()}\n"
-            "--- КОНЕЦ ОПИСАНИЯ СЦЕНАРИЯ ---\n"
-            "По вопросам про текущую сцену (где предмет, какой следующий шаг, "
-            "зачем этот этап) отвечай строго по этому описанию.\n"
+            "--- END STATIC SCENARIO ---\n"
+            "For questions about scene objects, steps, or purpose, use this "
+            "description unless the live state below is more current.\n"
         )
     if scenario_state and scenario_state.strip():
         prompt += (
-            "\n--- ТЕКУЩЕЕ СОСТОЯНИЕ СЦЕНЫ (актуально на этот запрос) ---\n"
+            "\n--- LIVE SCENE STATE FOR THIS REQUEST ---\n"
             f"{scenario_state.strip()}\n"
-            "--- КОНЕЦ СОСТОЯНИЯ СЦЕНЫ ---\n"
-            "Это живое состояние от тренажёра. На вопросы «что дальше», «что "
-            "сейчас делать», «что у меня в руках» отвечай с опорой на него.\n"
+            "--- END LIVE SCENE STATE ---\n"
+            "This state is authoritative for current and next steps, visible or "
+            "held objects, allowed actions, and the last action result.\n"
         )
     if allow_general_knowledge:
         prompt += (
-            "\n--- РЕЖИМ РЕЗЕРВНОГО ОБЩЕНАУЧНОГО ОТВЕТА ---\n"
-            "Сначала оцени, содержат ли найденные документы прямую и достаточную "
-            "информацию для ответа на вопрос. Если да, отвечай строго по ним и "
-            f"начни ответ с маркера {_GROUNDED_MARKER}. Если документов нет, они "
-            "повреждены, состоят из служебного текста или не отвечают на вопрос, "
-            "ты ОБЯЗАН использовать надёжные общеизвестные научные знания и "
-            f"начать ответ с маркера {_GENERAL_KNOWLEDGE_MARKER}. В этом режиме "
-            "запрещено отказывать только потому, что в найденных документах нет "
-            "прямого ответа, и запрещено сообщать пользователю об отсутствии "
-            "информации в материалах. Егер құжаттарда тікелей жауап болмаса, "
-            "бас тартпай, жалпы ғылыми біліммен қазақ тілінде жауап бер. Не смешивай "
-            "два режима. Маркер ставь первым, до любых других символов. После "
-            "маркера сразу дай обычный ответ на языке вопроса.\n"
-            "--- КОНЕЦ РЕЖИМА ---\n"
+            "\n--- GENERAL SCIENCE FALLBACK MODE ---\n"
+            "First decide whether the retrieved excerpts directly and sufficiently "
+            "support the answer. If they do, answer only from them and begin with "
+            f"{_GROUNDED_MARKER}. If they do not, use reliable, widely accepted "
+            "scientific knowledge and begin with "
+            f"{_GENERAL_KNOWLEDGE_MARKER}. Do not refuse merely because retrieved "
+            "evidence is absent, thin, corrupt, or irrelevant. Do not mention the "
+            "evidence gap to the user. Use exactly one private marker as the first "
+            "characters, then give the normal answer in the requested language.\n"
+            "--- END GENERAL SCIENCE FALLBACK MODE ---\n"
         )
     return prompt
 
@@ -301,21 +373,75 @@ def build_system_prompt(
 # ── Local hybrid retrieval ────────────────────────────────────────────────────
 
 
-def _infer_query_language(query: str) -> str:
-    """Infer the supported answer language (Kazakh or Russian) from the query."""
+def _detect_query_language(query: str) -> Optional[LanguageCode]:
+    """Detect supported natural-language prose without guessing from identifiers.
+
+    Latin formulas, URLs, filenames, acronyms, and mixed alphanumeric identifiers
+    are removed before English scoring. Short ambiguous inputs therefore return
+    ``None`` and are resolved by explicit language, lab language, or the configured
+    default instead of being mislabeled as English.
+    """
     text = query or ""
-    kazakh_score = len(_KAZAKH_CHAR_RE.findall(text)) * 2
-    kazakh_score += len(_KAZAKH_WORD_RE.findall(text))
-    russian_score = len(_RUSSIAN_WORD_RE.findall(text))
-    if kazakh_score > russian_score:
-        return "kk"
-    if russian_score > kazakh_score:
-        return "ru"
-    return (
-        settings.DEFAULT_LANGUAGE
-        if settings.DEFAULT_LANGUAGE in {"ru", "kk"}
-        else "ru"
-    )
+    if not text.strip():
+        return None
+
+    kazakh_score = len(_KAZAKH_CHAR_RE.findall(text)) * 3
+    kazakh_score += len(_KAZAKH_WORD_RE.findall(text)) * 2
+    russian_score = len(_RUSSIAN_WORD_RE.findall(text)) * 2
+    cyrillic_words = re.findall(r"[Ѐ-ӿ]{2,}", text)
+    if cyrillic_words:
+        if kazakh_score:
+            kazakh_score += len(cyrillic_words)
+        else:
+            russian_score += len(cyrillic_words)
+
+    prose = _LATIN_NON_PROSE_RE.sub(" ", text)
+    english_words = [word.casefold() for word in _ENGLISH_WORD_RE.findall(prose)]
+    english_signals = len(_ENGLISH_SIGNAL_RE.findall(prose))
+    english_score = english_signals * 2
+    if len(english_words) >= 4 and english_signals:
+        english_score += len(english_words)
+    elif len(english_words) >= 2 and english_signals >= 2:
+        english_score += len(english_words)
+    elif len(english_words) == 1 and english_words[0] in _ENGLISH_SINGLE_WORD_SIGNALS:
+        english_score += 3
+
+    scores: dict[LanguageCode, int] = {
+        "ru": russian_score,
+        "kk": kazakh_score,
+        "en": english_score,
+    }
+    best_language, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score <= 0:
+        return None
+    if sum(score == best_score for score in scores.values()) > 1:
+        return None
+    return best_language
+
+
+def resolve_answer_language(
+    query: str,
+    explicit_language: Optional[LanguageCode] = None,
+    lab_language: Optional[str] = None,
+) -> LanguageCode:
+    """Resolve language using request, current query, lab, then default precedence."""
+    if explicit_language is not None:
+        return normalize_language_code(explicit_language)
+    detected = _detect_query_language(query)
+    if detected is not None:
+        return detected
+    if lab_language and is_language_code(lab_language):
+        return lab_language
+    return normalize_language_code(settings.DEFAULT_LANGUAGE, field="DEFAULT_LANGUAGE")
+
+
+def _infer_query_language(
+    query: str,
+    explicit_language: Optional[LanguageCode] = None,
+    lab_language: Optional[str] = None,
+) -> LanguageCode:
+    """Backward-compatible alias for the canonical answer-language resolver."""
+    return resolve_answer_language(query, explicit_language, lab_language)
 
 
 def _infer_query_subject(query: str) -> Optional[str]:
@@ -329,9 +455,16 @@ def _infer_query_subject(query: str) -> Optional[str]:
     return best_subject if best_score > 0 and not tied else None
 
 
-def _infer_query_context(query: str) -> tuple[Optional[str], str]:
+def _infer_query_context(
+    query: str,
+    explicit_language: Optional[LanguageCode] = None,
+    lab_language: Optional[str] = None,
+) -> tuple[Optional[str], LanguageCode]:
     """Return ``(subject, language)`` inferred from a standalone question."""
-    return _infer_query_subject(query), _infer_query_language(query)
+    return (
+        _infer_query_subject(query),
+        resolve_answer_language(query, explicit_language, lab_language),
+    )
 
 
 def _is_usable_knowledge_text(text: str) -> bool:
@@ -528,7 +661,9 @@ def _format_knowledge(chunks: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def _citations_from_chunks(chunks: list[dict]) -> list[dict]:
+def _citations_from_chunks(
+    chunks: list[dict], answer_language: LanguageCode = "ru"
+) -> list[dict]:
     """Group chunk metadata into stable, locator-rich document citations.
 
     ``filename`` and ``file_id`` remain present for existing clients. New fields
@@ -611,18 +746,27 @@ def _citations_from_chunks(chunks: list[dict]) -> list[dict]:
             citation["sections"] = sections
             if len(sections) == 1:
                 citation["section"] = sections[0]
-        citation["display_label"] = _citation_display_label(citation)
+        citation["display_label"] = _citation_display_label(
+            citation, answer_language=answer_language
+        )
         citations.append(citation)
     return citations
 
 
-def _citation_display_label(citation: dict) -> str:
-    """Build a concise Russian display label from structured citation data."""
+def _citation_display_label(
+    citation: dict, answer_language: LanguageCode = "ru"
+) -> str:
+    """Build a concise display label localized to the answer language."""
     if citation.get("source_type") == "lab_instruction":
         number = citation.get("lab_number")
-        label = "Инструкция к лабораторной работе"
-        if number is not None:
-            label += f" №{number}"
+        if answer_language == "en":
+            label = "Lab instruction"
+            if number is not None:
+                label += f" No. {number}"
+        else:
+            label = "Инструкция к лабораторной работе"
+            if number is not None:
+                label += f" №{number}"
     else:
         filename = str(citation.get("filename") or "Источник")
         label = re.sub(r"\.[^.]+$", "", filename)
@@ -638,18 +782,22 @@ def _citation_display_label(citation: dict) -> str:
         page_label = str(page_start)
         if page_end is not None and page_end != page_start:
             page_label += f"-{page_end}"
-        label += f", стр. {page_label}"
+        if answer_language == "en":
+            page_prefix = "pp." if page_end is not None and page_end != page_start else "p."
+            label += f", {page_prefix} {page_label}"
+        else:
+            label += f", стр. {page_label}"
     return label
 
 
 def _is_lab_procedure_query(query: str) -> bool:
-    """Whether RU/KK wording clearly asks for current-lab procedure details."""
+    """Whether RU/KK/EN wording clearly asks for current-lab procedure details."""
     normalized = _WS_RE.sub(" ", query or "").strip()
     return bool(normalized and _LAB_PROCEDURE_QUERY_RE.search(normalized))
 
 
 def _lab_scope_terms(text: Optional[str]) -> set[str]:
-    """Return small morphology-tolerant topic keys for RU/KK lab text."""
+    """Return small morphology-tolerant topic keys for RU/KK/EN lab text."""
     terms: set[str] = set()
     for raw_word in _WORD_RE.findall((text or "").casefold().replace("ё", "е")):
         if len(raw_word) < 4:
@@ -672,7 +820,7 @@ def _lab_scope_refusal(
     lab: Optional[dict],
     scope_text: str,
     theory_chunks: list[dict],
-    answer_language: str,
+    answer_language: LanguageCode,
 ) -> Optional[str]:
     """Reject clearly unrelated questions when structured lab context is active.
 
@@ -707,7 +855,10 @@ def _lab_scope_refusal(
 
 
 def _answer_citations(
-    query: str, theory_chunks: list[dict], lab_source_chunks: list[dict]
+    query: str,
+    theory_chunks: list[dict],
+    lab_source_chunks: list[dict],
+    answer_language: LanguageCode = "ru",
 ) -> list[dict]:
     """Build citations with primary-source ordering matched to query intent.
 
@@ -719,7 +870,7 @@ def _answer_citations(
         ordered_chunks = [*lab_source_chunks, *theory_chunks]
     else:
         ordered_chunks = [*theory_chunks, *lab_source_chunks]
-    return _citations_from_chunks(ordered_chunks)
+    return _citations_from_chunks(ordered_chunks, answer_language=answer_language)
 
 
 def _general_fallback_allowed(
@@ -778,13 +929,13 @@ def _force_general_knowledge_prompt(system_prompt: str) -> str:
     """Override a mistaken grounded refusal for a fallback-eligible request."""
     return (
         system_prompt
-        + "\n--- ПРИНУДИТЕЛЬНЫЙ ОБЩЕНАУЧНЫЙ ОТВЕТ ---\n"
-        "Предыдущая попытка ошибочно отказалась отвечать из-за отсутствия факта "
-        "в документах. Теперь не оценивай документы и не упоминай их. Ответь на "
-        "вопрос с помощью надёжных общеизвестных научных знаний. Обязательно "
-        f"начни с маркера {_GENERAL_KNOWLEDGE_MARKER}. Егер сұрақ қазақ тілінде "
-        "болса, толық қазақ тілінде нақты жауап бер және бас тартпа.\n"
-        "--- КОНЕЦ ПРИНУДИТЕЛЬНОГО РЕЖИМА ---\n"
+        + "\n--- FORCED GENERAL SCIENCE ANSWER ---\n"
+        "The previous attempt incorrectly refused because the documents did not "
+        "contain the fact. Do not evaluate or mention the documents now. Answer "
+        "using reliable, widely accepted scientific knowledge in the already "
+        "specified answer language. Begin with the private marker "
+        f"{_GENERAL_KNOWLEDGE_MARKER}.\n"
+        "--- END FORCED GENERAL SCIENCE ANSWER ---\n"
     )
 
 
@@ -809,6 +960,7 @@ class AnswerResult:
     answer: str
     citations: list[dict] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
+    language: LanguageCode = "ru"
 
     @property
     def primary_source(self) -> Optional[dict]:
@@ -863,6 +1015,7 @@ def _answer_cache_key(
     scenario_state: Optional[str],
     lab: Optional[dict],
     max_tokens: Optional[int],
+    answer_language: LanguageCode = "ru",
 ) -> tuple:
     """Everything that changes the generated answer, minus chat history.
 
@@ -875,6 +1028,7 @@ def _answer_cache_key(
         scenario_state or "",
         tuple(sorted((k, str(v)) for k, v in (lab or {}).items())),
         max_tokens or 0,
+        answer_language,
     )
 
 
@@ -890,6 +1044,7 @@ class _AnswerGrounding:
     theory_chunks: list[dict]
     lab_source_chunks: list[dict]
     allow_general_knowledge: bool
+    answer_language: LanguageCode
     scope_refusal: Optional[str] = None
 
 
@@ -899,10 +1054,14 @@ async def _prepare_answer_grounding(
     scenario_state: Optional[str],
     lab: Optional[dict],
     retrieval_query: Optional[str] = None,
+    answer_language: Optional[LanguageCode] = None,
 ) -> _AnswerGrounding:
     """Build identical retrieval and fallback state for both generation paths."""
     effective_retrieval_query = retrieval_query or query
-    inferred_subject, answer_language = _infer_query_context(query)
+    resolved_answer_language = answer_language or resolve_answer_language(
+        query, lab_language=(lab or {}).get("lang")
+    )
+    inferred_subject = _infer_query_subject(query)
     if not inferred_subject and effective_retrieval_query != query:
         inferred_subject = _infer_query_subject(effective_retrieval_query)
     (
@@ -923,9 +1082,9 @@ async def _prepare_answer_grounding(
         # subject-ambiguous questions, a global language-only filter can hide
         # the best cross-language semantic hit; the answer prompt is still
         # locked to the detected query language.
-        retrieval_lang = answer_language if inferred_subject else None
+        retrieval_lang = resolved_answer_language if inferred_subject else None
     elif not retrieval_lang:
-        retrieval_lang = answer_language
+        retrieval_lang = resolved_answer_language
 
     retrieved = await _retrieve(
         effective_retrieval_query,
@@ -945,7 +1104,7 @@ async def _prepare_answer_grounding(
         lab,
         scope_text,
         theory_chunks,
-        answer_language,
+        resolved_answer_language,
     )
     allow_general_knowledge = _general_fallback_allowed(
         query,
@@ -961,7 +1120,7 @@ async def _prepare_answer_grounding(
         knowledge_context=_format_knowledge(theory_chunks),
         lab_instruction=lab_instruction,
         lab_incomplete=lab_incomplete,
-        answer_language=answer_language,
+        answer_language=resolved_answer_language,
         allow_general_knowledge=allow_general_knowledge,
         strict_lab_scope=lab_active,
     )
@@ -970,6 +1129,7 @@ async def _prepare_answer_grounding(
         theory_chunks=theory_chunks,
         lab_source_chunks=lab_source_chunks,
         allow_general_knowledge=allow_general_knowledge,
+        answer_language=resolved_answer_language,
         scope_refusal=scope_refusal,
     )
 
@@ -998,7 +1158,12 @@ async def _complete_answer(
     """Create a checked completion and retry grounded refusals as general science."""
 
     if grounding.scope_refusal:
-        return AnswerResult(answer=grounding.scope_refusal, citations=[], usage={})
+        return AnswerResult(
+            answer=grounding.scope_refusal,
+            citations=[],
+            usage={},
+            language=grounding.answer_language,
+        )
 
     async def _create(instructions: str):
         try:
@@ -1042,10 +1207,14 @@ async def _complete_answer(
             []
             if used_general_knowledge
             else _answer_citations(
-                query, grounding.theory_chunks, grounding.lab_source_chunks
+                query,
+                grounding.theory_chunks,
+                grounding.lab_source_chunks,
+                grounding.answer_language,
             )
         ),
         usage=_combined_usage(*responses),
+        language=grounding.answer_language,
     )
 
 
@@ -1066,6 +1235,7 @@ async def generate_answer(
     max_tokens: Optional[int] = None,
     scenario_state: Optional[str] = None,
     lab: Optional[dict] = None,
+    answer_language: Optional[LanguageCode] = None,
 ) -> AnswerResult:
     """Generate a grounded answer (non-streaming).
 
@@ -1076,8 +1246,20 @@ async def generate_answer(
     from the in-process answer cache when an identical question (same scenario/
     state/lab) was answered within ``ANSWER_CACHE_TTL_S``.
     """
+    resolved_answer_language = resolve_answer_language(
+        query,
+        explicit_language=answer_language,
+        lab_language=(lab or {}).get("lang"),
+    )
     cache_key = (
-        _answer_cache_key(query, scenario_context, scenario_state, lab, max_tokens)
+        _answer_cache_key(
+            query,
+            scenario_context,
+            scenario_state,
+            lab,
+            max_tokens,
+            resolved_answer_language,
+        )
         if chat_history is None or len(chat_history) <= 1
         else None
     )
@@ -1108,6 +1290,7 @@ async def generate_answer(
         scenario_state,
         lab,
         retrieval_query=retrieval_query,
+        answer_language=resolved_answer_language,
     )
     input_messages = build_input_messages(history)
 
@@ -1125,6 +1308,7 @@ async def stream_answer(
     max_tokens: Optional[int] = None,
     scenario_state: Optional[str] = None,
     lab: Optional[dict] = None,
+    answer_language: Optional[LanguageCode] = None,
 ) -> AsyncIterator[dict]:
     """Stream a grounded answer as a sequence of events:
 
@@ -1136,8 +1320,20 @@ async def stream_answer(
     structured lab context as :func:`generate_answer`. Shares the answer cache
     with :func:`generate_answer` — a hit yields the whole answer as one delta.
     """
+    resolved_answer_language = resolve_answer_language(
+        query,
+        explicit_language=answer_language,
+        lab_language=(lab or {}).get("lang"),
+    )
     cache_key = (
-        _answer_cache_key(query, scenario_context, scenario_state, lab, max_tokens)
+        _answer_cache_key(
+            query,
+            scenario_context,
+            scenario_state,
+            lab,
+            max_tokens,
+            resolved_answer_language,
+        )
         if chat_history is None or len(chat_history) <= 1
         else None
     )
@@ -1146,7 +1342,12 @@ async def stream_answer(
         if cached is not None:
             _log_generation("answer_stream_cached", query, cached)
             yield {"type": "delta", "text": cached.answer}
-            yield {"type": "done", "citations": cached.citations, "usage": cached.usage}
+            yield {
+                "type": "done",
+                "citations": cached.citations,
+                "usage": cached.usage,
+                "language": cached.language,
+            }
             return
 
     raw_history = (
@@ -1170,6 +1371,7 @@ async def stream_answer(
         scenario_state,
         lab,
         retrieval_query=retrieval_query,
+        answer_language=resolved_answer_language,
     )
     input_messages = build_input_messages(history)
 
@@ -1186,7 +1388,12 @@ async def stream_answer(
         if cache_key is not None and result.answer:
             _answer_cache.put(cache_key, result)
         yield {"type": "delta", "text": result.answer}
-        yield {"type": "done", "citations": result.citations, "usage": result.usage}
+        yield {
+            "type": "done",
+            "citations": result.citations,
+            "usage": result.usage,
+            "language": result.language,
+        }
         return
 
     try:
@@ -1213,31 +1420,38 @@ async def stream_answer(
     result = AnswerResult(
         answer=_response_text(final),
         citations=_answer_citations(
-            query, grounding.theory_chunks, grounding.lab_source_chunks
+            query,
+            grounding.theory_chunks,
+            grounding.lab_source_chunks,
+            grounding.answer_language,
         ),
         usage=_usage_dict(final),
+        language=grounding.answer_language,
     )
     _log_generation("answer_stream", query, result)
     if cache_key is not None and result.answer:
         _answer_cache.put(cache_key, result)
-    yield {"type": "done", "citations": result.citations, "usage": result.usage}
+    yield {
+        "type": "done",
+        "citations": result.citations,
+        "usage": result.usage,
+        "language": result.language,
+    }
 
 
 # ── Hint rephrasing (Task 2 of the spec) ─────────────────────────────────────
 
 _HINT_SYSTEM_PROMPT = (
-    "Ты — ИИ-ассистент школьного VR-тренажёра. Тренажёр сам решает, КОГДА и "
-    "КАКУЮ подсказку показать. Твоя единственная задача — перефразировать "
-    "готовый текст подсказки так, чтобы он звучал естественно и по-учительски "
-    "в контексте сцены.\n\n"
-    "Правила перефразирования:\n"
-    "- Полностью сохраняй смысл исходной подсказки.\n"
-    "- Используй контекст сцены, чтобы звучать естественнее.\n"
-    "- Уровень 1: краткая фраза (1 предложение).\n"
-    "- Уровень 2: конкретнее, с упоминанием объектов из сцены (1–2 предложения).\n"
-    "- Уровень 3: подробно, с пошаговым действием (2–3 предложения).\n"
-    "- Не добавляй информацию, которой нет в описании сценария или подсказке.\n"
-    "- Отвечай ТОЛЬКО перефразированным текстом, без пояснений и кавычек.\n"
+    "You rephrase a simulator-provided hint for a student in a school VR lab. "
+    "The simulator already decided when to show it and what it means.\n\n"
+    "Rules:\n"
+    "- Preserve the hint's meaning exactly.\n"
+    "- Use supplied scene context only to make the wording natural.\n"
+    "- Level 1: one short sentence.\n"
+    "- Level 2: one or two concrete sentences that may mention scene objects.\n"
+    "- Level 3: two or three sentences with the provided action expressed clearly.\n"
+    "- Do not add facts or actions absent from the hint or scenario.\n"
+    "- Return only the rephrased hint, with no explanation or quotation marks.\n"
 )
 
 
@@ -1253,25 +1467,31 @@ async def rephrase_hint(
     hint_level: int,
     scenario_context: Optional[str] = None,
     scenario_state: Optional[str] = None,
+    answer_language: Optional[LanguageCode] = None,
 ) -> str:
     """Rephrase a simulator-provided hint at the given verbosity level.
 
     No file search — the hint and scenario context are all the model needs.
     """
-    instructions = _HINT_SYSTEM_PROMPT
+    language = resolve_answer_language(hint_text, explicit_language=answer_language)
+    instructions = (
+        _HINT_SYSTEM_PROMPT
+        + f"\nOUTPUT LANGUAGE: {LANGUAGE_NAMES[language]}. Preserve the input "
+        "meaning and write the entire result in this language.\n"
+    )
     if scenario_context and scenario_context.strip():
         instructions += (
-            "\n--- ОПИСАНИЕ СЦЕНАРИЯ ---\n"
+            "\n--- SCENARIO ---\n"
             f"{scenario_context.strip()}\n"
-            "--- КОНЕЦ ---\n"
+            "--- END SCENARIO ---\n"
         )
     if scenario_state and scenario_state.strip():
         instructions += (
-            "\n--- ТЕКУЩЕЕ СОСТОЯНИЕ СЦЕНЫ ---\n"
+            "\n--- LIVE SCENE STATE ---\n"
             f"{scenario_state.strip()}\n"
-            "--- КОНЕЦ ---\n"
+            "--- END LIVE SCENE STATE ---\n"
         )
-    user_msg = f"Уровень подсказки: {hint_level}\nТекст подсказки: {hint_text}"
+    user_msg = f"Hint level: {hint_level}\nHint text: {hint_text}"
 
     try:
         response = await client.responses.create(

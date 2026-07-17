@@ -62,7 +62,7 @@ def _russian_backend(monkeypatch, selected_backend: str, *, enabled: bool = True
     backend = LocalTtsBackend(
         SimpleNamespace(tts_normalize_ru_numbers=enabled, tts_ru_backend="supertonic")
     )
-    backend._ru_models = {
+    backend._shared_models = {
         "supertonic": object(),
         "qwen": object(),
         "mms": object(),
@@ -72,14 +72,14 @@ def _russian_backend(monkeypatch, selected_backend: str, *, enabled: bool = True
     if selected_backend == "qwen":
         monkeypatch.setattr(
             backend,
-            "_synthesize_qwen_ru",
-            lambda text, speed, voice: captured.append(text) or b"WAV",
+            "_synthesize_qwen",
+            lambda text, language, speed, voice: captured.append(text) or b"WAV",
         )
     elif selected_backend == "supertonic":
         monkeypatch.setattr(
             backend,
-            "_synthesize_supertonic_ru",
-            lambda text, speed, voice: captured.append(text) or b"WAV",
+            "_synthesize_supertonic",
+            lambda text, language, speed, voice: captured.append(text) or b"WAV",
         )
     else:
         monkeypatch.setattr(

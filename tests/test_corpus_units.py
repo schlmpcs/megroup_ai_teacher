@@ -76,6 +76,38 @@ def test_parse_textbook_epub_ru():
     assert meta["lang"] == "ru"
 
 
+def test_parse_english_lab_and_textbook_layouts():
+    lab = corpus_meta.parse_path(
+        "Corpus/Laboratory works/Physics/Physics Grade 10/en/"
+        "Lab work No. 2.docx",
+        corpus_root="Corpus",
+    )
+    book = corpus_meta.parse_path(
+        "Corpus/School materials/Biology/english/Biology Grade 9.epub",
+        corpus_root="Corpus",
+    )
+
+    assert lab == {
+        "source": "Laboratory works/Physics/Physics Grade 10/en/"
+        "Lab work No. 2.docx",
+        "filename": "Lab work No. 2.docx",
+        "doc_type": "lab_instruction",
+        "subject": "physics",
+        "grade": 10,
+        "lang": "en",
+        "lab_number": 2,
+        "lab_id": "physics-10-en-02",
+    }
+    assert book["doc_type"] == "textbook"
+    assert book["subject"] == "biology"
+    assert book["grade"] == 9
+    assert book["lang"] == "en"
+    eng_alias = corpus_meta.parse_path(
+        "Corpus/Textbooks/Chemistry/eng/Chemistry Grade 8.pdf"
+    )
+    assert eng_alias["lang"] == "en"
+
+
 def test_parse_unrecognised_path_returns_none():
     assert corpus_meta.parse_path("some/random/file.pdf") is None
 
@@ -123,6 +155,21 @@ def test_build_upload_metadata_lab_instruction_composes_lab_id():
     assert metadata["lab_id"] == "chemistry-10-kk-02"
 
 
+def test_build_upload_metadata_accepts_english():
+    metadata, doc_key = corpus_meta.build_upload_metadata(
+        "Lab work No. 2.docx",
+        doc_type="lab_instruction",
+        subject="physics",
+        grade=10,
+        lang="en",
+        lab_number=2,
+    )
+    assert metadata["lab_id"] == "physics-10-en-02"
+    assert doc_key == (
+        "admin_uploads/lab_instruction/physics/10/en/02/Lab work No. 2.docx"
+    )
+
+
 def test_build_upload_metadata_scopes_same_filename_without_collisions():
     _, physics_key = corpus_meta.build_upload_metadata(
         "book.pdf", "textbook", "physics", 7, "ru"
@@ -153,7 +200,7 @@ def test_build_upload_metadata_scopes_same_filename_without_collisions():
             "grade must be",
         ),
         (
-            {"doc_type": "textbook", "subject": "physics", "grade": 8, "lang": "en"},
+            {"doc_type": "textbook", "subject": "physics", "grade": 8, "lang": "de"},
             "lang must be",
         ),
         (
@@ -290,6 +337,33 @@ def test_build_manifest_flags_stub(tmp_path):
     assert labs["chemistry-7-ru-02"]["status"] == "stub"
 
 
+def test_manifest_reports_english_coverage(tmp_path):
+    lab_dir = (
+        tmp_path
+        / "Laboratory works"
+        / "Physics"
+        / "Physics Grade 10"
+        / "en"
+    )
+    book_dir = tmp_path / "School materials" / "Biology" / "en"
+    lab_dir.mkdir(parents=True)
+    book_dir.mkdir(parents=True)
+    (lab_dir / "Lab work No. 2.md").write_text(
+        "Purpose and procedure for heating water safely. " * 12,
+        encoding="utf-8",
+    )
+    (book_dir / "Biology Grade 9.md").write_text(
+        "Cells have membranes that regulate transport. " * 12,
+        encoding="utf-8",
+    )
+
+    manifest = ingestion.build_manifest(str(tmp_path))
+
+    assert manifest["labs"]["physics-10-en-02"]["status"] == "complete"
+    assert manifest["labs_by_language"] == {"en": 1}
+    assert manifest["textbooks_by_language"] == {"en": 1}
+
+
 # ── vectorstore: metadata filter ─────────────────────────────────────────────
 
 
@@ -395,6 +469,26 @@ async def test_list_documents_exposes_document_metadata(monkeypatch):
             "file_type": "pdf",
         }
     ]
+
+
+async def test_collection_status_reports_per_language_documents(monkeypatch):
+    class _Client:
+        async def collection_exists(self, name):
+            return True
+
+        async def count(self, **kwargs):
+            return SimpleNamespace(count=7)
+
+    async def _documents():
+        return [{"lang": "ru"}, {"lang": "en"}, {"lang": "en"}, {"lang": None}]
+
+    monkeypatch.setattr(vectorstore, "get_client", lambda: _Client())
+    monkeypatch.setattr(vectorstore, "list_documents", _documents)
+
+    status = await vectorstore.collection_status()
+
+    assert status["supported_languages"] == ["ru", "kk", "en"]
+    assert status["documents_by_language"] == {"ru": 1, "kk": 0, "en": 2}
 
 
 # ── llm: lab-aware grounding ─────────────────────────────────────────────────
@@ -513,9 +607,8 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
     lab = {"subject": "biology", "grade": 9, "lang": "ru", "lab_number": 7,
            "lab_id": "biology-9-ru-07"}
     await llm.generate_answer("вопрос", lab=lab)
-    assert "инструкция" in captured["instructions"].lower()
-    assert "недоступна" in captured["instructions"].lower()
-    assert "СТРОГИЕ ГРАНИЦЫ" in captured["instructions"]
+    assert "exact instruction is unavailable" in captured["instructions"].lower()
+    assert "STRICT CURRENT LABORATORY SCOPE" in captured["instructions"]
     assert llm._GENERAL_KNOWLEDGE_MARKER not in captured["instructions"]
 
 
@@ -602,6 +695,39 @@ async def test_retrieve_falls_back_when_same_language_thin(monkeypatch):
     texts = [c["payload"]["text"] for c in chunks]
     # same-language first, then other-language backfill, no ru-1 duplicate
     assert texts == ["ru-1", "kk-1", "kk-2"]
+
+
+async def test_retrieve_prefers_english_then_cross_language_without_duplicates(
+    monkeypatch,
+):
+    monkeypatch.setattr(llm.settings, "RETRIEVAL_TOP_K", 3, raising=False)
+    seen = []
+
+    async def _embed_query(text):
+        return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
+
+    async def _hybrid_search(dense, si, sv, top_k, candidates, query_filter=None):
+        language = next(
+            (condition.match.value for condition in query_filter.must if condition.key == "lang"),
+            None,
+        )
+        seen.append(language)
+        if language == "en":
+            return [_chunk("en", "en-1")]
+        return [_chunk("en", "en-1"), _chunk("ru", "ru-1"), _chunk("kk", "kk-1")]
+
+    monkeypatch.setattr(llm.embeddings, "embed_query", _embed_query)
+    monkeypatch.setattr(llm.vectorstore, "hybrid_search", _hybrid_search)
+
+    base = vectorstore.meta_filter(doc_type="textbook", subject="physics")
+    chunks = await llm._retrieve("boiling", query_filter=base, lang="en")
+
+    assert seen == ["en", None]
+    assert [chunk["payload"]["text"] for chunk in chunks] == [
+        "en-1",
+        "ru-1",
+        "kk-1",
+    ]
 
 
 async def test_retrieve_no_lang_single_search(monkeypatch):

@@ -298,6 +298,38 @@ TEST_UI_HTML = """<!doctype html>
           <div class="message" data-role="stt-message"></div>
         </div>
       </section>
+
+      <section class="panel" data-language="en">
+        <div class="panel-title">
+          <h2>English</h2>
+          <span class="language-code">en</span>
+        </div>
+
+        <div class="field">
+          <label for="tts-text-en">Text to synthesize</label>
+          <textarea id="tts-text-en" data-role="tts-text" autocomplete="off">Heat 250 mL of water to 25 °C and record the result.</textarea>
+          <div class="control-row">
+            <select data-role="tts-backend" aria-label="TTS backend">
+              <option value="supertonic">Supertonic</option>
+              <option value="qwen">Qwen3-TTS 0.6B</option>
+            </select>
+            <button data-action="tts" type="button">Generate</button>
+          </div>
+          <audio data-role="tts-audio" controls></audio>
+          <div class="message" data-role="tts-message"></div>
+        </div>
+
+        <div class="field">
+          <label for="stt-file-en">Audio to transcribe</label>
+          <input id="stt-file-en" data-role="stt-file" type="file" accept="audio/*">
+          <div class="control-row">
+            <button data-action="record" type="button" class="secondary">Record</button>
+            <button data-action="stop-recording" type="button" class="secondary" disabled>Stop</button>
+          </div>
+          <pre data-role="stt-result">Transcript will appear here.</pre>
+          <div class="message" data-role="stt-message"></div>
+        </div>
+      </section>
     </div>
 
     <script>

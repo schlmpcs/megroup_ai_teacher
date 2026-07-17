@@ -22,6 +22,7 @@ import logging
 from qdrant_client import AsyncQdrantClient, models
 
 from app.core.config import settings
+from app.core.languages import SUPPORTED_LANGUAGES
 from app.services.errors import LLMError, LLMTimeoutError, LLMUpstreamError
 
 logger = logging.getLogger("assistant.vectorstore")
@@ -339,6 +340,10 @@ async def collection_status() -> dict:
                 "points": 0,
                 "documents": 0,
                 "file_counts": {"total": 0},
+                "documents_by_language": {
+                    language: 0 for language in SUPPORTED_LANGUAGES
+                },
+                "supported_languages": list(SUPPORTED_LANGUAGES),
             }
         points = (
             await client.count(collection_name=settings.QDRANT_COLLECTION, exact=True)
@@ -346,11 +351,18 @@ async def collection_status() -> dict:
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
 
-    documents = len(await list_documents())
+    document_rows = await list_documents()
+    documents = len(document_rows)
+    documents_by_language = {
+        language: sum(1 for row in document_rows if row.get("lang") == language)
+        for language in SUPPORTED_LANGUAGES
+    }
     return {
         "status": "ready" if points else "empty",
         "collection": settings.QDRANT_COLLECTION,
         "points": points,
         "documents": documents,
         "file_counts": {"total": documents},
+        "documents_by_language": documents_by_language,
+        "supported_languages": list(SUPPORTED_LANGUAGES),
     }

@@ -21,6 +21,11 @@ _RU = (
     "и выводит наружу продукты обмена. Ядро хранит наследственную информацию и "
     "управляет процессами синтеза белка в цитоплазме клетки. "
 ) * 2
+_EN = (
+    "The cell is the basic structural and functional unit of living organisms. "
+    "The cell membrane regulates movement of substances into and out of the cell. "
+    "The nucleus stores hereditary information and controls protein synthesis. "
+) * 4
 
 _CONTAINER_XML = (
     '<?xml version="1.0"?>'
@@ -99,6 +104,18 @@ def test_spine_fallback_recovers_text_when_markitdown_thin():
     assert ingestion._count_words(text) > 50
     # markitdown's thin "Обложка" must not be what we returned.
     assert text.strip() != "Обложка"
+
+
+def test_english_epub_is_not_treated_as_image_only():
+    epub = _make_epub(
+        {"OEBPS/ch1.xhtml": _xhtml(f"<h1>Chapter 1</h1><p>{_EN}</p>")},
+        spine=[("c1", "ch1.xhtml")],
+    )
+
+    text = ingestion.to_markdown("Biology Grade 9.epub", epub, lang="en")
+
+    assert "cell membrane" in text
+    assert ingestion._count_words(text) > 50
 
 
 def test_spine_reading_order_is_respected():
@@ -204,6 +221,15 @@ def test_pdf_cleanup_preserves_repeated_textbook_paragraphs():
 
     assert cleaned.count(paragraph) == 8
     assert not ingestion._is_low_quality_pdf_extraction(extracted, cleaned)
+
+
+def test_english_pdf_text_is_not_low_quality_without_cyrillic(monkeypatch):
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: _EN)
+
+    text = ingestion.to_markdown("Biology Grade 9.pdf", b"%PDF-fake", lang="en")
+
+    assert text == _EN.strip()
+    assert not ingestion._is_low_quality_pdf_extraction(_EN, text)
 
 
 def test_empty_document_removes_stale_chunks(monkeypatch):

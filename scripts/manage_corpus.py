@@ -50,7 +50,7 @@ async def _list() -> None:
     for f in await ingestion.list_documents():
         print(
             f"  {f['status']:>10}  {f['file_id']}  chunks={f.get('chunks', 0):<4}  "
-            f"{f.get('filename') or ''}"
+            f"lang={f.get('lang') or '-':<2}  {f.get('filename') or ''}"
         )
 
 
@@ -83,6 +83,7 @@ def _gen_manifest(root: str, out: str) -> None:
         f"Manifest written to {out}: {len(labs)} labs "
         f"({len(labs) - stub} complete, {stub} stub), "
         f"{manifest['textbooks']} textbook files, "
+        f"coverage={manifest.get('textbooks_by_language', {})}, "
         f"{len(manifest['missing_metadata'])} unrecognised paths"
     )
 
