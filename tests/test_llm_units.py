@@ -28,15 +28,16 @@ def test_build_system_prompt_with_scenario_state():
     assert "Зажечь спиртовку" in prompt
 
 
-def test_build_system_prompt_strict_lab_scope_rejects_unrelated_topics():
+def test_build_system_prompt_allows_current_subject_or_lab():
     prompt = llm.build_system_prompt(
         "Сценарий: нагрев воды",
         strict_lab_scope=True,
     )
 
-    assert "СТРОГИЕ ГРАНИЦЫ" in prompt
-    assert "другой теме" in prompt
-    assert "НЕ делает посторонний вопрос" in prompt
+    assert "ГРАНИЦЫ ПРЕДМЕТА И ЛАБОРАТОРНОЙ РАБОТЫ" in prompt
+    assert "любой его темы" in prompt
+    assert "не обязан быть напрямую связан" in prompt
+    assert "другом школьном предмете" in prompt
 
 
 def test_build_system_prompt_state_omitted_when_blank():
@@ -164,9 +165,45 @@ def test_lab_scope_rejects_explicitly_different_subject():
     assert refusal == llm._LAB_SCOPE_REFUSALS["ru"]
 
 
-def test_lab_scope_rejects_unrelated_topic_from_same_subject():
+def test_lab_scope_allows_topic_from_same_subject():
     refusal = llm._lab_scope_refusal(
         "Как работает электрическая цепь?",
+        {"subject": "physics"},
+        "Нагреть воду и записать температуру кипения.",
+        [
+            _chunk(
+                "electricity",
+                "physics.pdf",
+                "Электрическая цепь состоит из источника тока и проводников.",
+            )
+        ],
+        "ru",
+    )
+
+    assert refusal is None
+
+
+def test_lab_scope_allows_subject_topic_supported_by_retrieval():
+    refusal = llm._lab_scope_refusal(
+        "Что такое сопротивление?",
+        {"subject": "physics"},
+        "Нагреть воду и записать температуру кипения.",
+        [
+            _chunk(
+                "resistance",
+                "physics.pdf",
+                "Сопротивление проводника зависит от его материала и размеров.",
+            )
+        ],
+        "ru",
+    )
+
+    assert refusal is None
+
+
+def test_lab_scope_still_rejects_unrelated_non_school_topic():
+    refusal = llm._lab_scope_refusal(
+        "Кто написал роман Война и мир?",
         {"subject": "physics"},
         "Нагреть воду и записать температуру кипения.",
         [
@@ -474,9 +511,11 @@ async def test_authoritative_scenario_disables_general_fallback(monkeypatch):
     assert result.answer == "Нет данных в сценарии."
 
 
-async def test_generate_answer_rejects_unrelated_lab_question_without_openai(
+async def test_generate_answer_allows_same_subject_question_outside_exact_lab(
     monkeypatch,
 ):
+    captured = {}
+
     async def _lab_grounding(lab):
         return (
             "Нагреть воду и записать температуру кипения.",
@@ -497,7 +536,11 @@ async def test_generate_answer_rejects_unrelated_lab_question_without_openai(
         ]
 
     async def _create(**kwargs):
-        raise AssertionError("OpenAI must not be called for an unrelated lab question")
+        captured["instructions"] = kwargs["instructions"]
+        return SimpleNamespace(
+            output_text="Электрическая цепь проводит ток по замкнутому пути.",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=10, total_tokens=20),
+        )
 
     monkeypatch.setattr(llm, "_lab_grounding", _lab_grounding)
     monkeypatch.setattr(llm, "_retrieve", _retrieve)
@@ -509,12 +552,12 @@ async def test_generate_answer_rejects_unrelated_lab_question_without_openai(
         lab={"subject": "physics", "grade": 8, "lang": "ru"},
     )
 
-    assert result.answer == llm._LAB_SCOPE_REFUSALS["ru"]
-    assert result.citations == []
-    assert result.usage == {}
+    assert result.answer == "Электрическая цепь проводит ток по замкнутому пути."
+    assert result.citations[0]["file_id"] == "electricity"
+    assert "любой его темы" in captured["instructions"]
 
 
-async def test_stream_answer_rejects_unrelated_lab_question_without_streaming_openai(
+async def test_stream_answer_rejects_question_from_different_subject_without_openai(
     monkeypatch,
 ):
     async def _lab_grounding(lab):
@@ -546,7 +589,7 @@ async def test_stream_answer_rejects_unrelated_lab_question_without_streaming_op
     events = [
         event
         async for event in llm.stream_answer(
-            "Что такое электрическое сопротивление?",
+            "Как происходит фотосинтез?",
             scenario_context="Сценарий нагревания воды и измерения температуры.",
             lab={"subject": "physics", "grade": 8, "lang": "ru"},
         )

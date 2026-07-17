@@ -96,8 +96,14 @@ _BOILERPLATE_RE = re.compile(
 _GENERAL_KNOWLEDGE_MARKER = "[[GENERAL_KNOWLEDGE]]"
 _GROUNDED_MARKER = "[[GROUNDED]]"
 _LAB_SCOPE_REFUSALS = {
-    "ru": "Я могу отвечать только на вопросы, связанные с текущей лабораторной работой.",
-    "kk": "Мен тек ағымдағы зертханалық жұмысқа қатысты сұрақтарға жауап бере аламын.",
+    "ru": (
+        "Я могу отвечать только на вопросы, связанные с текущим предметом "
+        "или лабораторной работой."
+    ),
+    "kk": (
+        "Мен тек осы пәнге немесе ағымдағы зертханалық жұмысқа қатысты "
+        "сұрақтарға жауап бере аламын."
+    ),
 }
 # Generic prompt/scenario words must not make an unrelated question look related
 # merely because both texts mention a lab, a question, or a current step.
@@ -214,8 +220,9 @@ def build_system_prompt(
     the authoritative procedure text for the current lab, injected verbatim.
     When ``lab_incomplete`` is set, the model is told the procedure is
     unavailable so it answers theory-only instead of inventing steps. Structured
-    lab requests set ``strict_lab_scope`` so unrelated textbook topics remain out
-    of scope even if retrieval happens to return a matching fragment.
+    lab requests set ``strict_lab_scope`` so questions may cover either the
+    current school subject or the current lab, while unrelated topics remain out
+    of scope.
     """
     prompt = _BASE_SYSTEM_PROMPT
     if answer_language == "kk":
@@ -227,17 +234,18 @@ def build_system_prompt(
         prompt += "\nЯЗЫК ОТВЕТА: русский. Отвечай полностью на русском языке.\n"
     if strict_lab_scope:
         prompt += (
-            "\n--- СТРОГИЕ ГРАНИЦЫ ТЕКУЩЕЙ ЛАБОРАТОРНОЙ РАБОТЫ ---\n"
-            "Отвечай только на вопросы о текущей лабораторной работе: её цели, "
-            "оборудовании, безопасности, действиях, наблюдениях, результатах и "
-            "теории, которая непосредственно помогает понять именно эту работу. "
-            "Вопросы о другой теме, другой лабораторной работе, другом школьном "
-            "предмете или посторонних вещах не отвечай по существу. Наличие "
-            "подходящего фрагмента учебника само по себе НЕ делает посторонний "
-            "вопрос относящимся к текущей работе. Для постороннего вопроса ответь "
-            "только одной короткой фразой на языке пользователя: «Я могу отвечать "
-            "только на вопросы, связанные с текущей лабораторной работой.»\n"
-            "--- КОНЕЦ СТРОГИХ ГРАНИЦ ---\n"
+            "\n--- ГРАНИЦЫ ПРЕДМЕТА И ЛАБОРАТОРНОЙ РАБОТЫ ---\n"
+            "Отвечай на вопросы, связанные с текущим школьным предметом или "
+            "текущей лабораторной работой. Вопрос по текущему предмету может "
+            "касаться любой его темы и не обязан быть напрямую связан именно с "
+            "этой лабораторной работой. Для вопросов о шагах, оборудовании, "
+            "безопасности и состоянии сцены по-прежнему используй только данные "
+            "текущей работы и сценария. Вопросы о другом школьном предмете или "
+            "посторонних вещах не отвечай по существу. Для постороннего вопроса "
+            "ответь только одной короткой фразой на языке пользователя: «Я могу "
+            "отвечать только на вопросы, связанные с текущим предметом или "
+            "лабораторной работой.»\n"
+            "--- КОНЕЦ ГРАНИЦ ---\n"
         )
     if lab_instruction and lab_instruction.strip():
         prompt += (
@@ -674,12 +682,13 @@ def _lab_scope_refusal(
     theory_chunks: list[dict],
     answer_language: str,
 ) -> Optional[str]:
-    """Reject clearly unrelated questions when structured lab context is active.
+    """Reject questions unrelated to both the current subject and current lab.
 
     The gate is deliberately conservative: procedure questions and ambiguous
-    short follow-ups remain answerable. A theory question is accepted when it
-    overlaps the authoritative lab text directly, or when a retrieved textbook
-    chunk bridges terms from both the question and the lab. Explicit questions
+    short follow-ups remain answerable. Any clearly identified question from the
+    current subject is accepted, even when it is not about this exact lab. A
+    question is also accepted when it overlaps the authoritative lab text or a
+    retrieved textbook chunk from the subject-scoped search. Explicit questions
     about a different school subject are always rejected.
     """
     if not lab or _is_lab_procedure_query(query):
@@ -687,8 +696,12 @@ def _lab_scope_refusal(
 
     lab_subject = lab.get("subject")
     query_subject = _infer_query_subject(query)
-    if query_subject and lab_subject and query_subject != lab_subject:
-        return _LAB_SCOPE_REFUSALS.get(answer_language, _LAB_SCOPE_REFUSALS["ru"])
+    if query_subject and lab_subject:
+        if query_subject != lab_subject:
+            return _LAB_SCOPE_REFUSALS.get(
+                answer_language, _LAB_SCOPE_REFUSALS["ru"]
+            )
+        return None
 
     scope_terms = _lab_scope_terms(scope_text)
     query_terms = _lab_scope_terms(query)
@@ -700,7 +713,7 @@ def _lab_scope_refusal(
     for chunk in theory_chunks:
         chunk_text = (chunk.get("payload") or {}).get("text") or ""
         chunk_terms = _lab_scope_terms(chunk_text)
-        if query_terms & chunk_terms and scope_terms & chunk_terms:
+        if query_terms & chunk_terms:
             return None
 
     return _LAB_SCOPE_REFUSALS.get(answer_language, _LAB_SCOPE_REFUSALS["ru"])
