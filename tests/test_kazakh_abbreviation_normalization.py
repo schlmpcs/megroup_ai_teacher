@@ -129,3 +129,14 @@ def test_kazakh_letters_and_acronyms(source, expected):
 )
 def test_kazakh_pipeline_preserves_protected_tokens(source):
     assert _normalize_pipeline(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "В молекуласы туралы.",
+        "О ғылым туралы айтайық.",
+    ],
+)
+def test_kazakh_single_letters_before_words_are_not_spelled_out(source):
+    assert normalize_kazakh_tts_text(source) == source

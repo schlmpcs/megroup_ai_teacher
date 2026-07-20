@@ -125,3 +125,22 @@ def test_russian_letters_and_acronyms(source, expected):
 )
 def test_russian_pipeline_preserves_protected_tokens(source):
     assert _normalize_pipeline(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "В молекуле два атома водорода.",
+        "С другой стороны, К сожалению, У нас есть раствор.",
+        "И тогда О станет ясно.",
+        "Я думаю, что это верно.",
+    ],
+)
+def test_single_letter_prepositions_are_not_spelled_out(source):
+    """В, С, К, О, У, А and И are words, not letters to spell."""
+
+    assert normalize_russian_tts_text(source) == source
+
+
+def test_letter_labels_are_still_spelled_out():
+    assert normalize_russian_tts_text("Выберите вариант А.") == "Выберите вариант а."

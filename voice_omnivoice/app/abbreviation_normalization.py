@@ -217,8 +217,11 @@ _LATIN_ACRONYM_RE = re.compile(r"(?<![\w-])[A-Z]{2,5}(?![\w-])")
 _CYRILLIC_ACRONYM_RE = re.compile(
     rf"(?<![\w-])[{_KK_UPPER}]{{2,5}}(?![\w-])"
 )
+# A capital letter sitting in front of a lowercase word is a preposition such as
+# В or О, not a letter to spell out. Label usage ("А нұсқасы.") keeps its
+# punctuation and still gets spelled.
 _INDIVIDUAL_CYRILLIC_RE = re.compile(
-    rf"(?<!\w)(?P<letter>[{_KK_UPPER}])(?!\w)"
+    rf"(?<!\w)(?P<letter>[{_KK_UPPER}])(?!\w)(?!\s+[{_KK_LOWER}])"
 )
 _NAMED_LATIN_LETTER_RE = re.compile(
     r"(?i)\b(?P<label>әріп|әрпі)\s+(?P<letter>[A-Z])(?!\w)"

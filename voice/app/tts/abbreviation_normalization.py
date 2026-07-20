@@ -205,8 +205,11 @@ _LATIN_ACRONYM_RE = re.compile(r"(?<![\w-])[A-Z]{2,5}(?![\w-])")
 _CYRILLIC_ACRONYM_RE = re.compile(
     rf"(?<![\w-])[{_RU_UPPER}]{{2,5}}(?![\w-])"
 )
+# В, С, К, О, У, А and И are ordinary Russian words, so a capital letter sitting
+# in front of a lowercase word is a preposition and must not be spelled out.
+# Label usage ("вариант А.", "точка Б)") is followed by punctuation and survives.
 _INDIVIDUAL_CYRILLIC_RE = re.compile(
-    rf"(?<!\w)(?P<letter>[{_RU_UPPER}])(?!\w)"
+    rf"(?<!\w)(?P<letter>[{_RU_UPPER}])(?!\w)(?!\s+[{_RU_LOWER}])"
 )
 _NAMED_LATIN_LETTER_RE = re.compile(
     r"(?i)\b(?P<label>буква)\s+(?P<letter>[A-Z])(?!\w)"
