@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date
+from itertools import count
 from typing import Callable, Match, Pattern, TypeVar
 
 
@@ -282,22 +283,35 @@ _UNIT_NAMES = {
     "час": (("час", "часа", "часов"), "masculine"),
 }
 
+_PROTECTOR_SLOTS = count()
+
 
 @dataclass
 class _Protector:
     values: list[str] = field(default_factory=list)
+    # Protectors nest (the abbreviation pass protects, then this module
+    # protects again), so each instance needs its own placeholder namespace or
+    # the inner restore overwrites spans the outer one still owns. The slot
+    # band is disjoint from the one abbreviation_normalization mints from, so
+    # the two modules' counters can stay independent.
+    # ponytail: 256 slots, plenty for the three protectors alive per call.
+    slot: str = field(
+        default_factory=lambda: chr(0xE400 + next(_PROTECTOR_SLOTS) % 0x100)
+    )
+
+    def _placeholder(self, index: int) -> str:
+        return f"\ue000{self.slot}{chr(0xE300 + index)}\ue001"
 
     def protect(self, text: str, pattern: Pattern[str]) -> str:
         def replace(match: Match[str]) -> str:
-            index = len(self.values)
             self.values.append(match.group(0))
-            return f"\ue000{chr(0xE100 + index)}\ue001"
+            return self._placeholder(len(self.values) - 1)
 
         return pattern.sub(replace, text)
 
     def restore(self, text: str) -> str:
         for index, value in enumerate(self.values):
-            text = text.replace(f"\ue000{chr(0xE100 + index)}\ue001", value)
+            text = text.replace(self._placeholder(index), value)
         return text
 
 

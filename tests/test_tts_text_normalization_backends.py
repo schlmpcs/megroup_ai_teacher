@@ -38,7 +38,7 @@ def test_omnivoice_model_receives_normalized_kazakh_text(monkeypatch):
     assert result == b"WAV"
     call = backend.model.calls[0]
     assert call["text"] == (
-        "а қы Байтұрсынұлы: H2O молекуласында "
+        "а қы Байтұрсынұлы: аш екі о молекуласында "
         "екі сутек атомы "
         "және эй ай бар."
     )
@@ -104,7 +104,7 @@ def test_every_russian_backend_receives_normalized_text(
 
     assert result == b"WAV"
     assert captured == [
-        "а эс Пушкин: в молекуле H2O есть два атома и эй ай."
+        "а эс Пушкин: в молекуле аш два о есть два атома и эй ай."
     ]
 
 
@@ -125,4 +125,4 @@ def test_russian_transliteration_preserves_non_linguistic_tokens(monkeypatch):
         backend="supertonic",
     )
 
-    assert captured == ["H2O x2 LAB-204 report2.csv тест два"]
+    assert captured == ["аш два о x2 LAB-204 report2.csv тест два"]

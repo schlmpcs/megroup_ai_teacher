@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -166,21 +167,34 @@ _UNIT_NAMES = {
 }
 
 
+# Placeholders from a nested protector must not collide with the ones minted
+# by the abbreviation normalizer, so each instance takes its own slot char.
+_SLOTS = itertools.count()
+
+
+def _next_slot() -> str:
+    return chr(0xE090 + next(_SLOTS) % 0x70)
+
+
 @dataclass
 class _Protector:
     values: list[str] = field(default_factory=list)
+    slot: str = field(default_factory=_next_slot)
+
+    def _placeholder(self, index: int) -> str:
+        return f"\ue000{self.slot}{chr(0xE100 + index)}\ue001"
 
     def protect(self, text: str, pattern: Pattern[str]) -> str:
         def replace(match: Match[str]) -> str:
             index = len(self.values)
             self.values.append(match.group(0))
-            return f"\ue000{chr(0xE100 + index)}\ue001"
+            return self._placeholder(index)
 
         return pattern.sub(replace, text)
 
     def restore(self, text: str) -> str:
         for index, value in enumerate(self.values):
-            text = text.replace(f"\ue000{chr(0xE100 + index)}\ue001", value)
+            text = text.replace(self._placeholder(index), value)
         return text
 
 

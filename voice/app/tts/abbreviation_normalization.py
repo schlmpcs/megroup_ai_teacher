@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from itertools import count
 from typing import Match, Pattern
+
+from .formula_speech import speak_formula, speak_reaction
 
 
 RUSSIAN_ABBREVIATIONS = {
@@ -155,9 +158,25 @@ _ID_CONTEXT_RE = re.compile(
 )
 _RESERVED_ID_RE = re.compile(r"(?<!\w)(?:ID|UID|UUID|GUID|LAB)(?!\w)")
 
+_SUBSCRIPT_DIGITS = "₀-₉"
+_SUPERSCRIPT_DIGITS = "²³¹⁰⁴-⁹"
+_SUPERSCRIPT_SIGNS = "⁺⁻"
 _CHEMICAL_CANDIDATE_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:[A-Z][a-z]?|\d+|[()\[\]·.^+\-])+"
-    r"(?![A-Za-z0-9])"
+    rf"(?<![A-Za-z0-9])(?:[A-Z][a-z]?|\d+|"
+    rf"[{_SUBSCRIPT_DIGITS}{_SUPERSCRIPT_DIGITS}{_SUPERSCRIPT_SIGNS}"
+    rf"()\[\]·.^+\-])+"
+    rf"(?![A-Za-z0-9])"
+)
+_FORMULA_TOKEN = (
+    rf"\d*[A-Z][A-Za-z0-9{_SUBSCRIPT_DIGITS}()\[\]·]*"
+    rf"(?:[{_SUPERSCRIPT_DIGITS}]*[{_SUPERSCRIPT_SIGNS}])?"
+)
+_REACTION_RE = re.compile(
+    rf"(?<![\w-]){_FORMULA_TOKEN}"
+    rf"(?:\s*(?:<->|->|=>|[+→⟶↔⇄])\s*{_FORMULA_TOKEN})+(?![\w-])"
+)
+_ION_RE = re.compile(
+    r"(?<![\w-])(?:[A-Z][a-z]?\d*)+\d*[+-]{1,2}(?![\w-])"
 )
 _ELEMENT_SYMBOLS = {
     "Ac", "Ag", "Al", "Am", "Ar", "As", "At", "Au", "B", "Ba", "Be",
@@ -232,31 +251,44 @@ _STANDALONE_UNIT_RE = re.compile(
     r"(?<![\w/])(?:мин|кг|мг|мл|км|см|ч|г)(?![\w/])"
 )
 
+_PROTECTOR_SLOTS = count()
+
 
 @dataclass
 class _Protector:
     values: list[str] = field(default_factory=list)
+    # Protectors nest (the pipeline protects, then the abbreviation pass
+    # protects again), so each instance needs its own placeholder namespace or
+    # the inner restore overwrites spans the outer one still owns.
+    # ponytail: 256 slots, plenty for the three protectors alive per call.
+    slot: str = field(
+        default_factory=lambda: chr(0xE200 + next(_PROTECTOR_SLOTS) % 0x100)
+    )
+
+    def _placeholder(self, index: int) -> str:
+        return f"\ue000{self.slot}{chr(0xE300 + index)}\ue001"
 
     def protect(self, text: str, pattern: Pattern[str]) -> str:
         def replace(match: Match[str]) -> str:
-            index = len(self.values)
             self.values.append(match.group(0))
-            return f"\ue000{chr(0xE100 + index)}\ue001"
+            return self._placeholder(len(self.values) - 1)
 
         return pattern.sub(replace, text)
 
     def protect_value(self, value: str) -> str:
-        index = len(self.values)
         self.values.append(value)
-        return f"\ue000{chr(0xE100 + index)}\ue001"
+        return self._placeholder(len(self.values) - 1)
 
     def restore(self, text: str) -> str:
         for index, value in enumerate(self.values):
-            text = text.replace(f"\ue000{chr(0xE100 + index)}\ue001", value)
+            text = text.replace(self._placeholder(index), value)
         return text
 
 
 def _looks_like_chemical_formula(value: str) -> bool:
+    # The candidate pattern swallows sentence punctuation, and speak_formula
+    # puts it back, so a digitless formula must not fail on a trailing dot.
+    value = value.strip(".")
     if any(char.isdigit() or char in "()[]·" for char in value):
         return bool(re.search(r"[A-Z]", value))
 
@@ -275,9 +307,31 @@ def _protect_chemical_formulas(text: str, protector: _Protector) -> str:
         value = match.group(0)
         if not _looks_like_chemical_formula(value):
             return value
-        return protector.protect_value(value)
+        return protector.protect_value(speak_formula(value))
 
     return _CHEMICAL_CANDIDATE_RE.sub(replace, text)
+
+
+def _protect_reactions(text: str, protector: _Protector) -> str:
+    def replace(match: Match[str]) -> str:
+        value = match.group(0)
+        spoken = speak_reaction(value)
+        if spoken == value:
+            return value
+        return protector.protect_value(spoken)
+
+    return _REACTION_RE.sub(replace, text)
+
+
+def _protect_ions(text: str, protector: _Protector) -> str:
+    def replace(match: Match[str]) -> str:
+        value = match.group(0)
+        spoken = speak_formula(value)
+        if spoken == value:
+            return value
+        return protector.protect_value(spoken)
+
+    return _ION_RE.sub(replace, text)
 
 
 def _protect_nonlinguistic(text: str, protector: _Protector) -> str:
@@ -288,6 +342,15 @@ def _protect_nonlinguistic(text: str, protector: _Protector) -> str:
         _FILENAME_RE,
         _SCIENTIFIC_E_RE,
         _SCIENTIFIC_POWER_RE,
+    ):
+        text = protector.protect(text, pattern)
+    # Reactions must win over the equation and math patterns, which would
+    # otherwise swallow the whole span and restore it unspoken.
+    text = _protect_reactions(text, protector)
+    # An ASCII charge sign lets the math pattern claim the ion, so ions have to
+    # be spoken before the equation and math passes too.
+    text = _protect_ions(text, protector)
+    for pattern in (
         _EQUATION_RE,
         _MATH_EXPRESSION_RE,
         _VARIABLE_CONTEXT_RE,

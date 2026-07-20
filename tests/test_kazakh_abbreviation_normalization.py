@@ -83,7 +83,7 @@ def test_kazakh_new_units_feed_the_existing_number_normalizer():
         "3.14",
         "25%",
         "2 кг",
-        "H2O 2",
+        "x2 2",
         "31.02.2026 25:99 version 1.2.3",
     ],
 )
@@ -111,7 +111,7 @@ def test_kazakh_initials_with_and_without_spaces(source, expected):
         ("әрпі Қ", "әрпі қы"),
         ("AI VR API pH DNA", "эй ай ви ар эй пи ай пэ аш ди эн эй"),
         ("GPU ҚР", "джи пи ю қы эр"),
-        ("CO", "CO"),
+        ("CO", "це о"),
     ],
 )
 def test_kazakh_letters_and_acronyms(source, expected):
@@ -121,7 +121,6 @@ def test_kazakh_letters_and_acronyms(source, expected):
 @pytest.mark.parametrize(
     "source",
     [
-        "H2O CO2 NaCl Fe2(SO4)3 Ca(OH)2 CuSO4·5H2O CO",
         "x = 2; 2 + 2 = 4; 2+2; x^2; F=ma; айнымалы Қ; айнымалы API",
         "https://example.com/AI/lab2?q=25 www.example.kz/API/2026",
         "report_AI.csv AI.c lesson_DNA_12.03.2026.txt /labs/API/report.csv",
