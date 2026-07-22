@@ -16,6 +16,7 @@ class AdminSettings(BaseSettings):
     ADMIN_UI_COOKIE_SECURE: bool = True
     BACKEND_BASE_URL: str = "http://api:8000"
     BACKEND_ADMIN_API_KEY: str = ""
+    BACKEND_INTERNAL_API_KEY: str = ""
     BACKEND_TIMEOUT_S: float = 300.0
 
     @field_validator(
@@ -23,6 +24,7 @@ class AdminSettings(BaseSettings):
         "ADMIN_UI_PASSWORD_HASH",
         "ADMIN_UI_SESSION_SECRET",
         "BACKEND_ADMIN_API_KEY",
+        "BACKEND_INTERNAL_API_KEY",
     )
     @classmethod
     def required(cls, value: str, info) -> str:
@@ -30,7 +32,12 @@ class AdminSettings(BaseSettings):
         if not stripped:
             raise ValueError(f"{info.field_name} is required")
         if (
-            info.field_name in {"ADMIN_UI_SESSION_SECRET", "BACKEND_ADMIN_API_KEY"}
+            info.field_name
+            in {
+                "ADMIN_UI_SESSION_SECRET",
+                "BACKEND_ADMIN_API_KEY",
+                "BACKEND_INTERNAL_API_KEY",
+            }
             and stripped == _SECRET_PLACEHOLDER
         ):
             raise ValueError(f"{info.field_name} must not use the example placeholder")

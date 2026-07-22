@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import json
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 jobs = {}
@@ -26,11 +28,102 @@ def authorize(authorization: str = Header("")):
         raise HTTPException(status_code=403)
 
 
+def authorize_internal(authorization: str = Header("")):
+    if authorization != "Bearer smoke-internal-key":
+        raise HTTPException(status_code=403)
+
+
 @app.get("/admin/corpus_status", dependencies=[Depends(authorize)])
 async def corpus_status():
     if os.environ.get("FAKE_CORPUS_STATUS_FAIL", "false").lower() == "true":
         raise HTTPException(status_code=503, detail="Synthetic corpus status failure")
     return {"status": "ready", "documents": len(documents), "points": 3}
+
+
+@app.get("/admin/scenarios", dependencies=[Depends(authorize)])
+async def scenarios():
+    return {
+        "scenarios": [
+            {
+                "scenario_id": "physics_lab_02_heating",
+                "scenario_name": "Нагревание воды",
+                "language": "ru",
+            }
+        ]
+    }
+
+
+@app.get("/health", dependencies=[Depends(authorize_internal)])
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready", dependencies=[Depends(authorize_internal)])
+async def ready():
+    return {"status": "ready", "checks": {"qdrant": "ok", "voice": "ok"}}
+
+
+@app.post("/ask", dependencies=[Depends(authorize_internal)])
+async def ask(payload: dict):
+    return {
+        "answer": "Вода кипит, когда давление насыщенного пара сравнивается с внешним давлением.",
+        "citations": [{"filename": "Physics 8.md", "display_label": "Кипение"}],
+        "primary_source": {"filename": "Physics 8.md"},
+        "usage": {"input_tokens": 10, "output_tokens": 12},
+        "language": payload.get("language", "ru"),
+    }
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(authorize_internal)])
+async def chat(payload: dict):
+    if not payload.get("stream"):
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "Теплопроводность переносит энергию внутри вещества."}}],
+            "metadata": {"citations": [], "primary_source": None},
+        }
+
+    async def frames():
+        yield 'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+        yield 'data: {"choices":[{"delta":{"content":"Теплопроводность переносит энергию."}}]}\n\n'
+        yield 'data: {"metadata":{"citations":[],"primary_source":null}}\n\n'
+        yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(frames(), media_type="text/event-stream")
+
+
+@app.post("/hint", dependencies=[Depends(authorize_internal)])
+async def hint(payload: dict):
+    return {
+        "hint": "Следите за температурой воды и дождитесь устойчивого кипения.",
+        "hint_level": payload["hint_level"],
+        "language": payload.get("language", "ru"),
+    }
+
+
+@app.post("/stt", dependencies=[Depends(authorize_internal)])
+async def stt(file: UploadFile = File(...), language: str = Form("auto")):
+    await file.read()
+    return {"text": "Что такое кипение?", "language": "ru" if language == "auto" else language}
+
+
+@app.post("/tts", dependencies=[Depends(authorize_internal)])
+async def tts(payload: dict):
+    return Response(content=b"RIFFtest", media_type="audio/wav", headers={"X-TTS-Backend": payload.get("backend", "supertonic")})
+
+
+@app.post("/voice_ask", dependencies=[Depends(authorize_internal)])
+async def voice_ask(file: UploadFile = File(...)):
+    await file.read()
+    return {
+        "question": "Что такое кипение?",
+        "answer": "Кипение представляет собой парообразование по всему объёму жидкости.",
+        "citations": [],
+        "primary_source": None,
+        "audio_base64": base64.b64encode(b"RIFFtest").decode("ascii"),
+        "audio_format": "audio/wav",
+        "observability": {"latency_ms": {"stt": 10, "llm": 20, "tts": 10, "total": 40}},
+    }
 
 
 @app.get("/admin/ingestion/status", dependencies=[Depends(authorize)])

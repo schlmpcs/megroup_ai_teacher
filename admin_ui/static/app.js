@@ -140,6 +140,7 @@ function showLogin() {
   renderDocuments();
   clearJobDetails();
   renderServiceStatus(null, null);
+  resetTestConsole();
 }
 
 function showApp() {

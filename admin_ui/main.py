@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -29,6 +29,16 @@ _PATTERNS = (
     ("DELETE", re.compile(r"ingestion/jobs/[0-9a-f]{32}")),
     ("DELETE", re.compile(r"documents/[A-Za-z0-9._:-]{1,128}")),
 )
+_TEST_EXACT = {
+    ("GET", "health"),
+    ("GET", "ready"),
+    ("POST", "ask"),
+    ("POST", "v1/chat/completions"),
+    ("POST", "hint"),
+    ("POST", "stt"),
+    ("POST", "tts"),
+    ("POST", "voice_ask"),
+}
 
 
 @asynccontextmanager
@@ -56,7 +66,7 @@ login_limiter = LoginLimiter()
 async def disable_session_caching(request: Request, call_next):
     response = await call_next(request)
     session_path = request.url.path in {"/auth/login", "/api/session", "/auth/logout"}
-    if session_path or request.url.path.startswith("/api/admin/"):
+    if session_path or request.url.path.startswith(("/api/admin/", "/api/test/")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -71,6 +81,17 @@ def _allowed(method: str, path: str) -> bool:
         method == allowed_method and pattern.fullmatch(path)
         for allowed_method, pattern in _PATTERNS
     )
+
+
+def _proxy_headers(request: Request, api_key: str) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": request.headers.get("accept", "application/json"),
+    }
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
 
 
 def session_payload(
@@ -157,13 +178,7 @@ async def proxy_admin(
         raise HTTPException(status_code=404, detail="Admin operation not found")
     if method in {"POST", "DELETE"}:
         require_csrf(request, session)
-    headers = {
-        "Authorization": f"Bearer {settings.BACKEND_ADMIN_API_KEY}",
-        "Accept": request.headers.get("accept", "application/json"),
-    }
-    content_type = request.headers.get("content-type")
-    if content_type:
-        headers["Content-Type"] = content_type
+    headers = _proxy_headers(request, settings.BACKEND_ADMIN_API_KEY)
     transport = getattr(app.state, "backend_transport", None)
     async with httpx.AsyncClient(
         base_url=settings.BACKEND_BASE_URL,
@@ -184,3 +199,52 @@ async def proxy_admin(
     if backend.headers.get("content-type"):
         response_headers["Content-Type"] = backend.headers["content-type"]
     return Response(content=backend.content, status_code=backend.status_code, headers=response_headers)
+
+
+@app.api_route("/api/test/{path:path}", methods=["GET", "POST"])
+async def proxy_test(
+    path: str,
+    request: Request,
+    session: dict = Depends(session_payload),
+    settings: AdminSettings = Depends(get_settings),
+):
+    method = request.method.upper()
+    if (method, path) not in _TEST_EXACT:
+        raise HTTPException(status_code=404, detail="Test operation not found")
+    if method == "POST":
+        require_csrf(request, session)
+
+    client = httpx.AsyncClient(
+        base_url=settings.BACKEND_BASE_URL,
+        timeout=settings.BACKEND_TIMEOUT_S,
+        transport=getattr(app.state, "backend_transport", None),
+    )
+    try:
+        backend = await client.send(
+            client.build_request(
+                method,
+                f"/{path}",
+                params=request.query_params,
+                headers=_proxy_headers(request, settings.BACKEND_INTERNAL_API_KEY),
+                content=request.stream() if method == "POST" else None,
+            ),
+            stream=True,
+        )
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Backend test API unavailable") from exc
+
+    async def body():
+        try:
+            async for chunk in backend.aiter_bytes():
+                yield chunk
+        finally:
+            await backend.aclose()
+            await client.aclose()
+
+    response_headers = {
+        name: value
+        for name in ("content-type", "content-disposition", "x-tts-backend", "content-language")
+        if (value := backend.headers.get(name))
+    }
+    return StreamingResponse(body(), status_code=backend.status_code, headers=response_headers)

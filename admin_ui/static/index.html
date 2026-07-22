@@ -6,6 +6,7 @@
   <title>Панель управления VR-ассистентом</title>
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
+  <script src="/static/test_console.js" defer></script>
 </head>
 <body>
   <section id="loginView" class="login-shell">
@@ -30,6 +31,7 @@
       <button type="button" data-view="ingest" aria-selected="true">Загрузка</button>
       <button type="button" data-view="jobs" aria-selected="false">Задания</button>
       <button type="button" data-view="documents" aria-selected="false">Документы</button>
+      <button type="button" data-view="testing" aria-selected="false">Тест API</button>
     </nav>
 
     <main>
@@ -83,6 +85,133 @@
         <div class="table-wrap"><table id="documentsTable"><thead><tr>
           <th>Имя файла</th><th>Тип</th><th>Предмет</th><th>Класс</th><th>Язык</th><th>Фрагменты</th><th></th>
         </tr></thead><tbody></tbody></table></div>
+      </section>
+
+      <section id="testingView" data-view-panel="testing" hidden>
+        <div class="segmented test-tabs" role="tablist" aria-label="Тестовые вызовы API">
+          <button type="button" data-test-view="health" aria-selected="true">Состояние</button>
+          <button type="button" data-test-view="ask" aria-selected="false">Вопрос</button>
+          <button type="button" data-test-view="chat" aria-selected="false">Чат</button>
+          <button type="button" data-test-view="hint" aria-selected="false">Подсказка</button>
+          <button type="button" data-test-view="stt" aria-selected="false">Распознавание речи</button>
+          <button type="button" data-test-view="tts" aria-selected="false">Синтез речи</button>
+          <button type="button" data-test-view="voice" aria-selected="false">Голосовой вопрос</button>
+        </div>
+
+        <section class="test-panel" data-test-panel="health">
+          <h2>Состояние сервисов</h2>
+          <div class="command-row">
+            <button id="testHealthButton" type="button">Проверить API</button>
+            <button id="testReadyButton" type="button">Проверить готовность</button>
+            <button id="testScenariosButton" type="button">Загрузить сценарии</button>
+          </div>
+          <div id="testHealthOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="ask" hidden>
+          <h2>Вопрос с поиском по базе знаний</h2>
+          <label>Вопрос<textarea id="testAskQuery">Почему вода закипает при нагревании?</textarea></label>
+          <div class="test-grid">
+            <label>Язык ответа<select id="testAskResponseLang"><option value="">Определить автоматически</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Сценарий<input id="testAskScenario" type="text" list="scenarioList" placeholder="Необязательно"></label>
+            <label>Максимум токенов<input id="testAskMaxTokens" type="number" min="64" max="4096" placeholder="По умолчанию"></label>
+          </div>
+          <fieldset class="test-fieldset">
+            <legend>Контекст лабораторной работы</legend>
+            <div class="test-grid">
+              <label>Предмет<select id="testAskSubject"><option value="">Не указан</option><option value="physics">Физика</option><option value="chemistry">Химия</option><option value="biology">Биология</option></select></label>
+              <label>Класс<input id="testAskGrade" type="number" min="7" max="11" placeholder="7-11"></label>
+              <label>Язык корпуса<select id="testAskLabLang"><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+              <label>Номер работы<input id="testAskLabNumber" type="number" min="1" max="20" placeholder="Необязательно"></label>
+            </div>
+          </fieldset>
+          <button id="testAskButton" class="primary" type="button">Отправить</button>
+          <div id="testAskOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="chat" hidden>
+          <h2>Чат и потоковый ответ</h2>
+          <label>Сообщения в формате JSON<textarea id="testChatMessages" class="code-input">[
+  {"role": "user", "content": "Что такое теплопроводность?"}
+]</textarea></label>
+          <div class="test-grid">
+            <label>Язык ответа<select id="testChatLanguage"><option value="">Определить автоматически</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Сценарий<input id="testChatScenario" type="text" list="scenarioList" placeholder="Необязательно"></label>
+            <label>Максимум токенов<input id="testChatMaxTokens" type="number" min="64" max="4096" placeholder="По умолчанию"></label>
+            <label class="check-label"><input id="testChatStream" type="checkbox" checked> Потоковый ответ</label>
+          </div>
+          <button id="testChatButton" class="primary" type="button">Отправить</button>
+          <div id="testChatOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="hint" hidden>
+          <h2>Переформулировка подсказки</h2>
+          <label>Исходная подсказка<textarea id="testHintText">Нагрейте воду до 100 градусов.</textarea></label>
+          <div class="test-grid">
+            <label>Уровень<select id="testHintLevel"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
+            <label>Язык<select id="testHintLanguage"><option value="">Определить автоматически</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Сценарий<input id="testHintScenario" type="text" list="scenarioList" placeholder="Необязательно"></label>
+          </div>
+          <button id="testHintButton" class="primary" type="button">Отправить</button>
+          <div id="testHintOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="stt" hidden>
+          <h2>Распознавание речи</h2>
+          <div class="test-grid">
+            <label>Язык<select id="testSttLanguage"><option value="">Определить автоматически</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Аудиофайл<span class="file-choice"><span class="file-button">Выбрать файл<input id="testSttFile" type="file" accept="audio/*"></span><span id="testSttFileName" class="muted">Файл не выбран</span></span></label>
+          </div>
+          <div class="command-row">
+            <button id="testSttRecordButton" class="record-button" type="button">Начать запись</button>
+            <span id="testSttRecordStatus" class="muted" aria-live="polite"></span>
+          </div>
+          <div id="testSttPreview"></div>
+          <button id="testSttButton" class="primary" type="button">Распознать</button>
+          <div id="testSttOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="tts" hidden>
+          <h2>Синтез речи</h2>
+          <label>Текст<textarea id="testTtsText">Сәлеметсіз бе! Бүгін біз зертханалық жұмысты бастаймыз.</textarea></label>
+          <div class="test-grid">
+            <label>Язык<select id="testTtsLanguage"><option value="">По умолчанию</option><option value="ru">Русский</option><option value="kk" selected>Казахский</option><option value="en">Английский</option></select></label>
+            <label>Движок<select id="testTtsBackend"><option value="">По умолчанию</option><option value="omnivoice" selected>OmniVoice</option><option value="mms">MMS</option><option value="supertonic">Supertonic</option><option value="qwen">Qwen3-TTS 0.6B</option></select></label>
+            <label>Голос<input id="testTtsVoice" type="text" placeholder="Необязательно"></label>
+            <label>Формат<input id="testTtsFormat" type="text" placeholder="wav"></label>
+          </div>
+          <button id="testTtsButton" class="primary" type="button">Синтезировать</button>
+          <div id="testTtsOutput" class="test-output" aria-live="polite"></div>
+        </section>
+
+        <section class="test-panel test-form" data-test-panel="voice" hidden>
+          <h2>Полный голосовой конвейер</h2>
+          <div class="test-grid">
+            <label>Язык распознавания<select id="testVoiceLanguage"><option value="">Определить автоматически</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Язык ответа<select id="testVoiceResponseLanguage"><option value="">Как в вопросе</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+            <label>Движок синтеза<select id="testVoiceBackend"><option value="">По умолчанию</option><option value="supertonic">Supertonic</option><option value="qwen">Qwen3-TTS 0.6B</option><option value="omnivoice">OmniVoice</option><option value="mms">MMS</option></select></label>
+            <label>Сценарий<input id="testVoiceScenario" type="text" list="scenarioList" placeholder="Необязательно"></label>
+            <label>Голос<input id="testVoiceVoice" type="text" placeholder="Необязательно"></label>
+            <label>Аудиофайл<span class="file-choice"><span class="file-button">Выбрать файл<input id="testVoiceFile" type="file" accept="audio/*"></span><span id="testVoiceFileName" class="muted">Файл не выбран</span></span></label>
+          </div>
+          <fieldset class="test-fieldset">
+            <legend>Контекст лабораторной работы</legend>
+            <div class="test-grid">
+              <label>Предмет<select id="testVoiceSubject"><option value="">Не указан</option><option value="physics">Физика</option><option value="chemistry">Химия</option><option value="biology">Биология</option></select></label>
+              <label>Класс<input id="testVoiceGrade" type="number" min="7" max="11" placeholder="7-11"></label>
+              <label>Язык корпуса<select id="testVoiceLabLang"><option value="">Как в вопросе</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select></label>
+              <label>Номер работы<input id="testVoiceLabNumber" type="number" min="1" max="20" placeholder="Необязательно"></label>
+            </div>
+          </fieldset>
+          <div class="command-row">
+            <button id="testVoiceRecordButton" class="record-button" type="button">Начать запись</button>
+            <span id="testVoiceRecordStatus" class="muted" aria-live="polite"></span>
+          </div>
+          <div id="testVoicePreview"></div>
+          <button id="testVoiceButton" class="primary" type="button">Запустить</button>
+          <div id="testVoiceOutput" class="test-output" aria-live="polite"></div>
+        </section>
+        <datalist id="scenarioList"></datalist>
       </section>
     </main>
   </div>

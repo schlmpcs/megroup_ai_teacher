@@ -17,12 +17,17 @@ def _configure(monkeypatch):
     monkeypatch.setenv("ADMIN_UI_COOKIE_SECURE", "false")
     monkeypatch.setenv("BACKEND_BASE_URL", "http://backend")
     monkeypatch.setenv("BACKEND_ADMIN_API_KEY", "backend-admin-key")
+    monkeypatch.setenv("BACKEND_INTERNAL_API_KEY", "backend-internal-key")
     get_settings.cache_clear()
 
 
 @pytest.mark.parametrize(
     "field",
-    ["ADMIN_UI_SESSION_SECRET", "BACKEND_ADMIN_API_KEY"],
+    [
+        "ADMIN_UI_SESSION_SECRET",
+        "BACKEND_ADMIN_API_KEY",
+        "BACKEND_INTERNAL_API_KEY",
+    ],
 )
 def test_settings_reject_known_secret_placeholder(field):
     values = {
@@ -30,6 +35,7 @@ def test_settings_reject_known_secret_placeholder(field):
         "ADMIN_UI_PASSWORD_HASH": hash_password("secret"),
         "ADMIN_UI_SESSION_SECRET": "session-secret-1234567890-abcdef",
         "BACKEND_ADMIN_API_KEY": "backend-admin-key",
+        "BACKEND_INTERNAL_API_KEY": "backend-internal-key",
     }
     values[field] = "generate-with-python-secrets-token-urlsafe-32"
 
@@ -88,6 +94,37 @@ def test_index_serves_operator_shell_without_backend_secrets(monkeypatch):
     assert "BACKEND_BASE_URL" not in response.text
 
 
+def test_index_contains_unified_api_test_console(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    for text in [
+        "Тест API",
+        "Состояние",
+        "Вопрос",
+        "Чат",
+        "Подсказка",
+        "Распознавание речи",
+        "Синтез речи",
+        "Голосовой вопрос",
+    ]:
+        assert text in response.text
+    for element_id in [
+        "testHealthOutput",
+        "testAskQuery",
+        "testChatMessages",
+        "testHintText",
+        "testSttFile",
+        "testTtsText",
+        "testVoiceFile",
+        "scenarioList",
+    ]:
+        assert f'id="{element_id}"' in response.text
+    assert "Base URL" not in response.text
+    assert "INTERNAL_API_KEY" not in response.text
+
+
 def test_static_javascript_renders_operator_state_in_russian(monkeypatch):
     _configure(monkeypatch)
     with TestClient(app) as client:
@@ -112,6 +149,27 @@ def test_static_javascript_never_uses_browser_storage(monkeypatch):
     assert response.status_code == 200
     assert "localStorage" not in response.text
     assert "sessionStorage" not in response.text
+
+
+def test_static_javascript_drives_all_test_endpoints_without_browser_keys(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/test_console.js")
+    assert response.status_code == 200
+    for path in [
+        'testFetch("health"',
+        'testFetch("ready"',
+        'testFetch("ask"',
+        'testFetch("v1/chat/completions"',
+        'testFetch("hint"',
+        'testFetch("stt"',
+        'testFetch("tts"',
+        'testFetch("voice_ask"',
+    ]:
+        assert path in response.text
+    assert "MediaRecorder" in response.text
+    assert 'headers.set("X-CSRF-Token", state.csrf);' in response.text
+    assert "Authorization" not in response.text
 
 
 def test_static_javascript_general_identity_uses_relative_path(monkeypatch):
@@ -151,6 +209,7 @@ def test_static_javascript_login_reset_and_logout_clear_state(monkeypatch):
         "state.selectedJobId = null;",
         "clearJobDetails();",
         "renderServiceStatus(null, null);",
+        "resetTestConsole();",
     ]:
         assert reset in show_login.group("body")
     assert "try {" in response.text
@@ -258,6 +317,54 @@ def test_proxy_injects_backend_key_and_strips_browser_authorization(monkeypatch)
     assert captured["authorization"] == "Bearer backend-admin-key"
 
 
+def test_test_proxy_injects_internal_key_and_streams_response(monkeypatch):
+    _configure(monkeypatch)
+    captured = {}
+
+    async def handler(request: httpx.Request):
+        captured["authorization"] = request.headers.get("authorization")
+        captured["path"] = request.url.path
+        captured["body"] = await request.aread()
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "text/event-stream"},
+            content=b'data: {"choices": []}\n\ndata: [DONE]\n\n',
+        )
+
+    app.state.backend_transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        response = client.post(
+            "/api/test/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer browser-key",
+                "X-CSRF-Token": login.json()["csrf_token"],
+            },
+            json={"messages": [{"role": "user", "content": "hello"}], "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.text.endswith("data: [DONE]\n\n")
+    assert captured["authorization"] == "Bearer backend-internal-key"
+    assert captured["path"] == "/v1/chat/completions"
+    assert json.loads(captured["body"])["stream"] is True
+
+
+def test_test_proxy_requires_session_csrf_and_allowlist(monkeypatch):
+    _configure(monkeypatch)
+    app.state.backend_transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"status": "ok"})
+    )
+    with TestClient(app) as client:
+        assert client.get("/api/test/health").status_code == 401
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        assert login.status_code == 200
+        assert client.post("/api/test/ask", json={"query": "hello"}).status_code == 403
+        assert client.get("/api/test/not-allowed").status_code == 404
+        assert client.get("/api/test/health").status_code == 200
+
+
 def test_invalid_credentials_are_generic(monkeypatch):
     _configure(monkeypatch)
     with TestClient(app) as client:
@@ -293,6 +400,10 @@ def test_proxy_rejects_missing_session_and_disallowed_path(monkeypatch):
         login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
         assert login.status_code == 200
         assert client.get("/api/admin/not-allowed").status_code == 404
+        assert client.post(
+            "/api/admin/documents",
+            headers={"X-CSRF-Token": login.json()["csrf_token"]},
+        ).status_code == 404
 
 
 def test_session_is_invalidated_when_configured_username_changes(monkeypatch):

@@ -45,6 +45,7 @@ def test_admin_ui_end_to_end(tmp_path):
         "ADMIN_UI_COOKIE_SECURE": "false",
         "BACKEND_BASE_URL": f"http://127.0.0.1:{backend_port}",
         "BACKEND_ADMIN_API_KEY": "smoke-backend-key",
+        "BACKEND_INTERNAL_API_KEY": "smoke-internal-key",
         "FAKE_CORPUS_STATUS_FAIL": "false",
         "FAKE_INGESTION_STATUS_DELAY_S": "0",
         "FAKE_OCR_DEFAULT": "true",
@@ -142,6 +143,56 @@ def test_admin_ui_end_to_end(tmp_path):
                 page.click("#confirmAction")
             expect(page.locator("#documentsTable tbody tr")).to_have_count(0)
 
+            page.click('[data-view="testing"]')
+            expect(page.locator("#testingView")).to_be_visible()
+            page.click("#testHealthButton")
+            expect(page.locator("#testHealthOutput")).to_contain_text("HTTP 200")
+            expect(page.locator("#scenarioList option")).to_have_count(1)
+
+            page.click('[data-test-view="ask"]')
+            page.click("#testAskButton")
+            expect(page.locator("#testAskOutput")).to_contain_text("Вода кипит")
+
+            page.click('[data-test-view="chat"]')
+            page.click("#testChatButton")
+            expect(page.locator("#testChatOutput")).to_contain_text("Теплопроводность")
+            expect(page.locator("#testChatOutput")).to_contain_text("Готово")
+
+            page.click('[data-test-view="hint"]')
+            page.click("#testHintButton")
+            expect(page.locator("#testHintOutput")).to_contain_text("Следите за температурой")
+
+            audio_file = {"name": "question.wav", "mimeType": "audio/wav", "buffer": b"RIFFtest"}
+            page.click('[data-test-view="stt"]')
+            page.set_input_files("#testSttFile", audio_file)
+            page.click("#testSttButton")
+            expect(page.locator("#testSttOutput")).to_contain_text("Что такое кипение")
+
+            page.click('[data-test-view="tts"]')
+            page.click("#testTtsButton")
+            expect(page.locator("#testTtsOutput audio")).to_have_count(1)
+
+            page.click('[data-test-view="voice"]')
+            page.set_input_files("#testVoiceFile", audio_file)
+            page.click("#testVoiceButton")
+            expect(page.locator("#testVoiceOutput")).to_contain_text("Что такое кипение")
+            expect(page.locator("#testVoiceOutput")).to_contain_text("парообразование")
+            expect(page.locator("#testVoiceOutput audio")).to_have_count(1)
+            api_test_screenshot = tmp_path / "admin-ui-api-test-desktop.png"
+            page.screenshot(path=str(api_test_screenshot), full_page=True)
+
+            page.click("#logoutButton")
+            expect(page.locator("#loginView")).to_be_visible()
+            page.fill("#username", "admin")
+            page.fill("#password", "secret")
+            page.click("#loginForm button[type=submit]")
+            expect(page.locator("#appView")).to_be_visible()
+            expect(page.locator("#testVoiceOutput")).to_be_empty()
+            expect(page.locator("#testVoiceOutput audio")).to_have_count(0)
+            expect(page.locator("#testVoiceFileName")).to_have_text("Файл не выбран")
+            assert page.locator("#testVoiceFile").evaluate("input => input.files.length") == 0
+            assert page.evaluate("testState.scenariosLoaded") is False
+
             mobile = browser.new_page(viewport={"width": 390, "height": 844})
             mobile.goto(f"http://127.0.0.1:{ui_port}")
             mobile.fill("#username", "admin")
@@ -162,11 +213,18 @@ def test_admin_ui_end_to_end(tmp_path):
             assert topbar_box and tabs_box and table_box
             assert topbar_box["y"] + topbar_box["height"] <= tabs_box["y"] + 1
             assert tabs_box["y"] + tabs_box["height"] <= table_box["y"] + 1
+            mobile.click('[data-view="testing"]')
+            mobile.click('[data-test-view="voice"]')
+            expect(mobile.locator('[data-test-panel="voice"]')).to_be_visible()
+            assert mobile.evaluate(
+                "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+            )
             mobile_screenshot = tmp_path / "admin-ui-mobile.png"
             mobile.screenshot(path=str(mobile_screenshot), full_page=True)
 
             browser.close()
             assert desktop_screenshot.stat().st_size > 1000
+            assert api_test_screenshot.stat().st_size > 1000
             assert mobile_screenshot.stat().st_size > 1000
     finally:
         ui.terminate()
@@ -190,6 +248,7 @@ def test_ocr_default_survives_corpus_failure_and_early_operator_override():
         "ADMIN_UI_COOKIE_SECURE": "false",
         "BACKEND_BASE_URL": f"http://127.0.0.1:{backend_port}",
         "BACKEND_ADMIN_API_KEY": "smoke-backend-key",
+        "BACKEND_INTERNAL_API_KEY": "smoke-internal-key",
         "FAKE_CORPUS_STATUS_FAIL": "true",
         "FAKE_INGESTION_STATUS_DELAY_S": "1",
         "FAKE_OCR_DEFAULT": "true",

@@ -74,6 +74,7 @@ services:
       - ADMIN_UI_COOKIE_SECURE=${ADMIN_UI_COOKIE_SECURE:-true}
       - BACKEND_BASE_URL=http://api:8000
       - BACKEND_ADMIN_API_KEY=${ADMIN_API_KEY}
+      - BACKEND_INTERNAL_API_KEY=${INTERNAL_API_KEY}
     depends_on:
       - api
     restart: unless-stopped
