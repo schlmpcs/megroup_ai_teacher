@@ -43,7 +43,9 @@ def test_omnivoice_model_receives_normalized_kazakh_text(monkeypatch):
         "және эй ай бар."
     )
     assert call["language"] == "Kazakh"
-    assert call["instruct"] == "male, young adult, moderate pitch"
+    assert call["instruct"] == (
+        "male, young adult, calm teacher, clear articulation, moderate pitch"
+    )
     assert "normalize_text" not in call
 
 

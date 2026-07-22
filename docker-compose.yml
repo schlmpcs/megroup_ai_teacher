@@ -116,7 +116,7 @@ services:
 
   # Kazakh TTS uses a separate service because OmniVoice requires Transformers
   # 5.x while the Russian Qwen backend above is pinned to Transformers 4.57.3.
-  # It exposes only the fixed `male, young adult, moderate pitch` profile.
+  # It exposes only the fixed calm young-male teacher profile.
   voice-omnivoice:
     build: ./voice_omnivoice
     ports:
@@ -125,7 +125,7 @@ services:
       - omnivoice_hf_cache:/models/hf_cache
     environment:
       - OMNIVOICE_MODEL=${OMNIVOICE_MODEL:-shyngys879/KazakhTTS-OmniVoice}
-      - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, moderate pitch}
+      - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, calm teacher, clear articulation, moderate pitch}
       - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
       - OMNIVOICE_NORMALIZE_KK_NUMBERS=${OMNIVOICE_NORMALIZE_KK_NUMBERS:-true}
       - OMNIVOICE_AUDIO_TOKENIZER_PATH=/models/hf_cache/higgs-audio-v2-tokenizer
