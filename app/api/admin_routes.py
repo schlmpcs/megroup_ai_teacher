@@ -341,6 +341,12 @@ async def ingestion_status():
     }
 
 
+@admin_router.post("/cache/answers/clear")
+async def clear_answers_cache_endpoint():
+    clear_answer_cache()
+    return {"cleared": True}
+
+
 @admin_router.get("/ingestion/jobs")
 async def list_ingestion_jobs(
     status_filter: str | None = Query(default=None, alias="status"),

@@ -359,3 +359,15 @@ def test_ingestion_status_reports_offline_worker(client, admin_auth):
     response = client.get("/admin/ingestion/status", headers=admin_auth)
     assert response.status_code == 200
     assert response.json()["worker"]["online"] is False
+
+
+def test_clear_answer_cache_uses_admin_boundary(client, auth, admin_auth, monkeypatch):
+    calls = []
+    monkeypatch.setattr(admin_routes, "clear_answer_cache", lambda: calls.append(True))
+
+    denied = client.post("/admin/cache/answers/clear", headers=auth)
+    allowed = client.post("/admin/cache/answers/clear", headers=admin_auth)
+
+    assert denied.status_code == 403
+    assert allowed.json() == {"cleared": True}
+    assert calls == [True]
