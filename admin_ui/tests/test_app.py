@@ -42,6 +42,25 @@ def test_login_sets_http_only_cookie_and_returns_csrf(monkeypatch):
     assert "SameSite=strict" in response.headers["set-cookie"]
 
 
+def test_index_serves_operator_shell_without_backend_secrets(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert "VR AI Assistant Admin" in response.text
+    assert "backend-admin-key" not in response.text
+    assert "BACKEND_BASE_URL" not in response.text
+
+
+def test_static_javascript_never_uses_browser_storage(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert "localStorage" not in response.text
+    assert "sessionStorage" not in response.text
+
+
 def test_mutating_proxy_requires_csrf(monkeypatch):
     _configure(monkeypatch)
     with TestClient(app) as client:
