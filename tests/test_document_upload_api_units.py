@@ -1,7 +1,8 @@
 import pytest
 from fastapi import HTTPException
 
-import app.api.routes as routes
+import app.api.admin_routes as admin_routes
+import app.api.upload_utils as upload_utils
 from app.services.errors import LLMTimeoutError
 
 
@@ -26,7 +27,7 @@ async def test_read_upload_rejects_oversize_before_consuming_all_chunks():
     file = _ChunkedUpload(b"ab", b"cd", b"ef", b"gh")
 
     with pytest.raises(HTTPException) as exc_info:
-        await routes._read_upload(file, max_bytes=5, chunk_size=2)
+        await upload_utils.read_upload(file, max_bytes=5, chunk_size=2)
 
     assert exc_info.value.status_code == 413
     assert exc_info.value.detail == "File exceeds maximum size of 5 bytes"
@@ -38,13 +39,13 @@ async def test_read_upload_keeps_empty_file_response():
     file = _ChunkedUpload()
 
     with pytest.raises(HTTPException) as exc_info:
-        await routes._read_upload(file, max_bytes=5, chunk_size=2)
+        await upload_utils.read_upload(file, max_bytes=5, chunk_size=2)
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Uploaded file is empty"
 
 
-def test_admin_documents_uses_document_upload_limit(client, auth, monkeypatch):
+def test_admin_documents_uses_document_upload_limit(client, admin_auth, monkeypatch):
     payload = b"x" * 20
     captured = {}
 
@@ -58,14 +59,14 @@ def test_admin_documents_uses_document_upload_limit(client, auth, monkeypatch):
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
-    monkeypatch.setattr(routes.settings, "MAX_UPLOAD_BYTES", 10)
-    monkeypatch.setattr(routes.settings, "MAX_DOCUMENT_UPLOAD_BYTES", 100)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.settings, "MAX_UPLOAD_BYTES", 10)
+    monkeypatch.setattr(admin_routes.settings, "MAX_DOCUMENT_UPLOAD_BYTES", 100)
 
     response = client.post(
         "/admin/documents",
         files={"file": ("notes.md", payload, "text/markdown")},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert response.status_code == 201
@@ -78,7 +79,9 @@ def test_admin_documents_uses_document_upload_limit(client, auth, monkeypatch):
     assert captured == {"filename": "notes.md", "raw": payload}
 
 
-def test_admin_documents_uses_configured_ocr_when_omitted(client, auth, monkeypatch):
+def test_admin_documents_uses_configured_ocr_when_omitted(
+    client, admin_auth, monkeypatch
+):
     captured = {}
 
     async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
@@ -90,13 +93,13 @@ def test_admin_documents_uses_configured_ocr_when_omitted(client, auth, monkeypa
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.settings, "OCR_ENABLED", True)
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.settings, "OCR_ENABLED", True)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
 
     response = client.post(
         "/admin/documents",
         files={"file": ("notes.md", b"notes", "text/markdown")},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert response.status_code == 201
@@ -108,7 +111,7 @@ def test_admin_documents_uses_configured_ocr_when_omitted(client, auth, monkeypa
     [(True, "false", False), (False, "true", True)],
 )
 def test_admin_documents_explicit_ocr_overrides_setting(
-    client, auth, monkeypatch, configured, requested, expected
+    client, admin_auth, monkeypatch, configured, requested, expected
 ):
     captured = {}
 
@@ -121,14 +124,14 @@ def test_admin_documents_explicit_ocr_overrides_setting(
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.settings, "OCR_ENABLED", configured)
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.settings, "OCR_ENABLED", configured)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
 
     response = client.post(
         "/admin/documents",
         files={"file": ("notes.md", b"notes", "text/markdown")},
         data={"ocr": requested},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert response.status_code == 201
@@ -136,20 +139,22 @@ def test_admin_documents_explicit_ocr_overrides_setting(
 
 
 def test_admin_documents_clears_cache_after_ambiguous_write(
-    client, auth, monkeypatch
+    client, admin_auth, monkeypatch
 ):
     clears = []
 
     async def _upload(*args, **kwargs):
         raise LLMTimeoutError("write outcome unknown")
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
-    monkeypatch.setattr(routes, "clear_answer_cache", lambda: clears.append(True))
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(
+        admin_routes, "clear_answer_cache", lambda: clears.append(True)
+    )
 
     response = client.post(
         "/admin/documents",
         files={"file": ("notes.md", b"notes", "text/markdown")},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert response.status_code == 504

@@ -39,23 +39,25 @@ def _extract_token(api_key: str) -> str:
     return raw_value
 
 
-async def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    """Validate the caller's bearer token against INTERNAL_API_KEY.
-
-    Suitable for a trusted client (the VR app) talking to the proxy. The proxy
-    is what holds the real OpenAI key, so this token never grants OpenAI access
-    directly — it only authorises use of this service.
-    """
+def _verify_header(api_key: str | None, candidate: str) -> str:
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing Authorization Header",
         )
-
     token = _extract_token(api_key)
-    if not _token_matches(token, settings.INTERNAL_API_KEY):
+    if not _token_matches(token, candidate):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Could not validate credentials",
         )
     return token
+
+
+async def verify_api_key(api_key: str = Security(api_key_header)) -> str:
+    """Validate the caller's bearer token against INTERNAL_API_KEY."""
+    return _verify_header(api_key, settings.INTERNAL_API_KEY)
+
+
+async def verify_admin_api_key(api_key: str = Security(api_key_header)) -> str:
+    return _verify_header(api_key, settings.ADMIN_API_KEY)

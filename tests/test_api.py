@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import app.api.admin_routes as admin_routes
 import app.api.routes as routes
 from app.services.llm import AnswerResult, LLMTimeoutError
 
@@ -1099,18 +1100,18 @@ def test_voice_ask_stream(client, auth, monkeypatch):
 # ── Admin ────────────────────────────────────────────────────────────────────
 
 
-def test_corpus_status(client, auth, monkeypatch):
+def test_corpus_status(client, admin_auth, monkeypatch):
     async def _status():
         return {"status": "ready", "file_counts": {"total": 3}}
 
-    monkeypatch.setattr(routes.ingestion, "corpus_status", _status)
-    r = client.get("/admin/corpus_status", headers=auth)
+    monkeypatch.setattr(admin_routes.ingestion, "corpus_status", _status)
+    r = client.get("/admin/corpus_status", headers=admin_auth)
     assert r.status_code == 200
     assert r.json()["file_counts"]["total"] == 3
 
 
-def test_list_scenarios_endpoint(client, auth):
-    r = client.get("/admin/scenarios", headers=auth)
+def test_list_scenarios_endpoint(client, admin_auth):
+    r = client.get("/admin/scenarios", headers=admin_auth)
     assert r.status_code == 200
     ids = [s["scenario_id"] for s in r.json()["scenarios"]]
     assert "physics_lab_02_heating" in ids
@@ -1122,7 +1123,7 @@ def test_list_scenarios_endpoint(client, auth):
     assert english["language"] == "en"
 
 
-def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
+def test_upload_general_document_remains_compatible(client, admin_auth, monkeypatch):
     call = {}
     cache_clears = []
 
@@ -1141,12 +1142,14 @@ def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
-    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(
+        admin_routes, "clear_answer_cache", lambda: cache_clears.append(True)
+    )
     r = client.post(
         "/admin/documents",
         files={"file": ("../notes.md", b"general notes", "text/markdown")},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert r.status_code == 201
@@ -1166,7 +1169,7 @@ def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
     assert cache_clears == [True]
 
 
-def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
+def test_upload_textbook_with_structured_metadata(client, admin_auth, monkeypatch):
     call = {}
 
     async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
@@ -1178,7 +1181,7 @@ def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
             "chunks": 4,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
     r = client.post(
         "/admin/documents",
         files={"file": ("Physics 8.pdf", b"pdf data", "application/pdf")},
@@ -1188,7 +1191,7 @@ def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
             "grade": "8",
             "lang": "ru",
         },
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert r.status_code == 201
@@ -1204,7 +1207,7 @@ def test_upload_textbook_with_structured_metadata(client, auth, monkeypatch):
     assert call["doc_key"] == metadata["source"]
 
 
-def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
+def test_upload_lab_instruction_builds_lab_id(client, admin_auth, monkeypatch):
     call = {}
 
     async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
@@ -1216,7 +1219,7 @@ def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
             "chunks": 2,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
     r = client.post(
         "/admin/documents",
         files={"file": ("Lab 2.docx", b"docx data", "application/octet-stream")},
@@ -1227,7 +1230,7 @@ def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
             "lang": "kk",
             "lab_number": "2",
         },
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert r.status_code == 201
@@ -1242,7 +1245,7 @@ def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
 
 
 def test_upload_english_lab_instruction_builds_english_path(
-    client, auth, monkeypatch
+    client, admin_auth, monkeypatch
 ):
     captured = {}
 
@@ -1255,7 +1258,7 @@ def test_upload_english_lab_instruction_builds_english_path(
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
     r = client.post(
         "/admin/documents",
         files={"file": ("Lab work No. 2.docx", b"docx", "application/octet-stream")},
@@ -1266,7 +1269,7 @@ def test_upload_english_lab_instruction_builds_english_path(
             "lang": "en",
             "lab_number": "2",
         },
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert r.status_code == 201
@@ -1274,7 +1277,7 @@ def test_upload_english_lab_instruction_builds_english_path(
     assert captured["doc_key"] == "admin_uploads/lab_instruction/physics-10-en-02"
 
 
-def test_upload_forwards_ocr_flag(client, auth, monkeypatch):
+def test_upload_forwards_ocr_flag(client, admin_auth, monkeypatch):
     call = {}
 
     async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
@@ -1286,12 +1289,12 @@ def test_upload_forwards_ocr_flag(client, auth, monkeypatch):
             "chunks": 1,
         }
 
-    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
     r = client.post(
         "/admin/documents",
         files={"file": ("scan.pdf", b"scanned pdf", "application/pdf")},
         data={"ocr": "true"},
-        headers=auth,
+        headers=admin_auth,
     )
 
     assert r.status_code == 201
@@ -1318,12 +1321,12 @@ def test_upload_forwards_ocr_flag(client, auth, monkeypatch):
         },
     ],
 )
-def test_upload_invalid_metadata_combination_400(client, auth, metadata):
+def test_upload_invalid_metadata_combination_400(client, admin_auth, metadata):
     r = client.post(
         "/admin/documents",
         files={"file": ("document.pdf", b"pdf data", "application/pdf")},
         data=metadata,
-        headers=auth,
+        headers=admin_auth,
     )
     assert r.status_code == 400
 
@@ -1338,52 +1341,58 @@ def test_upload_invalid_metadata_combination_400(client, auth, metadata):
         {"doc_type": "lab_instruction", "lab_number": "100"},
     ],
 )
-def test_upload_enum_and_range_validation_422(client, auth, metadata):
+def test_upload_enum_and_range_validation_422(client, admin_auth, metadata):
     r = client.post(
         "/admin/documents",
         files={"file": ("document.pdf", b"pdf data", "application/pdf")},
         data=metadata,
-        headers=auth,
+        headers=admin_auth,
     )
     assert r.status_code == 422
 
 
-def test_upload_unsupported_type_400(client, auth):
+def test_upload_unsupported_type_400(client, admin_auth):
     r = client.post(
         "/admin/documents",
         files={"file": ("notes.xyz", b"data", "application/octet-stream")},
-        headers=auth,
+        headers=admin_auth,
     )
     assert r.status_code == 400
 
 
-def test_delete_document_clears_answer_cache(client, auth, monkeypatch):
+def test_delete_document_clears_answer_cache(client, admin_auth, monkeypatch):
     cache_clears = []
 
     async def _delete(file_id):
         assert file_id == "chemistry-book"
         return True
 
-    monkeypatch.setattr(routes.ingestion, "delete_document", _delete)
-    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
+    monkeypatch.setattr(admin_routes.ingestion, "delete_document", _delete)
+    monkeypatch.setattr(
+        admin_routes, "clear_answer_cache", lambda: cache_clears.append(True)
+    )
 
-    r = client.delete("/admin/documents/chemistry-book", headers=auth)
+    r = client.delete("/admin/documents/chemistry-book", headers=admin_auth)
 
     assert r.status_code == 200
     assert r.json() == {"deleted": True, "file_id": "chemistry-book"}
     assert cache_clears == [True]
 
 
-def test_delete_missing_document_does_not_clear_answer_cache(client, auth, monkeypatch):
+def test_delete_missing_document_does_not_clear_answer_cache(
+    client, admin_auth, monkeypatch
+):
     cache_clears = []
 
     async def _delete(file_id):
         return False
 
-    monkeypatch.setattr(routes.ingestion, "delete_document", _delete)
-    monkeypatch.setattr(routes, "clear_answer_cache", lambda: cache_clears.append(True))
+    monkeypatch.setattr(admin_routes.ingestion, "delete_document", _delete)
+    monkeypatch.setattr(
+        admin_routes, "clear_answer_cache", lambda: cache_clears.append(True)
+    )
 
-    r = client.delete("/admin/documents/missing", headers=auth)
+    r = client.delete("/admin/documents/missing", headers=admin_auth)
 
     assert r.status_code == 404
     assert cache_clears == []

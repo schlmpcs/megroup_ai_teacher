@@ -3,9 +3,11 @@
 import os
 
 os.environ.setdefault("INTERNAL_API_KEY", "test-internal-key-1234567890")
+os.environ.setdefault("ADMIN_API_KEY", "test-admin-key-1234567890")
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-key")
 os.environ.setdefault("SCENARIOS_DIR", "./scenarios")
 os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "1000")
+os.environ.setdefault("INGESTION_DATA_DIR", "/tmp/megroup-ai-ingestion-tests")
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +18,7 @@ from app.services.memory import conversation_memory
 from app.services.voice import _tts_cache
 
 AUTH = {"Authorization": "Bearer test-internal-key-1234567890"}
+ADMIN_AUTH = {"Authorization": "Bearer test-admin-key-1234567890"}
 
 
 @pytest.fixture(autouse=True)
@@ -34,3 +37,8 @@ def client():
 @pytest.fixture
 def auth():
     return dict(AUTH)
+
+
+@pytest.fixture
+def admin_auth():
+    return dict(ADMIN_AUTH)

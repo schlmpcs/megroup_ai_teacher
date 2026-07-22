@@ -4,7 +4,6 @@ import logging
 import re
 import time
 import uuid
-from pathlib import Path
 from typing import Annotated, List, Literal, NoReturn, Optional
 
 from fastapi import (
@@ -23,16 +22,15 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from app.api.upload_utils import read_upload
 from app.core.config import settings
 from app.core.languages import LanguageCode, SpeechRecognitionLanguage
 from app.core.security import verify_api_key
-from app.services import ingestion
-from app.services.corpus_meta import build_upload_metadata, compose_lab_id
+from app.services.corpus_meta import compose_lab_id
 from app.services.llm import (
-    LLMTimeoutError,
     LLMError,
-    clear_answer_cache,
     generate_answer,
+    LLMTimeoutError,
     rephrase_hint,
     resolve_answer_language,
     stream_answer,
@@ -46,7 +44,6 @@ from app.services.scenarios import (
     ScenarioNotFoundError,
     format_scenario_state,
     get_scenario_context,
-    list_scenarios,
 )
 from app.services.voice import resolve_tts_backend, synthesize, transcribe_with_language
 
@@ -535,33 +532,6 @@ async def hint_endpoint(req: HintRequest, request: Request):
     }
 
 
-async def _read_upload(
-    file: UploadFile,
-    *,
-    max_bytes: Optional[int] = None,
-    chunk_size: int = 1024 * 1024,
-) -> bytes:
-    limit = settings.MAX_UPLOAD_BYTES if max_bytes is None else max_bytes
-    chunks: list[bytes] = []
-    total = 0
-
-    while True:
-        chunk = await file.read(chunk_size)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File exceeds maximum size of {limit} bytes",
-            )
-        chunks.append(chunk)
-
-    if total == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    return b"".join(chunks)
-
-
 @router.post("/stt")
 @limiter.limit(_consumer_limit)
 async def stt_endpoint(
@@ -570,7 +540,7 @@ async def stt_endpoint(
     language: SpeechRecognitionLanguage = Form("auto"),
 ):
     """Speech-to-text with automatic RU/KK/EN detection when language is omitted."""
-    raw = await _read_upload(file)
+    raw = await read_upload(file, max_bytes=settings.MAX_UPLOAD_BYTES)
     try:
         text, resolved_language = await transcribe_with_language(
             raw,
@@ -676,7 +646,7 @@ async def voice_ask_endpoint(
         last_action=last_action,
         last_action_result=last_action_result,
     )
-    raw = await _read_upload(file)
+    raw = await read_upload(file, max_bytes=settings.MAX_UPLOAD_BYTES)
     timings: dict = {}
     requested_stt_language = language
 
@@ -849,106 +819,3 @@ async def clear_conversation(
         "conversation_id": conversation_id,
         "cleared": conversation_memory.clear(conversation_id),
     }
-
-
-# ── Admin endpoints ────────────────────────────────────────────────────────
-
-
-@router.get("/admin/corpus_status")
-async def corpus_status_endpoint():
-    try:
-        return await ingestion.corpus_status()
-    except LLMError as exc:
-        _handle_llm_error(exc)
-
-
-@router.post("/admin/documents", status_code=status.HTTP_201_CREATED)
-async def upload_document_endpoint(
-    file: UploadFile = File(...),
-    doc_type: Optional[Literal["textbook", "lab_instruction"]] = Form(None),
-    subject: Optional[Literal["physics", "chemistry", "biology"]] = Form(None),
-    grade: Optional[int] = Form(None, ge=7, le=11),
-    lang: Optional[LanguageCode] = Form(None),
-    lab_number: Optional[int] = Form(None, ge=1, le=99),
-    ocr: Optional[bool] = Form(None),
-):
-    """Upload a general document, textbook, or lab instruction into the KB."""
-    filename = Path((file.filename or "").replace("\\", "/")).name
-    suffix = Path(filename).suffix.lower()
-    if suffix not in ingestion.SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Unsupported file type '{suffix}'. Supported: "
-                f"{', '.join(sorted(ingestion.SUPPORTED_EXTENSIONS))}"
-            ),
-        )
-
-    structured_metadata_supplied = any(
-        value is not None for value in (doc_type, subject, grade, lang, lab_number)
-    )
-    try:
-        metadata, doc_key = build_upload_metadata(
-            filename,
-            doc_type=doc_type,
-            subject=subject,
-            grade=grade,
-            lang=lang,
-            lab_number=lab_number,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-
-    raw = await _read_upload(file, max_bytes=settings.MAX_DOCUMENT_UPLOAD_BYTES)
-    try:
-        result = await ingestion.upload_document(
-            filename,
-            raw,
-            metadata=metadata,
-            doc_key=doc_key,
-            ocr=settings.OCR_ENABLED if ocr is None else ocr,
-        )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    except LLMError as exc:
-        _handle_llm_error(exc)
-    finally:
-        clear_answer_cache()
-    if structured_metadata_supplied:
-        return {**result, "metadata": metadata}
-    return result
-
-
-@router.get("/admin/documents")
-async def list_documents_endpoint():
-    try:
-        return {"documents": await ingestion.list_documents()}
-    except (ValueError, LLMError) as exc:
-        if isinstance(exc, LLMError):
-            _handle_llm_error(exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-
-
-@router.delete("/admin/documents/{file_id}")
-async def delete_document_endpoint(file_id: str):
-    try:
-        deleted = await ingestion.delete_document(file_id)
-    except LLMError as exc:
-        _handle_llm_error(exc)
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Document not found"
-        )
-    clear_answer_cache()
-    return {"deleted": True, "file_id": file_id}
-
-
-@router.get("/admin/scenarios")
-async def list_scenarios_endpoint():
-    return {"scenarios": list_scenarios()}

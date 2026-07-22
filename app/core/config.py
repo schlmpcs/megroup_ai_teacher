@@ -23,13 +23,14 @@ class Settings(BaseSettings):
 
     # ── Security (required) ──────────────────────────────────────────────────
     INTERNAL_API_KEY: str = ""
+    ADMIN_API_KEY: str = ""
 
-    @field_validator("INTERNAL_API_KEY")
+    @field_validator("INTERNAL_API_KEY", "ADMIN_API_KEY")
     @classmethod
-    def _must_not_be_default(cls, v: str) -> str:
+    def _must_not_be_default(cls, v: str, info) -> str:
         if v in _DEFAULT_SECRETS:
             raise ValueError(
-                "INTERNAL_API_KEY must be set to a strong secret "
+                f"{info.field_name} must be set to a strong secret "
                 '(generate with: python -c "import secrets; print(secrets.token_urlsafe(32))")'
             )
         return v
@@ -76,6 +77,10 @@ class Settings(BaseSettings):
     # written. Metadata (subject/grade/lang/lab_id) is derived from the paths.
     CORPUS_ROOT: str = "./Лабораторные физхимбио"
     LABS_MANIFEST: str = "./labs.json"
+    INGESTION_DATA_DIR: str = "./data/ingestion"
+    INGESTION_BATCH_MAX_FILES: int = 100
+    INGESTION_BATCH_MAX_BYTES: int = 1_073_741_824
+    INGESTION_API_BASE_URL: str = "http://localhost:8000"
 
     # ── OCR fallback (opt-in; ingest-time only, server-side) ─────────────────
     # Some textbooks are scanned page-images with no text layer. When OCR_ENABLED
@@ -182,6 +187,7 @@ settings = Settings()
 
 _REQUIRED_ENV_VARS = [
     "INTERNAL_API_KEY",
+    "ADMIN_API_KEY",
     "OPENAI_API_KEY",
 ]
 

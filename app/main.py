@@ -9,6 +9,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.api.admin_routes import admin_router
 from app.api.routes import limiter, router
 from app.core.config import missing_required_env_vars, settings
 from app.core.languages import SUPPORTED_LANGUAGES
@@ -76,6 +77,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(admin_router)
 
 
 @app.get("/health")
