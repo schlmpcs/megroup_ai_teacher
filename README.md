@@ -89,7 +89,7 @@ docker compose up --build     # 7 сервисов (порты ниже)
 
 ### Operator UI
 
-Хеш пароля для operator UI:
+Generate the operator UI password hash:
 
 ```bash
 python -m admin_ui.hash_password
@@ -97,10 +97,12 @@ docker compose up -d --build api ingestion-worker admin-ui
 open http://localhost:8004
 ```
 
-Для production обязателен HTTPS. `BACKEND_ADMIN_API_KEY` остаётся только на
-сервере и браузеру не выдаётся. Prune доступен только для full-root запуска без
-`Relative subtree`. Upload-артефакты и история очереди сохраняются до удаления
-соответствующей job из UI.
+Local HTTP testing at `http://localhost:8004` requires
+`ADMIN_UI_COOKIE_SECURE=false`. Restore `ADMIN_UI_COOKIE_SECURE=true` in
+production behind HTTPS. `BACKEND_ADMIN_API_KEY` stays server-side and is never
+sent to the browser. Prune is available only for a full-root run with an empty
+`Relative subtree`. Upload artifacts and retained job history remain until the
+terminal job is deleted from the UI.
 
 Локальная разработка прокси (Qdrant и embedder при этом удобно держать в Docker):
 
