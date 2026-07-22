@@ -1,12 +1,13 @@
 import io
 import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
-from app.config import Settings
+from ..config import Settings
 
 
 class LocalWhisperSttBackend:
@@ -15,11 +16,13 @@ class LocalWhisperSttBackend:
         self.loaded: list[str] = []
         self._processors: dict[str, Any] = {}
         self._model: Any = None
-        self._inference_lock: Any = None
+        self._inference_gate = threading.Lock()
+        self._inference_state_lock = threading.Lock()
+        self._pending_real_inferences = 0
+        self._last_real_inference_completed_at = time.monotonic()
+        self._last_warmup_completed_at = time.monotonic()
 
     def load_models(self) -> None:
-        import threading
-
         import torch
         from peft import PeftModel
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
@@ -54,10 +57,93 @@ class LocalWhisperSttBackend:
 
         self._processors = {"kk": kk_processor, "ru": ru_processor}
         self._model = shared_model
-        self._inference_lock = threading.Lock()
         self.loaded = ["stt_kk", "stt_ru"]
 
     def transcribe(self, audio_bytes: bytes, language: str = "auto") -> dict:
+        with self._inference_state_lock:
+            self._pending_real_inferences += 1
+
+        self._inference_gate.acquire()
+        try:
+            return self._transcribe_reserved(audio_bytes, language)
+        finally:
+            with self._inference_state_lock:
+                self._pending_real_inferences -= 1
+                self._last_real_inference_completed_at = time.monotonic()
+            self._inference_gate.release()
+
+    def warm_up(
+        self,
+        probes: Mapping[str, bytes],
+        *,
+        blocking: bool = True,
+        min_real_idle_s: float = 0.0,
+        min_warmup_interval_s: float = 0.0,
+    ) -> bool:
+        """Run explicit-language inference without counting it as real activity.
+
+        Periodic callers use ``blocking=False`` so a real request that has
+        already reserved the backend causes an immediate skip. The idle check
+        is repeated after reservation to close the race with a real request
+        completing between the first timestamp read and lock acquisition.
+        """
+        if min_real_idle_s < 0:
+            raise ValueError("min_real_idle_s must be non-negative")
+        if min_warmup_interval_s < 0:
+            raise ValueError("min_warmup_interval_s must be non-negative")
+
+        if blocking:
+            self._inference_gate.acquire()
+        else:
+            with self._inference_state_lock:
+                now = time.monotonic()
+                if self._pending_real_inferences or not self._warmup_is_due(
+                    now,
+                    min_real_idle_s=min_real_idle_s,
+                    min_warmup_interval_s=min_warmup_interval_s,
+                ):
+                    return False
+                if not self._inference_gate.acquire(blocking=False):
+                    return False
+
+        attempted = False
+        try:
+            with self._inference_state_lock:
+                now = time.monotonic()
+                if self._pending_real_inferences or not self._warmup_is_due(
+                    now,
+                    min_real_idle_s=min_real_idle_s,
+                    min_warmup_interval_s=min_warmup_interval_s,
+                ):
+                    return False
+
+            attempted = True
+            for language, audio_bytes in probes.items():
+                if language not in self._processors:
+                    raise ValueError(f"unsupported STT warm-up language: {language}")
+                self._transcribe_reserved(audio_bytes, language)
+            return True
+        finally:
+            if attempted:
+                with self._inference_state_lock:
+                    self._last_warmup_completed_at = time.monotonic()
+            self._inference_gate.release()
+
+    def _warmup_is_due(
+        self,
+        now: float,
+        *,
+        min_real_idle_s: float,
+        min_warmup_interval_s: float,
+    ) -> bool:
+        real_idle_s = now - self._last_real_inference_completed_at
+        since_warmup_s = now - self._last_warmup_completed_at
+        return (
+            real_idle_s >= min_real_idle_s
+            and since_warmup_s >= min_warmup_interval_s
+        )
+
+    def _transcribe_reserved(self, audio_bytes: bytes, language: str) -> dict:
         import torch
 
         audio, sampling_rate = self._decode_audio(audio_bytes)
@@ -73,24 +159,23 @@ class LocalWhisperSttBackend:
         input_features = inputs.input_features.to(torch_device, dtype=model_dtype)
 
         t0 = time.time()
-        with self._inference_lock:
-            if resolved_language == "kk":
+        if resolved_language == "kk":
+            with torch.no_grad():
+                predicted_ids = self._model.generate(
+                    input_features,
+                    language="kazakh",
+                    task="transcribe",
+                    max_new_tokens=225,
+                )
+        else:
+            with self._model.disable_adapter():
                 with torch.no_grad():
                     predicted_ids = self._model.generate(
                         input_features,
-                        language="kazakh",
+                        language="russian",
                         task="transcribe",
                         max_new_tokens=225,
                     )
-            else:
-                with self._model.disable_adapter():
-                    with torch.no_grad():
-                        predicted_ids = self._model.generate(
-                            input_features,
-                            language="russian",
-                            task="transcribe",
-                            max_new_tokens=225,
-                        )
         elapsed_ms = int((time.time() - t0) * 1000)
 
         text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
@@ -118,10 +203,9 @@ class LocalWhisperSttBackend:
             sampling_rate=16000,
             return_tensors="pt",
         ).input_features.to(torch_device, dtype=model_dtype)
-        with self._inference_lock:
-            with self._model.disable_adapter():
-                with torch.no_grad():
-                    detected = self._model.detect_language(inputs)
+        with self._model.disable_adapter():
+            with torch.no_grad():
+                detected = self._model.detect_language(inputs)
 
         lang_str = "russian"
         if torch.is_tensor(detected) and detected.numel() > 0:

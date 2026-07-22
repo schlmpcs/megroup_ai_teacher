@@ -36,6 +36,13 @@ def _bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean value")
 
 
+def _positive_float_env(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     stt_kk_model: str = os.getenv(
@@ -70,6 +77,16 @@ class Settings:
     tts_normalize_ru_numbers: bool = _bool_env("TTS_NORMALIZE_RU_NUMBERS", True)
     device: str = DEVICE
     hf_cache: str = os.getenv("HF_HOME", "/models/hf_cache")
+    stt_keep_warm_enabled: bool = _bool_env("STT_KEEP_WARM_ENABLED", True)
+    stt_keep_warm_real_idle_s: float = _positive_float_env(
+        "STT_KEEP_WARM_REAL_IDLE_S", 180.0
+    )
+    stt_keep_warm_interval_s: float = _positive_float_env(
+        "STT_KEEP_WARM_INTERVAL_S", 240.0
+    )
+    stt_keep_warm_poll_s: float = _positive_float_env(
+        "STT_KEEP_WARM_POLL_S", 15.0
+    )
     max_audio_duration_s: int = int(os.getenv("MAX_AUDIO_DURATION_S", "120"))
     max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 

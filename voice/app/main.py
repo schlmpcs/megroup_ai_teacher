@@ -2,16 +2,18 @@ import asyncio
 import base64
 import logging
 from contextlib import asynccontextmanager
-from typing import Protocol
+from contextlib import suppress
+from pathlib import Path
+from typing import Mapping, Protocol
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
-from app.config import Settings, get_settings
-from app.stt.language import normalize_stt_language
-from app.tts.language import normalize_tts_language
-from app.ui import register_ui
+from .config import Settings, get_settings
+from .stt.language import normalize_stt_language
+from .tts.language import normalize_tts_language
+from .ui import register_ui
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,15 @@ class SttBackend(Protocol):
     def load_models(self) -> None: ...
 
     def transcribe(self, audio_bytes: bytes, language: str) -> dict: ...
+
+    def warm_up(
+        self,
+        probes: Mapping[str, bytes],
+        *,
+        blocking: bool,
+        min_real_idle_s: float,
+        min_warmup_interval_s: float,
+    ) -> bool: ...
 
 
 class TtsBackend(Protocol):
@@ -82,15 +93,70 @@ class SynthesizeRequest(BaseModel):
 
 
 def _default_stt_backend(settings: Settings) -> SttBackend:
-    from app.stt.model import LocalWhisperSttBackend
+    from .stt.model import LocalWhisperSttBackend
 
     return LocalWhisperSttBackend(settings)
 
 
 def _default_tts_backend(settings: Settings) -> TtsBackend:
-    from app.tts.model import LocalTtsBackend
+    from .tts.model import LocalTtsBackend
 
     return LocalTtsBackend(settings)
+
+
+def _load_stt_warmup_probes() -> dict[str, bytes]:
+    # These clips were generated for this service with the local macOS system
+    # voices Milena ("Проверка") and Aru ("Тексеру"), then converted to 16 kHz
+    # mono PCM. Spoken probes avoid Whisper's long hallucinated decodes on tone
+    # or silence inputs.
+    probe_dir = Path(__file__).resolve().parent / "stt"
+    return {
+        "ru": (probe_dir / "warmup_ru.wav").read_bytes(),
+        "kk": (probe_dir / "warmup_kk.wav").read_bytes(),
+    }
+
+
+async def _to_thread_until_complete(function, /, *args, **kwargs):
+    """Await a worker even when shutdown cancels the surrounding task."""
+    worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with suppress(Exception):
+            await worker
+        raise
+
+
+async def _stt_keep_warm_loop(
+    stt_backend: SttBackend,
+    probes: Mapping[str, bytes],
+    *,
+    poll_s: float,
+    real_idle_s: float,
+    interval_s: float,
+) -> None:
+    while True:
+        await asyncio.sleep(poll_s)
+        try:
+            warmed = await _to_thread_until_complete(
+                stt_backend.warm_up,
+                probes,
+                blocking=False,
+                min_real_idle_s=real_idle_s,
+                min_warmup_interval_s=interval_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic STT warm-up failed")
+            continue
+
+        if warmed:
+            logger.info("Periodic STT warm-up completed for ru and kk")
+        else:
+            logger.debug(
+                "Periodic STT warm-up skipped because STT is active or not due"
+            )
 
 
 def create_app(
@@ -105,12 +171,44 @@ def create_app(
     )
     stt_backend = stt_backend or _default_stt_backend(settings)
     tts_backend = tts_backend or _default_tts_backend(settings)
+    stt_warmup_probes = _load_stt_warmup_probes()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        keep_warm_task: asyncio.Task | None = None
         await asyncio.to_thread(stt_backend.load_models)
         await asyncio.to_thread(tts_backend.load_models)
-        yield
+        warmed = await _to_thread_until_complete(
+            stt_backend.warm_up,
+            stt_warmup_probes,
+            blocking=True,
+            min_real_idle_s=0.0,
+            min_warmup_interval_s=0.0,
+        )
+        if not warmed:
+            raise RuntimeError("Startup STT warm-up could not reserve the backend")
+        logger.info("Startup STT warm-up completed for ru and kk")
+
+        if settings.stt_keep_warm_enabled:
+            keep_warm_task = asyncio.create_task(
+                _stt_keep_warm_loop(
+                    stt_backend,
+                    stt_warmup_probes,
+                    poll_s=settings.stt_keep_warm_poll_s,
+                    real_idle_s=settings.stt_keep_warm_real_idle_s,
+                    interval_s=settings.stt_keep_warm_interval_s,
+                ),
+                name="stt-keep-warm",
+            )
+        app.state.stt_keep_warm_task = keep_warm_task
+
+        try:
+            yield
+        finally:
+            if keep_warm_task is not None:
+                keep_warm_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keep_warm_task
 
     app = FastAPI(title="VRRAG STT/TTS Service", lifespan=lifespan)
     app.state.stt_backend = stt_backend
@@ -149,7 +247,7 @@ def create_app(
             )
 
         try:
-            return await asyncio.to_thread(
+            return await _to_thread_until_complete(
                 stt_backend.transcribe, audio_bytes, normalized_language
             )
         except ValueError as exc:
