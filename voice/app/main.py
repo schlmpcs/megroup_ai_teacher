@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import time
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from pathlib import Path
@@ -15,7 +16,7 @@ from .stt.language import normalize_stt_language
 from .tts.language import normalize_tts_language
 from .ui import register_ui
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 
 class SttBackend(Protocol):
@@ -137,6 +138,7 @@ async def _stt_keep_warm_loop(
 ) -> None:
     while True:
         await asyncio.sleep(poll_s)
+        started_at = time.monotonic()
         try:
             warmed = await _to_thread_until_complete(
                 stt_backend.warm_up,
@@ -152,7 +154,11 @@ async def _stt_keep_warm_loop(
             continue
 
         if warmed:
-            logger.info("Periodic STT warm-up completed for ru and kk")
+            elapsed_ms = (time.monotonic() - started_at) * 1000
+            logger.info(
+                "Periodic STT warm-up completed for ru and kk in %.0f ms",
+                elapsed_ms,
+            )
         else:
             logger.debug(
                 "Periodic STT warm-up skipped because STT is active or not due"
@@ -178,6 +184,7 @@ def create_app(
         keep_warm_task: asyncio.Task | None = None
         await asyncio.to_thread(stt_backend.load_models)
         await asyncio.to_thread(tts_backend.load_models)
+        warmup_started_at = time.monotonic()
         warmed = await _to_thread_until_complete(
             stt_backend.warm_up,
             stt_warmup_probes,
@@ -187,7 +194,11 @@ def create_app(
         )
         if not warmed:
             raise RuntimeError("Startup STT warm-up could not reserve the backend")
-        logger.info("Startup STT warm-up completed for ru and kk")
+        warmup_elapsed_ms = (time.monotonic() - warmup_started_at) * 1000
+        logger.info(
+            "Startup STT warm-up completed for ru and kk in %.0f ms",
+            warmup_elapsed_ms,
+        )
 
         if settings.stt_keep_warm_enabled:
             keep_warm_task = asyncio.create_task(
