@@ -60,6 +60,21 @@ def test_preview_uses_relative_path_identity_for_general_uploads(client, admin_a
     assert items[1]["errors"] == []
 
 
+def test_preview_preserves_legacy_identity_for_root_level_general_uploads(client, admin_auth):
+    response = client.post(
+        "/admin/ingestion/preview",
+        headers=admin_auth,
+        json={"paths": ["notes.md", "folder/notes.md", "notes.md"]},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["doc_key"] is None
+    assert items[1]["doc_key"] == "admin_uploads/general/folder/notes.md"
+    assert "duplicate document identity" in items[0]["errors"][0].lower()
+    assert "duplicate document identity" in items[2]["errors"][0].lower()
+    assert items[1]["errors"] == []
+
+
 def test_upload_job_streams_files_and_returns_202(client, admin_auth):
     manifest = [
         {
@@ -86,6 +101,18 @@ def test_upload_job_streams_files_and_returns_202(client, admin_auth):
     assert job["items"][0]["doc_key"] == "admin_uploads/textbook/physics/8/ru/Physics 8.md"
     stored = Path(ingestion_jobs.settings.INGESTION_DATA_DIR) / job["items"][0]["stored_path"]
     assert stored.read_bytes() == b"theory"
+
+
+def test_upload_job_preserves_legacy_identity_for_root_level_general_upload(client, admin_auth):
+    manifest = [{"filename": "notes.md", "relative_path": "notes.md", "ocr": False}]
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={"manifest": json.dumps(manifest)},
+    )
+    assert response.status_code == 202
+    assert response.json()["items"][0]["doc_key"] is None
 
 
 def test_upload_job_accepts_same_filename_from_different_relative_paths(client, admin_auth):

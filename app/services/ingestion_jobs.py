@@ -557,6 +557,7 @@ def cancel_pending_items(job_id: str) -> int:
 
 def request_cancel(job_id: str) -> dict:
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         job = _get_job(connection, job_id)
         if job is None:
             raise KeyError(job_id)

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -129,6 +130,37 @@ def test_cancel_running_job_is_idempotent_when_already_requested(job_dir):
     assert first["cancel_requested"] is True
     assert second["status"] == "running"
     assert second["cancel_requested"] is True
+
+
+def test_cancel_rechecks_status_after_lock_before_cancelling(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    result = {}
+
+    with ingestion_jobs.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+
+        def request():
+            result["job"] = ingestion_jobs.request_cancel(job["id"])
+
+        thread = Thread(target=request)
+        thread.start()
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'running',
+                started_at = ?,
+                current_item = NULL,
+                current_stage = NULL
+            WHERE id = ?
+            """,
+            (ingestion_jobs.now(), job["id"]),
+        )
+        connection.commit()
+        thread.join()
+
+    cancelled = result["job"]
+    assert cancelled["status"] == "running"
+    assert cancelled["cancel_requested"] is True
 
 
 def test_cancel_rejects_terminal_job(job_dir):

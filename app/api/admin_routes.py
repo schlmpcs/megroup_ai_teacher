@@ -77,8 +77,11 @@ def _validated_relative_upload_path(relative_path: str, filename: str) -> str:
     return path.as_posix()
 
 
-def _general_upload_doc_key(relative_path: str, filename: str) -> str:
-    return f"admin_uploads/general/{_validated_relative_upload_path(relative_path, filename)}"
+def _general_upload_doc_key(relative_path: str, filename: str) -> str | None:
+    validated = _validated_relative_upload_path(relative_path, filename)
+    if PurePath(validated).parts == (filename,):
+        return None
+    return f"admin_uploads/general/{validated}"
 
 
 def _preview_path(path: str) -> dict:
