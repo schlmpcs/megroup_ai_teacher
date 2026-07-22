@@ -372,6 +372,7 @@ def _refresh_job_counts(connection: sqlite3.Connection, job_id: str) -> None:
 def enqueue_upload_job(job_id: str, items: list[dict], *, retry_of: str | None = None) -> dict:
     created_at = _now()
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             INSERT INTO jobs (
@@ -558,7 +559,7 @@ def request_cancel(job_id: str) -> dict:
     with connect() as connection:
         job = _get_job(connection, job_id)
         if job is None:
-            raise ValueError(f"Unknown job: {job_id}")
+            raise KeyError(job_id)
         connection.execute(
             "UPDATE jobs SET cancel_requested = 1 WHERE id = ?",
             (job_id,),
@@ -680,7 +681,7 @@ def worker_status() -> dict:
 def retry_job(job_id: str) -> dict:
     original = get_job(job_id)
     if original is None:
-        raise ValueError(f"Unknown job: {job_id}")
+        raise KeyError(job_id)
     if original["kind"] == "corpus":
         return enqueue_corpus_job(original["options"], retry_of=original["id"])
 

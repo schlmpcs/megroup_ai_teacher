@@ -363,3 +363,10 @@ def test_cleanup_stale_tmp_surfaces_removal_failure(job_dir, monkeypatch):
     with pytest.raises(OSError, match="cannot remove"):
         ingestion_jobs.cleanup_stale_tmp()
     assert old.exists()
+
+
+def test_missing_job_actions_raise_key_error(job_dir):
+    with pytest.raises(KeyError):
+        ingestion_jobs.request_cancel("missing")
+    with pytest.raises(KeyError):
+        ingestion_jobs.retry_job("missing")
