@@ -31,6 +31,8 @@ def test_gateway_owns_public_api_port_and_routes_admin_shell():
 
     assert api and '"8001:8000"' not in api.group("body")
     assert gateway and '"8001:8080"' in gateway.group("body")
+    assert "http://127.0.0.1:8080/health" in gateway.group("body")
+    assert "http://127.0.0.1:8080/" in gateway.group("body")
     for route in ["location = /", "location /static/", "location /auth/", "location = /api/session", "location /api/admin/"]:
         assert route in config
     assert "proxy_pass http://admin-ui:8000" in config
