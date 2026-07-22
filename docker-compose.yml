@@ -125,7 +125,7 @@ services:
       - omnivoice_hf_cache:/models/hf_cache
     environment:
       - OMNIVOICE_MODEL=${OMNIVOICE_MODEL:-shyngys879/KazakhTTS-OmniVoice}
-      - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, calm teacher, clear articulation, moderate pitch}
+      - OMNIVOICE_INSTRUCT=${OMNIVOICE_INSTRUCT:-male, young adult, low pitch}
       - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
       - OMNIVOICE_NORMALIZE_KK_NUMBERS=${OMNIVOICE_NORMALIZE_KK_NUMBERS:-true}
       - OMNIVOICE_AUDIO_TOKENIZER_PATH=/models/hf_cache/higgs-audio-v2-tokenizer

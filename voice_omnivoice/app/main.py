@@ -45,8 +45,7 @@ def _env_bool(name: str, default: bool) -> bool:
 class Settings:
     model: str = os.getenv("OMNIVOICE_MODEL", "shyngys879/KazakhTTS-OmniVoice")
     instruct: str = os.getenv(
-        "OMNIVOICE_INSTRUCT",
-        "male, young adult, calm teacher, clear articulation, moderate pitch",
+        "OMNIVOICE_INSTRUCT", "male, young adult, low pitch"
     )
     steps: int = int(os.getenv("OMNIVOICE_STEPS", "24"))
     audio_tokenizer_path: str = os.getenv(

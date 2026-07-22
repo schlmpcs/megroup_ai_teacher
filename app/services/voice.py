@@ -216,7 +216,11 @@ async def synthesize(
     cached = _tts_cache.get(cache_key)
     if cached is not None:
         return cached
-    body = {"text": text, "language": lang, "speed": 1.0}
+    body = {
+        "text": text,
+        "language": lang,
+        "speed": 0.9 if selected_backend == "omnivoice" else 1.0,
+    }
     body["backend"] = selected_backend
     if voice is not None:
         body["voice"] = voice
