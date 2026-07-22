@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from typing import Match, Pattern
 
-from .formula_speech import speak_formula, speak_reaction
+from .formula_speech import PHYSICS_LETTER_NAMES_RU, speak_formula, speak_reaction
 
 
 RUSSIAN_ABBREVIATIONS = {
@@ -215,6 +215,15 @@ _NAMED_LATIN_LETTER_RE = re.compile(
     r"(?i)\b(?P<label>буква)\s+(?P<letter>[A-Z])(?!\w)"
 )
 
+_INLINE_LATEX_RE = re.compile(r"\\\((?P<body>.*?)\\\)", re.DOTALL)
+_LATEX_STYLE_RE = re.compile(
+    r"\\(?:mathbf|mathrm|mathit|mathsf|mathtt|vec)\s*\{([^{}]*)\}"
+)
+_LATEX_FRACTION_RE = re.compile(
+    r"\\(?:dfrac|frac)\s*\{([^{}]*)\}\s*\{([^{}]*)\}"
+)
+_LATEX_VARIABLE_RE = re.compile(r"(?<![A-Za-z])([A-Za-z])(?![A-Za-z])")
+
 _PHRASE_ABBREVIATIONS = (
     (re.compile(r"(?<!\w)и\s+т\s*\.\s*д\s*\.(?!\w)", re.IGNORECASE), "и так далее"),
     (
@@ -419,6 +428,38 @@ def _replace_unknown_cyrillic_acronym(match: Match[str]) -> str:
     return " ".join(RUSSIAN_LETTER_NAMES[letter] for letter in value)
 
 
+def _speak_latex_expression(value: str) -> str:
+    text = value.strip()
+    while _LATEX_STYLE_RE.search(text):
+        text = _LATEX_STYLE_RE.sub(r"\1", text)
+    while _LATEX_FRACTION_RE.search(text):
+        text = _LATEX_FRACTION_RE.sub(
+            lambda match: (
+                f"{_speak_latex_expression(match.group(1))} делённое на "
+                f"{_speak_latex_expression(match.group(2))}"
+            ),
+            text,
+        )
+    for source, spoken in (
+        (r"\cdot", " умножить на "),
+        (r"\times", " умножить на "),
+        ("=", " равно "),
+        ("/", " делённое на "),
+        ("+", " плюс "),
+    ):
+        text = text.replace(source, spoken)
+    text = _LATEX_VARIABLE_RE.sub(
+        lambda match: PHYSICS_LETTER_NAMES_RU[match.group(1).upper()], text
+    )
+    return " ".join(text.replace("{", "").replace("}", "").split())
+
+
+def _speak_inline_latex(text: str) -> str:
+    return _INLINE_LATEX_RE.sub(
+        lambda match: _speak_latex_expression(match.group("body")), text
+    )
+
+
 def normalize_russian_abbreviations(text: str) -> str:
     """Expand safe Russian abbreviations and letter sequences before TTS."""
 
@@ -467,7 +508,7 @@ def normalize_russian_tts_text(text: str) -> str:
     from .text_normalization import normalize_russian_text
 
     protector = _Protector()
-    protected = _protect_nonlinguistic(text, protector)
+    protected = _protect_nonlinguistic(_speak_inline_latex(text), protector)
     normalized = normalize_russian_abbreviations(protected)
     normalized = normalize_russian_text(normalized)
     return protector.restore(normalized)

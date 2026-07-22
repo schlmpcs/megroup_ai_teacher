@@ -144,3 +144,13 @@ def test_single_letter_prepositions_are_not_spelled_out(source):
 
 def test_letter_labels_are_still_spelled_out():
     assert normalize_russian_tts_text("Выберите вариант А.") == "Выберите вариант а."
+
+
+def test_russian_pipeline_speaks_inline_latex_newton_formula():
+    source = (
+        r"Формула: \( \mathbf{a} = \frac{\mathbf{F}}{m} \), "
+        r"где \( \mathbf{a} \), \( \mathbf{F} \) и \( m \)."
+    )
+    expected = "Формула: а равно эф делённое на эм, где а, эф и эм."
+
+    assert normalize_russian_tts_text(source) == expected
