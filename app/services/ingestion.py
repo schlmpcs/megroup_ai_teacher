@@ -19,8 +19,8 @@ The full ingest path is::
 from the path (``corpus_meta.parse_path`` -> subject/grade/lang/lab_id) and
 ingests each file with that metadata so retrieval can be scoped by lab context.
 The document id is a stable ``uuid5`` of the ``doc_key`` (the relative path for
-bulk ingest, since lab filenames repeat across grades), and existing chunks for
-that id are deleted before re-upserting.
+bulk ingest, since lab filenames repeat across grades). Re-ingest stages and
+activates a new generation before stale chunks are removed.
 
 Validation failures (unsupported extension, etc.) raise ``ValueError``; any
 embedding/vector-store failure surfaces as an ``LLMError`` subclass and is left
@@ -528,10 +528,59 @@ def to_markdown(
             f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
-    if suffix == ".pdf" and b"%PDF-" not in content[:1024]:
-        raise ValueError("Invalid PDF file")
-    if suffix in {".docx", ".epub"} and not zipfile.is_zipfile(io.BytesIO(content)):
-        raise ValueError(f"Invalid {suffix.removeprefix('.').upper()} file")
+    parsed_docx = None
+    if suffix == ".pdf":
+        if b"%PDF-" not in content[:1024]:
+            raise ValueError("Invalid PDF file")
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            len(reader.pages)
+        except Exception as exc:  # noqa: BLE001 - normalise parser failures
+            raise ValueError("Invalid PDF file") from exc
+    if suffix in {".docx", ".epub"}:
+        label = suffix.removeprefix(".").upper()
+        try:
+            if not zipfile.is_zipfile(io.BytesIO(content)):
+                raise ValueError
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                names = set(archive.namelist())
+                if suffix == ".docx" and not {
+                    "[Content_Types].xml",
+                    "word/document.xml",
+                }.issubset(names):
+                    raise ValueError
+                if suffix == ".epub":
+                    mimetype = archive.read("mimetype").decode("ascii").strip()
+                    if mimetype != "application/epub+zip":
+                        raise ValueError
+                    if "META-INF/container.xml" in names:
+                        container = ET.fromstring(
+                            archive.read("META-INF/container.xml")
+                        )
+                        if container.tag.rsplit("}", 1)[-1] != "container":
+                            raise ValueError
+                        opf_path = next(
+                            element.get("full-path")
+                            for element in container.iter()
+                            if element.tag.rsplit("}", 1)[-1] == "rootfile"
+                            and element.get("full-path")
+                        )
+                        if opf_path not in names:
+                            raise ValueError
+                        package = ET.fromstring(archive.read(opf_path))
+                        if package.tag.rsplit("}", 1)[-1] != "package":
+                            raise ValueError
+                    elif not any(
+                        name.lower().endswith(
+                            (".xhtml", ".html", ".htm", *_IMG_EXTS)
+                        )
+                        for name in names
+                    ):
+                        raise ValueError
+            if suffix == ".docx":
+                parsed_docx = docx.Document(io.BytesIO(content))
+        except Exception as exc:  # noqa: BLE001 - normalise parser failures
+            raise ValueError(f"Invalid {label} file") from exc
 
     # EPUB has its own markitdown-first-then-spine-fallback path (markitdown
     # silently under-reads the spine on these textbooks), so handle it before the
@@ -576,8 +625,9 @@ def to_markdown(
         return md
 
     if suffix == ".docx":
-        document = docx.Document(io.BytesIO(content))
-        return "\n".join(p.text for p in document.paragraphs if p.text and p.text.strip())
+        return "\n".join(
+            p.text for p in parsed_docx.paragraphs if p.text and p.text.strip()
+        )
 
     raise ValueError(f"Unsupported file type '{suffix}'")  # pragma: no cover
 
@@ -696,25 +746,28 @@ def _chunk_records(
     marker_index = 0
     for start in range(0, len(normalized), step):
         end = min(start + size, len(normalized))
-        window = normalized[start:end].strip()
+        raw_window = normalized[start:end]
+        window = raw_window.strip()
         if not window:
             continue
+        chunk_start = start + len(raw_window) - len(raw_window.lstrip())
+        chunk_end = end - (len(raw_window) - len(raw_window.rstrip()))
 
-        while marker_index < len(markers) and markers[marker_index][0] < end:
+        while marker_index < len(markers) and markers[marker_index][0] < chunk_end:
             _, kind, title = markers[marker_index]
             active[kind] = title
             marker_index += 1
 
         locator: dict = {
-            "char_start": start,
-            "char_end": end,
+            "char_start": chunk_start,
+            "char_end": chunk_end,
             **active,
         }
         pages = sorted(
             {
                 page_number
                 for page_start, page_end, page_number in (page_spans or [])
-                if start < page_end and end > page_start
+                if chunk_start < page_end and chunk_end > page_start
             }
         )
         if pages:
@@ -786,15 +839,17 @@ async def upload_document(
         "source_type", base_payload.get("doc_type") or "document"
     )
     base_payload.setdefault("file_type", suffix.removeprefix("."))
+    generation = uuid.uuid4().hex
     points = [
         {
-            "id": uuid.uuid5(_DOC_NAMESPACE, f"{key}:{i}").hex,
+            "id": uuid.uuid5(_DOC_NAMESPACE, f"{key}:{generation}:{i}").hex,
             "dense": emb.dense,
             "sparse_indices": emb.sparse_indices,
             "sparse_values": emb.sparse_values,
             "payload": {
                 **base_payload,
                 "doc_id": doc_id,
+                "generation": generation,
                 "filename": filename,
                 "chunk_index": i,
                 "chunk_count": len(chunk_records),
@@ -833,7 +888,11 @@ def _missing_metadata(meta: dict) -> list[str]:
 
 
 async def bulk_ingest_tree(
-    root: str, *, ocr: bool | None = None, only: str | None = None
+    root: str,
+    *,
+    ocr: bool | None = None,
+    only: str | None = None,
+    prune: bool = False,
 ) -> dict:
     """Walk ``root``, derive metadata from each path and ingest every file.
 
@@ -844,9 +903,18 @@ async def bulk_ingest_tree(
     to files whose path contains that substring — used to OCR just one subtree
     (e.g. ``Биология/рус``) without re-embedding the whole corpus. ``ocr`` enables
     the scanned-document OCR fallback (see :func:`to_markdown`). Per-file failures
-    are collected rather than aborting the whole run.
+    are collected rather than aborting the whole run. ``prune`` explicitly removes
+    stored corpus documents missing from this complete snapshot and cannot be
+    combined with ``only``.
     """
+    if prune and only is not None:
+        raise ValueError("prune cannot be combined with a filtered bulk ingest")
     files = iter_corpus_files(root)
+    base = Path(root)
+    current_doc_ids = {
+        _doc_id(str(path.relative_to(base)))
+        for path in files
+    }
     ocr_enabled = settings.OCR_ENABLED if ocr is None else ocr
     summary = {
         "root": root,
@@ -888,8 +956,6 @@ async def bulk_ingest_tree(
         if meta["doc_type"] == "lab_instruction"
     )
     duplicate_lab_ids = {lab_id for lab_id, count in lab_counts.items() if count > 1}
-    expected_doc_ids: set[str] = set()
-
     for path, meta in candidates:
         if meta.get("lab_id") in duplicate_lab_ids:
             summary["skipped"] += 1
@@ -900,7 +966,6 @@ async def bulk_ingest_tree(
                 }
             )
             continue
-        expected_doc_ids.add(_doc_id(meta["source"]))
         try:
             result = await upload_document(
                 path.name,
@@ -921,7 +986,7 @@ async def bulk_ingest_tree(
                 summary["documents_by_language"].get(language, 0) + 1
             )
 
-    if only is None:
+    if prune and candidates and not summary["errors"]:
         try:
             for document in await vectorstore.list_documents():
                 source = document.get("source_path")
@@ -930,7 +995,7 @@ async def bulk_ingest_tree(
                     source
                     and file_id
                     and corpus_meta.parse_path(source) is not None
-                    and file_id not in expected_doc_ids
+                    and file_id not in current_doc_ids
                     and await vectorstore.delete_document(file_id)
                 ):
                     summary["pruned"] += 1

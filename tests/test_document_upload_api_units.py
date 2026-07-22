@@ -2,6 +2,7 @@ import pytest
 from fastapi import HTTPException
 
 import app.api.routes as routes
+from app.services.errors import LLMTimeoutError
 
 
 class _ChunkedUpload:
@@ -100,3 +101,56 @@ def test_admin_documents_uses_configured_ocr_when_omitted(client, auth, monkeypa
 
     assert response.status_code == 201
     assert captured["ocr"] is True
+
+
+@pytest.mark.parametrize(
+    ("configured", "requested", "expected"),
+    [(True, "false", False), (False, "true", True)],
+)
+def test_admin_documents_explicit_ocr_overrides_setting(
+    client, auth, monkeypatch, configured, requested, expected
+):
+    captured = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, ocr=False, **_):
+        captured["ocr"] = ocr
+        return {
+            "file_id": "doc-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(routes.settings, "OCR_ENABLED", configured)
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+
+    response = client.post(
+        "/admin/documents",
+        files={"file": ("notes.md", b"notes", "text/markdown")},
+        data={"ocr": requested},
+        headers=auth,
+    )
+
+    assert response.status_code == 201
+    assert captured["ocr"] is expected
+
+
+def test_admin_documents_clears_cache_after_ambiguous_write(
+    client, auth, monkeypatch
+):
+    clears = []
+
+    async def _upload(*args, **kwargs):
+        raise LLMTimeoutError("write outcome unknown")
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    monkeypatch.setattr(routes, "clear_answer_cache", lambda: clears.append(True))
+
+    response = client.post(
+        "/admin/documents",
+        files={"file": ("notes.md", b"notes", "text/markdown")},
+        headers=auth,
+    )
+
+    assert response.status_code == 504
+    assert clears == [True]

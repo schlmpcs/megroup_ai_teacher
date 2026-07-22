@@ -3,7 +3,7 @@
 Usage:
   python -m scripts.manage_corpus create-collection
   python -m scripts.manage_corpus upload path/to/file.pdf [more.docx ...]
-  python -m scripts.manage_corpus bulk-ingest [CORPUS_ROOT]   # walk tree, tag, embed
+  python -m scripts.manage_corpus bulk-ingest [CORPUS_ROOT] [--prune]
   python -m scripts.manage_corpus gen-manifest [CORPUS_ROOT] [--out labs.json]
   python -m scripts.manage_corpus list
   python -m scripts.manage_corpus status
@@ -63,8 +63,15 @@ async def _delete(doc_id: str) -> None:
     print("deleted" if ok else "not found", doc_id)
 
 
-async def _bulk_ingest(root: str, ocr: bool | None = None, only: str | None = None) -> dict:
-    summary = await ingestion.bulk_ingest_tree(root, ocr=ocr, only=only)
+async def _bulk_ingest(
+    root: str,
+    ocr: bool | None = None,
+    only: str | None = None,
+    prune: bool = False,
+) -> dict:
+    summary = await ingestion.bulk_ingest_tree(
+        root, ocr=ocr, only=only, prune=prune
+    )
     print(
         f"Bulk ingest of {summary['root']}: "
         f"{summary['ready']} ready, {summary['empty']} empty, "
@@ -112,6 +119,11 @@ def main() -> None:
         help="Only ingest files whose path contains this substring "
         "(keeps the root so doc_ids stay stable, e.g. --only 'Биология/рус')",
     )
+    p_bulk.add_argument(
+        "--prune",
+        action="store_true",
+        help="Delete stored corpus documents absent from this complete snapshot",
+    )
 
     p_manifest = sub.add_parser("gen-manifest", help="Report lab completeness (no embedding)")
     p_manifest.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
@@ -130,11 +142,14 @@ def main() -> None:
     elif args.cmd == "upload":
         asyncio.run(_upload(args.paths))
     elif args.cmd == "bulk-ingest":
+        if args.prune and args.only is not None:
+            parser.error("--prune cannot be combined with --only")
         summary = asyncio.run(
             _bulk_ingest(
                 args.root,
                 ocr=settings.OCR_ENABLED if args.ocr is None else args.ocr,
                 only=args.only,
+                prune=args.prune,
             )
         )
         if summary.get("errors"):

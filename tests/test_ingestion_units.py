@@ -10,6 +10,7 @@ rather than indexed as noise, and that good markitdown output is still trusted.
 import io
 import zipfile
 
+import pypdf
 import pytest
 
 from app.services import ingestion
@@ -35,6 +36,14 @@ _CONTAINER_XML = (
     '<rootfile full-path="{opf}" media-type="application/oebps-package+xml"/>'
     "</rootfiles></container>"
 )
+
+
+def _pdf() -> bytes:
+    buffer = io.BytesIO()
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(buffer)
+    return buffer.getvalue()
 
 
 def _opf(spine_items: list[tuple[str, str]]) -> str:
@@ -147,7 +156,7 @@ def test_image_only_epub_skipped_and_logged(caplog):
 
 
 def test_alphabetical_fallback_without_container_or_opf():
-    # No container.xml / OPF -> fall back to every xhtml, alphabetical.
+    # Some legacy corpus EPUBs only carry the mimetype plus XHTML members.
     epub = _make_epub(
         {
             "text/00.xhtml": _xhtml(f"<p>{_RU}</p>"),
@@ -201,7 +210,7 @@ def test_pdf_cleanup_removes_okulyk_notice_and_page_artifacts(monkeypatch):
     )
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: extracted)
 
-    text = ingestion.to_markdown("Химия 8.pdf", b"%PDF-fake")
+    text = ingestion.to_markdown("Химия 8.pdf", _pdf())
 
     assert text == book_text
     assert "OKULYK" not in text
@@ -226,7 +235,7 @@ def test_pdf_cleanup_preserves_repeated_textbook_paragraphs():
 def test_english_pdf_text_is_not_low_quality_without_cyrillic(monkeypatch):
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: _EN)
 
-    text = ingestion.to_markdown("Biology Grade 9.pdf", b"%PDF-fake", lang="en")
+    text = ingestion.to_markdown("Biology Grade 9.pdf", _pdf(), lang="en")
 
     assert text == _EN.strip()
     assert not ingestion._is_low_quality_pdf_extraction(_EN, text)

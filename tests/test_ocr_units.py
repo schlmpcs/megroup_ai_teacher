@@ -13,6 +13,8 @@ The image-member resolver is tested directly with synthetic (text) zip members.
 import io
 import zipfile
 
+import pypdf
+
 from app.services import ingestion
 
 # Russian prose long enough to clear the image-only word threshold.
@@ -30,6 +32,14 @@ _CONTAINER_XML = (
     '<rootfile full-path="{opf}" media-type="application/oebps-package+xml"/>'
     "</rootfiles></container>"
 )
+
+
+def _pdf() -> bytes:
+    buffer = io.BytesIO()
+    writer = pypdf.PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(buffer)
+    return buffer.getvalue()
 
 
 def _opf(items: list[tuple[str, str]]) -> str:
@@ -162,8 +172,7 @@ def test_epub_ocr_on_but_empty_result_still_skips(monkeypatch):
 
 def test_pdf_ocr_on_recovers_text(monkeypatch):
     # markitdown returns a thin (sub-threshold) string for a scanned PDF; OCR on
-    # renders + recovers the real text. We never build a real PDF: _ocr_pdf is
-    # mocked, and the thin markitdown result keeps us off the pypdf path.
+    # renders + recovers the real text. _ocr_pdf is mocked.
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: "12 ")
     captured = {}
 
@@ -173,7 +182,7 @@ def test_pdf_ocr_on_recovers_text(monkeypatch):
 
     monkeypatch.setattr(ingestion, "_ocr_pdf", fake_ocr_pdf)
     text = ingestion.to_markdown(
-        "Биология 8 каз.pdf", b"%PDF-fake", ocr=True, lang="kk"
+        "Биология 8 каз.pdf", _pdf(), ocr=True, lang="kk"
     )
     assert "Клеточная мембрана" in text
     assert captured["lang"] == "kaz"  # kk -> kaz
@@ -187,7 +196,7 @@ def test_pdf_ocr_off_returns_thin_text(monkeypatch):
         raise AssertionError("OCR must not run when ocr=False")
 
     monkeypatch.setattr(ingestion, "_ocr_pdf", _boom)
-    text = ingestion.to_markdown("scan.pdf", b"%PDF-fake")
+    text = ingestion.to_markdown("scan.pdf", _pdf())
     assert text == "12 abc"
 
 
@@ -200,7 +209,7 @@ def test_pdf_ocr_kept_only_if_better(monkeypatch):
         raise AssertionError("OCR must not run when text is already present")
 
     monkeypatch.setattr(ingestion, "_ocr_pdf", _boom)
-    text = ingestion.to_markdown("good.pdf", b"%PDF-fake", ocr=True, lang="ru")
+    text = ingestion.to_markdown("good.pdf", _pdf(), ocr=True, lang="ru")
     assert text == rich.strip()
 
 
@@ -221,7 +230,7 @@ def test_pdf_high_word_count_okulyk_text_triggers_ocr(monkeypatch):
         return f"| page1 | | 1 |\n{_RU}\nВсе учебники Казахстана на OKULYK.KZ"
 
     monkeypatch.setattr(ingestion, "_ocr_pdf", fake_ocr)
-    text = ingestion.to_markdown("Химия 8.pdf", b"%PDF-fake", ocr=True, lang="kk")
+    text = ingestion.to_markdown("Химия 8.pdf", _pdf(), ocr=True, lang="kk")
 
     assert called == ["kaz"]
     assert "Клеточная мембрана" in text
@@ -236,7 +245,7 @@ def test_pdf_unknown_extreme_repetition_triggers_ocr(monkeypatch):
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: corrupt)
     monkeypatch.setattr(ingestion, "_ocr_pdf", lambda content, lang: _RU)
 
-    text = ingestion.to_markdown("Химия 9.pdf", b"%PDF-fake", ocr=True, lang="ru")
+    text = ingestion.to_markdown("Химия 9.pdf", _pdf(), ocr=True, lang="ru")
 
     assert text == _RU.strip()
 
@@ -258,7 +267,7 @@ def test_pdf_bad_ocr_does_not_replace_cleaned_text_layer(monkeypatch):
         lambda content, lang: "неразборчивая копия страницы. " * 100,
     )
 
-    text = ingestion.to_markdown("Химия 10.pdf", b"%PDF-fake", ocr=True, lang="ru")
+    text = ingestion.to_markdown("Химия 10.pdf", _pdf(), ocr=True, lang="ru")
 
     assert "Химиялық реакция" in text
     assert "OKULYK" not in text

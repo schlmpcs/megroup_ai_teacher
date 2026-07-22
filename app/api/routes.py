@@ -916,7 +916,8 @@ async def upload_document_endpoint(
         ) from exc
     except LLMError as exc:
         _handle_llm_error(exc)
-    clear_answer_cache()
+    finally:
+        clear_answer_cache()
     if structured_metadata_supplied:
         return {**result, "metadata": metadata}
     return result

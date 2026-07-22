@@ -1,6 +1,8 @@
 """Regression tests for document replacement and bulk-ingest safety."""
 
 import asyncio
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -53,6 +55,17 @@ async def test_invalid_document_is_rejected_before_qdrant(monkeypatch):
         await ingestion.upload_document("bad.pdf", b"not a pdf")
 
 
+async def test_fake_pdf_magic_is_parsed_before_qdrant(monkeypatch):
+    async def unexpected_ensure():
+        raise AssertionError("Qdrant must not be contacted for invalid input")
+
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: "text")
+    monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", unexpected_ensure)
+
+    with pytest.raises(ValueError, match="Invalid PDF"):
+        await ingestion.upload_document("fake.pdf", b"%PDF-fake")
+
+
 async def test_extraction_runs_off_the_event_loop(monkeypatch):
     calls = []
     real_to_thread = asyncio.to_thread
@@ -88,6 +101,103 @@ async def test_extraction_runs_off_the_event_loop(monkeypatch):
 def test_to_markdown_rejects_mislabeled_binary_documents(filename, content):
     with pytest.raises(ValueError, match="Invalid"):
         ingestion.to_markdown(filename, content)
+
+
+@pytest.mark.parametrize("filename", ["fake.docx", "fake.epub"])
+def test_to_markdown_rejects_wrong_zip_container(filename):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("hello.txt", "not the requested document format")
+
+    with pytest.raises(ValueError, match="Invalid"):
+        ingestion.to_markdown(filename, buffer.getvalue())
+
+
+@pytest.mark.parametrize("marker", ["mimetype", "container", "opf"])
+def test_to_markdown_rejects_incomplete_epub_container(marker):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        if marker == "mimetype":
+            archive.writestr("mimetype", "application/epub+zip")
+        elif marker == "container":
+            archive.writestr("META-INF/container.xml", "<container/>")
+        else:
+            archive.writestr("content.opf", "<package/>")
+
+    with pytest.raises(ValueError, match="Invalid EPUB"):
+        ingestion.to_markdown("fake.epub", buffer.getvalue())
+
+
+@pytest.mark.parametrize("filename", ["broken.docx", "broken.epub"])
+async def test_malformed_office_container_is_value_error_before_qdrant(
+    filename, monkeypatch
+):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        if filename.endswith(".docx"):
+            archive.writestr("[Content_Types].xml", "not xml")
+            archive.writestr("word/document.xml", "not xml")
+        else:
+            archive.writestr("mimetype", "application/epub+zip")
+            archive.writestr(
+                "META-INF/container.xml",
+                '<?xml version="1.0"?><container><rootfiles><rootfile '
+                'full-path="content.opf"/></rootfiles></container>',
+            )
+            archive.writestr("content.opf", "not xml")
+
+    async def unexpected_ensure():
+        raise AssertionError("Qdrant must not be contacted for invalid input")
+
+    monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: None)
+    monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", unexpected_ensure)
+
+    with pytest.raises(ValueError, match="Invalid"):
+        await ingestion.upload_document(filename, buffer.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("container_root", "opf_root"),
+    [("not-container", "package"), ("container", "not-package")],
+)
+def test_epub_rejects_wrong_xml_roots(container_root, opf_root):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr(
+            "META-INF/container.xml",
+            f"<{container_root}><rootfile full-path='content.opf'/></{container_root}>",
+        )
+        archive.writestr("content.opf", f"<{opf_root}/>")
+
+    with pytest.raises(ValueError, match="Invalid EPUB"):
+        ingestion.to_markdown("fake.epub", buffer.getvalue())
+
+
+async def test_reingest_uses_distinct_complete_generations(monkeypatch):
+    writes = []
+
+    async def ensure_collection():
+        return None
+
+    async def upsert_points(points):
+        writes.append(points)
+        return len(points)
+
+    monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", ensure_collection)
+    monkeypatch.setattr(ingestion.vectorstore, "upsert_points", upsert_points)
+    monkeypatch.setattr(ingestion.embeddings, "embed_texts", _embeddings)
+
+    await ingestion.upload_document("notes.md", b"same text")
+    await ingestion.upload_document("notes.md", b"same text")
+
+    assert all("generation" in point["payload"] for batch in writes for point in batch)
+    assert len({point["payload"]["generation"] for point in writes[0]}) == 1
+    assert len({point["payload"]["generation"] for point in writes[1]}) == 1
+    assert writes[0][0]["payload"]["generation"] != writes[1][0]["payload"]["generation"]
+    assert {point["id"] for point in writes[0]}.isdisjoint(
+        point["id"] for point in writes[1]
+    )
 
 
 def test_lab_upload_identity_is_lab_id_not_filename():
@@ -127,6 +237,23 @@ def _book_dir(root: Path) -> Path:
 async def test_bulk_ingest_rejects_missing_root():
     with pytest.raises(ValueError, match="Corpus root"):
         await ingestion.bulk_ingest_tree("/definitely/not/a/corpus")
+
+
+@pytest.mark.parametrize("with_unrecognised_file", [False, True])
+async def test_full_bulk_ingest_does_not_prune_without_valid_candidates(
+    tmp_path, monkeypatch, with_unrecognised_file
+):
+    if with_unrecognised_file:
+        (tmp_path / "misc.md").write_text("not a corpus path", encoding="utf-8")
+
+    async def unexpected_list():
+        raise AssertionError("invalid corpus snapshots must not trigger pruning")
+
+    monkeypatch.setattr(ingestion.vectorstore, "list_documents", unexpected_list)
+
+    summary = await ingestion.bulk_ingest_tree(str(tmp_path))
+
+    assert summary["pruned"] == 0
 
 
 async def test_bulk_ingest_skips_incomplete_metadata(tmp_path, monkeypatch):
@@ -188,15 +315,46 @@ async def test_bulk_ingest_rejects_duplicate_lab_ids(tmp_path, monkeypatch):
 
     summary = await ingestion.bulk_ingest_tree(str(tmp_path))
 
-    expected_ids = {ingestion._doc_id(meta["source"]) for meta in parsed}
     assert uploads == []
-    assert set(deleted) == expected_ids
+    assert deleted == []
     assert summary["skipped"] == 2
+    assert summary["pruned"] == 0
     assert len(summary["errors"]) == 2
     assert all("Duplicate lab_id" in error["error"] for error in summary["errors"])
 
 
-async def test_full_bulk_ingest_prunes_removed_corpus_documents(tmp_path, monkeypatch):
+async def test_full_bulk_ingest_does_not_prune_skipped_existing_files(
+    tmp_path, monkeypatch
+):
+    path = _lab_dir(tmp_path) / "Electrolyte current conditions.md"
+    path.write_text("procedure", encoding="utf-8")
+    meta = corpus_meta.parse_path(str(path), corpus_root=str(tmp_path))
+    deleted = []
+
+    async def list_documents():
+        return [
+            {
+                "file_id": ingestion._doc_id(meta["source"]),
+                "source_path": meta["source"],
+            }
+        ]
+
+    async def delete_document(doc_id):
+        deleted.append(doc_id)
+        return True
+
+    monkeypatch.setattr(ingestion.vectorstore, "list_documents", list_documents)
+    monkeypatch.setattr(ingestion.vectorstore, "delete_document", delete_document)
+
+    summary = await ingestion.bulk_ingest_tree(str(tmp_path))
+
+    assert deleted == []
+    assert summary["pruned"] == 0
+
+
+async def test_full_bulk_ingest_prunes_removed_documents_only_when_requested(
+    tmp_path, monkeypatch
+):
     current = _book_dir(tmp_path) / "Biology Grade 9.md"
     current.write_text("cell theory", encoding="utf-8")
     deleted = []
@@ -231,8 +389,18 @@ async def test_full_bulk_ingest_prunes_removed_corpus_documents(tmp_path, monkey
 
     summary = await ingestion.bulk_ingest_tree(str(tmp_path))
 
+    assert deleted == []
+    assert summary["pruned"] == 0
+
+    summary = await ingestion.bulk_ingest_tree(str(tmp_path), prune=True)
+
     assert deleted == ["stale-corpus-id"]
     assert summary["pruned"] == 1
+
+
+async def test_bulk_ingest_rejects_prune_with_only(tmp_path):
+    with pytest.raises(ValueError, match="prune cannot be combined"):
+        await ingestion.bulk_ingest_tree(str(tmp_path), only="Biology", prune=True)
 
 
 async def test_bulk_ingest_uses_ocr_setting_when_unspecified(tmp_path, monkeypatch):
