@@ -4,6 +4,7 @@ const state = {
   corpusPreview: null,
   jobs: [],
   documents: [],
+  selectedJobId: null,
   activeView: "ingest",
   activeSource: "upload",
   pollTimer: null,
@@ -32,9 +33,21 @@ async function request(path, options = {}) {
 }
 
 function showLogin() {
+  stopPolling();
+  state.csrf = "";
+  state.files = [];
+  state.corpusPreview = null;
+  state.jobs = [];
+  state.documents = [];
+  state.selectedJobId = null;
   $("loginView").hidden = false;
   $("appView").hidden = true;
-  stopPolling();
+  renderStaging();
+  renderCorpusPreview();
+  renderJobs();
+  renderDocuments();
+  clearJobDetails();
+  renderServiceStatus(null, null);
 }
 
 function showApp() {
@@ -96,6 +109,7 @@ async function refreshAll() {
       request("/api/admin/corpus_status"),
     ]);
     await loadJobs();
+    await refreshSelectedJob();
     renderServiceStatus(status, corpusStatus);
     if (state.activeView === "documents") await loadDocuments(corpusStatus);
   } finally {
@@ -111,7 +125,9 @@ function startPolling() {
     } catch (error) {
       showError(error);
     } finally {
-      state.pollTimer = window.setTimeout(tick, hasActiveJobs() ? 2000 : 10000);
+      if (!$("appView").hidden) {
+        state.pollTimer = window.setTimeout(tick, hasActiveJobs() ? 2000 : 10000);
+      }
     }
   };
   state.pollTimer = window.setTimeout(tick, 0);
@@ -126,6 +142,10 @@ function statusBadge(label, stateName) {
 
 function renderServiceStatus(status, corpusStatus) {
   const strip = $("serviceStatus");
+  if (!status || !corpusStatus) {
+    strip.replaceChildren();
+    return;
+  }
   const qdrantReady = ["ready", "empty"].includes(corpusStatus.status);
   const active = state.jobs.find((job) => job.status === "running");
   const badges = [
@@ -237,7 +257,7 @@ function validateRow(row) {
 }
 
 function stagingIdentity(row) {
-  if (row.kind === "general") return `general:${row.filename}`;
+  if (row.kind === "general") return `general:${row.relative_path}`;
   if (!row.subject || !row.grade || !row.lang) return null;
   if (row.kind === "textbook") {
     return `textbook:${row.subject}:${row.grade}:${row.lang}:${row.filename}`;
@@ -405,6 +425,13 @@ function renderCorpusPreview() {
   $("queueCorpus").disabled = state.corpusPreview.recognized === 0;
 }
 
+function clearJobDetails() {
+  state.selectedJobId = null;
+  const details = $("jobDetails");
+  details.replaceChildren();
+  details.hidden = true;
+}
+
 function commandButton(label, action, danger = false) {
   const button = document.createElement("button");
   button.type = "button";
@@ -423,8 +450,18 @@ async function confirmChange(message) {
   });
 }
 
-async function loadJob(id) {
-  const job = await request(`/api/admin/ingestion/jobs/${id}`);
+async function loadJob(id, options = {}) {
+  let job;
+  try {
+    job = await request(`/api/admin/ingestion/jobs/${id}`);
+  } catch (error) {
+    if (options.quietMissing && error.status === 404) {
+      clearJobDetails();
+      return null;
+    }
+    throw error;
+  }
+  state.selectedJobId = job.id;
   const details = $("jobDetails");
   details.replaceChildren();
   details.hidden = false;
@@ -458,12 +495,18 @@ async function loadJob(id) {
     details.append(notice);
   }
   details.append(tableWrap);
+  return job;
+}
+
+async function refreshSelectedJob() {
+  if (state.selectedJobId) await loadJob(state.selectedJobId, { quietMissing: true });
 }
 
 async function cancelJob(id) {
   if (!await confirmChange("Cancel this ingestion job?")) return;
   await request(`/api/admin/ingestion/jobs/${id}/cancel`, { method: "POST" });
   await loadJobs();
+  await loadJob(id, { quietMissing: true });
 }
 
 async function retryJob(id) {
@@ -475,7 +518,7 @@ async function retryJob(id) {
 async function deleteJob(id) {
   if (!await confirmChange("Delete this job history and its retained upload files?")) return;
   await request(`/api/admin/ingestion/jobs/${id}`, { method: "DELETE" });
-  $("jobDetails").hidden = true;
+  clearJobDetails();
   await loadJobs();
 }
 
@@ -572,9 +615,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("logoutButton").addEventListener("click", async () => {
-    await request("/auth/logout", { method: "POST" });
-    state.csrf = "";
-    showLogin();
+    try {
+      await request("/auth/logout", { method: "POST" });
+    } catch {
+      // Session may already be expired server-side; local reset still matters.
+    } finally {
+      showLogin();
+    }
   });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => selectView(button.dataset.view)));
   document.querySelectorAll("[data-source]").forEach((button) => button.addEventListener("click", () => selectSource(button.dataset.source)));

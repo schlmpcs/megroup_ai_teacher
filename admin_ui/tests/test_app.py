@@ -1,4 +1,5 @@
 import json
+import re
 
 import httpx
 import pytest
@@ -59,6 +60,69 @@ def test_static_javascript_never_uses_browser_storage(monkeypatch):
     assert response.status_code == 200
     assert "localStorage" not in response.text
     assert "sessionStorage" not in response.text
+
+
+def test_static_javascript_general_identity_uses_relative_path(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert "return `general:${row.relative_path}`;" in response.text
+    assert "return `general:${row.filename}`;" not in response.text
+
+
+def test_static_javascript_tracks_and_refreshes_selected_job(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert "selectedJobId: null" in response.text
+    assert "state.selectedJobId = job.id;" in response.text
+    assert "await refreshSelectedJob();" in response.text
+    assert "quietMissing" in response.text
+    assert "clearJobDetails();" in response.text
+
+
+def test_static_javascript_login_reset_and_logout_clear_state(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    show_login = re.search(r"function showLogin\(\) \{(?P<body>.*?)\n\}", response.text, re.S)
+    assert show_login
+    for reset in [
+        'state.csrf = "";',
+        "state.files = [];",
+        "state.corpusPreview = null;",
+        "state.jobs = [];",
+        "state.documents = [];",
+        "state.selectedJobId = null;",
+        "clearJobDetails();",
+        "renderServiceStatus(null, null);",
+    ]:
+        assert reset in show_login.group("body")
+    assert "try {" in response.text
+    assert "finally {" in response.text
+    assert "showLogin();" in response.text
+
+
+def test_static_javascript_polling_respects_hidden_app(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert 'if (!$("appView").hidden) {' in response.text
+    assert "state.pollTimer = window.setTimeout(tick, hasActiveJobs() ? 2000 : 10000);" in response.text
+
+
+def test_static_css_file_button_has_keyboard_focus_style(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/styles.css")
+    assert response.status_code == 200
+    assert ".file-button:focus-within" in response.text
+    assert "outline: 3px solid rgba(15, 118, 110, .22);" in response.text
+    assert "outline-offset: 1px;" in response.text
 
 
 def test_mutating_proxy_requires_csrf(monkeypatch):

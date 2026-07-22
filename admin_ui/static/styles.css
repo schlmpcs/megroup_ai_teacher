@@ -30,6 +30,7 @@ main { width: min(1440px, 100%); margin: 0 auto; padding: 20px; }
 .segmented, .command-row, .upload-actions, .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
 .segmented button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: white; }
 .file-button { display: inline-flex; align-items: center; min-height: 36px; padding: 7px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); cursor: pointer; }
+.file-button:focus-within { outline: 3px solid rgba(15, 118, 110, .22); outline-offset: 1px; }
 .file-button input { position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
