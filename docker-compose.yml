@@ -1,6 +1,7 @@
 services:
   api:
     build: .
+    image: megroup-ai-assistant-api:local
     ports:
       - "8001:8000"
     env_file:
@@ -17,9 +18,14 @@ services:
       - VOICE_TTS_RU_DEFAULT_BACKEND=${VOICE_TTS_RU_DEFAULT_BACKEND:-supertonic}
       - VOICE_TTS_EN_DEFAULT_BACKEND=${VOICE_TTS_EN_DEFAULT_BACKEND:-supertonic}
       - VOICE_TTS_KK_DEFAULT_BACKEND=${VOICE_TTS_KK_DEFAULT_BACKEND:-omnivoice}
+      - CORPUS_ROOT=/corpus
+      - INGESTION_DATA_DIR=/data/ingestion
+      - INGESTION_API_BASE_URL=http://api:8000
     volumes:
       # Mount scenarios so lab descriptions can be edited without a rebuild.
       - ./scenarios:/app/scenarios:ro
+      - ingestion_data:/data/ingestion
+      - ${CORPUS_HOST_ROOT:-./Лабораторные физхимбио}:/corpus:ro
     depends_on:
       - qdrant
       - embedder
@@ -28,6 +34,50 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/health'); "]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ingestion-worker:
+    build: .
+    image: megroup-ai-assistant-api:local
+    command: ["python", "-m", "scripts.run_ingestion_worker"]
+    env_file:
+      - .env
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_BASE_URL=http://embedder:8080
+      - CORPUS_ROOT=/corpus
+      - INGESTION_DATA_DIR=/data/ingestion
+      - INGESTION_API_BASE_URL=http://api:8000
+    volumes:
+      - ingestion_data:/data/ingestion
+      - ${CORPUS_HOST_ROOT:-./Лабораторные физхимбио}:/corpus:ro
+    depends_on:
+      - api
+      - qdrant
+      - embedder
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.services.ingestion_jobs import worker_status; import sys; sys.exit(0 if worker_status()['online'] else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  admin-ui:
+    build: ./admin_ui
+    ports:
+      - "8004:8000"
+    env_file:
+      - .env
+    environment:
+      - BACKEND_BASE_URL=http://api:8000
+      - BACKEND_ADMIN_API_KEY=${ADMIN_API_KEY}
+    depends_on:
+      - api
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -149,6 +199,7 @@ services:
       start_period: 300s
 
 volumes:
+  ingestion_data:
   qdrant_data:
   hf_cache:
   voice_hf_cache:

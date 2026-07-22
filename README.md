@@ -67,14 +67,16 @@ OpenAI: Responses API (генерация, ключ OpenAI)
 
 ```bash
 cp .env.example .env          # заполнить INTERNAL_API_KEY и OPENAI_API_KEY
-docker compose up --build     # 5 сервисов (порты ниже)
+docker compose up --build     # 7 сервисов (порты ниже)
 ```
 
-`docker compose` поднимает **пять** сервисов:
+`docker compose` поднимает **семь** сервисов:
 
 | Сервис | Образ / build | Порт (хост → контейнер) | GPU |
 |--------|---------------|--------------------------|-----|
 | `api` | `.` | `8001 → 8000` | нет |
+| `ingestion-worker` | `.` | нет | нет |
+| `admin-ui` | `./admin_ui` | `8004 → 8000` | нет |
 | `qdrant` | `qdrant/qdrant:latest` | `6333 → 6333`, `6334 → 6334` | нет |
 | `embedder` | `./embedder` | `8080 → 8080` | да |
 | `voice` | `./voice` | `8002 → 8001` | да |
@@ -84,6 +86,21 @@ docker compose up --build     # 5 сервисов (порты ниже)
 **NVIDIA Container Toolkit** и делят одну карту; первый запуск скачивает модели
 (bge-m3, Whisper, TTS), поэтому
 стартует медленно.
+
+### Operator UI
+
+Хеш пароля для operator UI:
+
+```bash
+python -m admin_ui.hash_password
+docker compose up -d --build api ingestion-worker admin-ui
+open http://localhost:8004
+```
+
+Для production обязателен HTTPS. `BACKEND_ADMIN_API_KEY` остаётся только на
+сервере и браузеру не выдаётся. Prune доступен только для full-root запуска без
+`Relative subtree`. Upload-артефакты и история очереди сохраняются до удаления
+соответствующей job из UI.
 
 Локальная разработка прокси (Qdrant и embedder при этом удобно держать в Docker):
 
