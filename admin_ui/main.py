@@ -70,7 +70,7 @@ def session_payload(
 ) -> dict:
     token = request.cookies.get("admin_session")
     payload = decode_session(token or "", secret=settings.ADMIN_UI_SESSION_SECRET)
-    if payload is None:
+    if payload is None or not hmac.compare_digest(payload["username"], settings.ADMIN_UI_USERNAME):
         raise HTTPException(status_code=401, detail="Authentication required")
     return payload
 

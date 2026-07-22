@@ -26,6 +26,8 @@ def hash_password(password: str, *, salt: bytes | None = None) -> str:
     if not password:
         raise ValueError("Password must not be empty")
     salt = salt or secrets.token_bytes(16)
+    if len(salt) != 16:
+        raise ValueError("Salt must be 16 bytes")
     digest = hashlib.scrypt(
         password.encode(),
         salt=salt,
@@ -40,16 +42,24 @@ def hash_password(password: str, *, salt: bytes | None = None) -> str:
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, n, r, p, salt, expected = encoded.split(":", 5)
-        if algorithm != "scrypt":
+        if (algorithm, n, r, p) != (
+            "scrypt",
+            str(_SCRYPT_N),
+            str(_SCRYPT_R),
+            str(_SCRYPT_P),
+        ):
             return False
+        decoded_salt = _unb64(salt)
         expected_digest = _unb64(expected)
+        if len(decoded_salt) != 16 or len(expected_digest) != _SCRYPT_DKLEN:
+            return False
         actual = hashlib.scrypt(
             password.encode(),
-            salt=_unb64(salt),
-            n=int(n),
-            r=int(r),
-            p=int(p),
-            dklen=len(expected_digest),
+            salt=decoded_salt,
+            n=_SCRYPT_N,
+            r=_SCRYPT_R,
+            p=_SCRYPT_P,
+            dklen=_SCRYPT_DKLEN,
         )
         return hmac.compare_digest(actual, expected_digest)
     except (TypeError, ValueError, binascii.Error):
@@ -86,9 +96,21 @@ def decode_session(token: str, *, secret: str, now: int | None = None) -> dict |
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
         return None
     current = int(time.time()) if now is None else now
-    if payload.get("expires_at", 0) < current:
+    if not isinstance(payload, dict):
         return None
-    if not isinstance(payload.get("username"), str) or not isinstance(payload.get("csrf"), str):
+    username = payload.get("username")
+    csrf = payload.get("csrf")
+    issued_at = payload.get("issued_at")
+    expires_at = payload.get("expires_at")
+    if not isinstance(username, str) or not username:
+        return None
+    if not isinstance(csrf, str) or not csrf:
+        return None
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        return None
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        return None
+    if expires_at < current:
         return None
     return payload
 
@@ -99,20 +121,23 @@ class LoginLimiter:
         self.window_s = window_s
         self.failures = defaultdict(deque)
 
-    def _prune(self, client_ip: str, now: float) -> None:
+    def _prune_all(self, now: float) -> None:
         cutoff = now - self.window_s
-        entries = self.failures[client_ip]
-        while entries and entries[0] <= cutoff:
-            entries.popleft()
+        for client_ip in list(self.failures):
+            entries = self.failures[client_ip]
+            while entries and entries[0] <= cutoff:
+                entries.popleft()
+            if not entries:
+                del self.failures[client_ip]
 
     def allowed(self, client_ip: str, *, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
-        self._prune(client_ip, current)
-        return len(self.failures[client_ip]) < self.max_failures
+        self._prune_all(current)
+        return len(self.failures.get(client_ip, ())) < self.max_failures
 
     def record_failure(self, client_ip: str, *, now: float | None = None) -> None:
         current = time.monotonic() if now is None else now
-        self._prune(client_ip, current)
+        self._prune_all(current)
         self.failures[client_ip].append(current)
 
     def clear(self, client_ip: str) -> None:

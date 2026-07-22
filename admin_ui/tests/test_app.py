@@ -108,6 +108,17 @@ def test_proxy_rejects_missing_session_and_disallowed_path(monkeypatch):
         assert client.get("/api/admin/not-allowed").status_code == 404
 
 
+def test_session_is_invalidated_when_configured_username_changes(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        assert login.status_code == 200
+        assert client.get("/api/session").status_code == 200
+        monkeypatch.setenv("ADMIN_UI_USERNAME", "other-admin")
+        get_settings.cache_clear()
+        assert client.get("/api/session").status_code == 401
+
+
 def test_proxy_forwards_body_query_and_maps_transport_failure(monkeypatch):
     _configure(monkeypatch)
     captured = {}
