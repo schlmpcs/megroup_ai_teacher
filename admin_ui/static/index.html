@@ -1,64 +1,64 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VR AI Assistant Admin</title>
+  <title>Панель управления VR-ассистентом</title>
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
   <section id="loginView" class="login-shell">
     <form id="loginForm" class="login-panel">
-      <h1>VR AI Assistant Admin</h1>
-      <label for="username">Username</label>
+      <h1>Панель управления VR-ассистентом</h1>
+      <label for="username">Логин</label>
       <input id="username" name="username" autocomplete="username" required>
-      <label for="password">Password</label>
+      <label for="password">Пароль</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required>
-      <button type="submit">Sign in</button>
+      <button type="submit">Войти</button>
       <p id="loginError" class="error" role="alert"></p>
     </form>
   </section>
 
   <div id="appView" class="app-shell" hidden>
     <header class="topbar">
-      <strong>VR AI Assistant Admin</strong>
+      <strong>Панель управления VR-ассистентом</strong>
       <div id="serviceStatus" class="status-strip" aria-live="polite"></div>
-      <button id="logoutButton" type="button">Sign out</button>
+      <button id="logoutButton" type="button">Выйти</button>
     </header>
-    <nav class="tabs" aria-label="Admin views">
-      <button type="button" data-view="ingest" aria-selected="true">Ingest</button>
-      <button type="button" data-view="jobs" aria-selected="false">Jobs</button>
-      <button type="button" data-view="documents" aria-selected="false">Documents</button>
+    <nav class="tabs" aria-label="Разделы панели управления">
+      <button type="button" data-view="ingest" aria-selected="true">Загрузка</button>
+      <button type="button" data-view="jobs" aria-selected="false">Задания</button>
+      <button type="button" data-view="documents" aria-selected="false">Документы</button>
     </nav>
 
     <main>
       <section id="ingestView" data-view-panel="ingest">
-        <div class="segmented" role="group" aria-label="Ingestion source">
-          <button type="button" data-source="upload" aria-pressed="true">Browser upload</button>
-          <button type="button" data-source="corpus" aria-pressed="false">Server corpus</button>
+        <div class="segmented" role="group" aria-label="Источник данных">
+          <button type="button" data-source="upload" aria-pressed="true">Загрузка с компьютера</button>
+          <button type="button" data-source="corpus" aria-pressed="false">Корпус на сервере</button>
         </div>
 
         <section id="uploadPanel">
           <div class="upload-actions">
-            <label class="file-button">Choose files<input id="fileInput" type="file" multiple accept=".pdf,.docx,.epub,.txt,.md"></label>
-            <label class="file-button">Choose folder<input id="folderInput" type="file" multiple webkitdirectory></label>
-            <button id="clearStaging" type="button">Clear</button>
+            <label class="file-button">Выбрать файлы<input id="fileInput" type="file" multiple accept=".pdf,.docx,.epub,.txt,.md"></label>
+            <label class="file-button">Выбрать папку<input id="folderInput" type="file" multiple webkitdirectory></label>
+            <button id="clearStaging" type="button">Очистить</button>
           </div>
           <div class="table-wrap"><table id="stagingTable"><thead><tr>
-            <th>File</th><th>Kind</th><th>Subject</th><th>Grade</th><th>Language</th><th>Lab</th><th>OCR</th><th>Status</th><th></th>
+            <th>Файл</th><th>Тип</th><th>Предмет</th><th>Класс</th><th>Язык</th><th>Лабораторная</th><th>OCR</th><th>Статус</th><th></th>
           </tr></thead><tbody></tbody></table></div>
-          <button id="queueUpload" type="button" disabled>Queue upload</button>
+          <button id="queueUpload" type="button" disabled>Поставить в очередь</button>
         </section>
 
         <section id="corpusPanel" hidden>
-          <label for="corpusSubtree">Relative subtree</label>
-          <input id="corpusSubtree" placeholder="Leave empty for the full corpus">
-          <label><input id="corpusOcr" type="checkbox"> OCR scanned files</label>
-          <label><input id="corpusPrune" type="checkbox"> Prune documents absent from a full-root scan</label>
+          <label for="corpusSubtree">Относительный путь</label>
+          <input id="corpusSubtree" placeholder="Оставьте пустым для всего корпуса">
+          <label><input id="corpusOcr" type="checkbox"> Распознавать сканированные файлы (OCR)</label>
+          <label><input id="corpusPrune" type="checkbox"> Удалить из базы документы, которых нет при полном сканировании корпуса</label>
           <div class="command-row">
-            <button id="previewCorpus" type="button">Preview</button>
-            <button id="queueCorpus" type="button" disabled>Queue corpus job</button>
+            <button id="previewCorpus" type="button">Предпросмотр</button>
+            <button id="queueCorpus" type="button" disabled>Поставить корпус в очередь</button>
           </div>
           <div id="corpusPreview" aria-live="polite"></div>
         </section>
@@ -66,7 +66,7 @@
 
       <section id="jobsView" data-view-panel="jobs" hidden>
         <div class="table-wrap"><table id="jobsTable"><thead><tr>
-          <th>Status</th><th>Kind</th><th>Progress</th><th>Current item</th><th>Created</th><th>Actions</th>
+          <th>Статус</th><th>Тип</th><th>Прогресс</th><th>Текущий файл</th><th>Создано</th><th>Действия</th>
         </tr></thead><tbody></tbody></table></div>
         <section id="jobDetails" hidden aria-live="polite"></section>
       </section>
@@ -74,14 +74,14 @@
       <section id="documentsView" data-view-panel="documents" hidden>
         <div id="corpusSummary"></div>
         <div class="filters">
-          <input id="documentSearch" aria-label="Filter by filename" placeholder="Filter filename">
-          <select id="documentType" aria-label="Filter by document type"><option value="">All types</option><option value="textbook">Textbook</option><option value="lab_instruction">Lab instruction</option></select>
-          <select id="documentSubject" aria-label="Filter by subject"><option value="">All subjects</option><option value="physics">Physics</option><option value="chemistry">Chemistry</option><option value="biology">Biology</option></select>
-          <select id="documentGrade" aria-label="Filter by grade"><option value="">All grades</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option></select>
-          <select id="documentLanguage" aria-label="Filter by language"><option value="">All languages</option><option>ru</option><option>kk</option><option>en</option></select>
+          <input id="documentSearch" aria-label="Фильтр по имени файла" placeholder="Поиск по имени файла">
+          <select id="documentType" aria-label="Фильтр по типу документа"><option value="">Все типы</option><option value="textbook">Учебник</option><option value="lab_instruction">Лабораторная работа</option></select>
+          <select id="documentSubject" aria-label="Фильтр по предмету"><option value="">Все предметы</option><option value="physics">Физика</option><option value="chemistry">Химия</option><option value="biology">Биология</option></select>
+          <select id="documentGrade" aria-label="Фильтр по классу"><option value="">Все классы</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option></select>
+          <select id="documentLanguage" aria-label="Фильтр по языку"><option value="">Все языки</option><option value="ru">Русский</option><option value="kk">Казахский</option><option value="en">Английский</option></select>
         </div>
         <div class="table-wrap"><table id="documentsTable"><thead><tr>
-          <th>Filename</th><th>Type</th><th>Subject</th><th>Grade</th><th>Language</th><th>Chunks</th><th></th>
+          <th>Имя файла</th><th>Тип</th><th>Предмет</th><th>Класс</th><th>Язык</th><th>Фрагменты</th><th></th>
         </tr></thead><tbody></tbody></table></div>
       </section>
     </main>
@@ -90,7 +90,7 @@
   <dialog id="confirmDialog" aria-labelledby="confirmMessage">
     <form method="dialog">
       <p id="confirmMessage"></p>
-      <div class="command-row"><button value="cancel">Cancel</button><button id="confirmAction" value="confirm">Confirm</button></div>
+      <div class="command-row"><button value="cancel">Отмена</button><button id="confirmAction" value="confirm">Подтвердить</button></div>
     </form>
   </dialog>
   <div id="toast" role="status" aria-live="polite"></div>

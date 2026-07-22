@@ -81,9 +81,28 @@ def test_index_serves_operator_shell_without_backend_secrets(monkeypatch):
     with TestClient(app) as client:
         response = client.get("/")
     assert response.status_code == 200
-    assert "VR AI Assistant Admin" in response.text
+    assert '<html lang="ru">' in response.text
+    assert "Панель управления VR-ассистентом" in response.text
+    assert "Загрузка с компьютера" in response.text
     assert "backend-admin-key" not in response.text
     assert "BACKEND_BASE_URL" not in response.text
+
+
+def test_static_javascript_renders_operator_state_in_russian(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    for text in [
+        "Сервер доступен",
+        "Обработчик доступен",
+        "Неподдерживаемый тип файла",
+        "Распознано",
+        "Задание",
+        "Повторить",
+        "Удалить",
+    ]:
+        assert text in response.text
 
 
 def test_static_javascript_never_uses_browser_storage(monkeypatch):

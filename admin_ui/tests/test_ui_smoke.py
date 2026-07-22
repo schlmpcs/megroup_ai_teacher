@@ -91,14 +91,14 @@ def test_admin_ui_end_to_end(tmp_path):
             ) as upload_response:
                 page.click("#queueUpload")
             upload_job = upload_response.value.json()
-            expect(page.locator("#jobDetails")).to_contain_text(f"Job {upload_job['id']}")
+            expect(page.locator("#jobDetails")).to_contain_text(f"Задание {upload_job['id']}")
             expect(page.locator("#jobDetails")).to_contain_text("notes.md")
 
             page.click('[data-view="ingest"]')
             page.click('[data-source="corpus"]')
             page.locator("#corpusOcr").uncheck()
             page.click("#previewCorpus")
-            expect(page.locator("#corpusPreview")).to_contain_text("1 recognized of 2")
+            expect(page.locator("#corpusPreview")).to_contain_text("Распознано 1 из 2")
             expect(page.locator("#corpusPreview")).to_contain_text("misc.md")
 
             with page.expect_response(
@@ -107,22 +107,22 @@ def test_admin_ui_end_to_end(tmp_path):
             ) as corpus_response:
                 page.click("#queueCorpus")
             failed_job = corpus_response.value.json()
-            expect(page.locator("#jobDetails")).to_contain_text(f"Job {failed_job['id']}")
+            expect(page.locator("#jobDetails")).to_contain_text(f"Задание {failed_job['id']}")
             expect(page.locator("#jobDetails")).to_contain_text("Synthetic smoke-test failure")
 
-            failed_row = page.locator("#jobsTable tbody tr").filter(has_text="failed").first
-            expect(failed_row.get_by_role("button", name="Retry")).to_be_visible()
+            failed_row = page.locator("#jobsTable tbody tr").filter(has_text="Ошибка").first
+            expect(failed_row.get_by_role("button", name="Повторить")).to_be_visible()
             with page.expect_response(
                 lambda response: response.url.endswith(
                     f"/api/admin/ingestion/jobs/{failed_job['id']}/retry"
                 )
                 and response.request.method == "POST"
             ) as retry_response:
-                failed_row.get_by_role("button", name="Retry").click()
+                failed_row.get_by_role("button", name="Повторить").click()
             retried_job = retry_response.value.json()
             assert retried_job["retry_of"] == failed_job["id"]
-            expect(page.locator("#jobDetails")).to_contain_text(f"Job {retried_job['id']}")
-            expect(page.locator("#jobDetails")).to_contain_text("completed; 1/1 completed")
+            expect(page.locator("#jobDetails")).to_contain_text(f"Задание {retried_job['id']}")
+            expect(page.locator("#jobDetails")).to_contain_text("Завершено; выполнено 1/1")
 
             page.click('[data-view="documents"]')
             page.fill("#documentSearch", "Physics")
@@ -130,10 +130,10 @@ def test_admin_ui_end_to_end(tmp_path):
 
             desktop_screenshot = tmp_path / "admin-ui-desktop.png"
             page.screenshot(path=str(desktop_screenshot), full_page=True)
-            page.locator("#documentsTable tbody tr").get_by_role("button", name="Delete").click()
+            page.locator("#documentsTable tbody tr").get_by_role("button", name="Удалить").click()
             expect(page.locator("#confirmDialog")).to_be_visible()
             expect(page.locator("#confirmMessage")).to_have_text(
-                "Delete Physics 8.md from the knowledge base?"
+                "Удалить Physics 8.md из базы знаний?"
             )
             with page.expect_response(
                 lambda response: response.url.endswith("/api/admin/documents/doc-1")

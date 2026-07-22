@@ -15,6 +15,78 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+const labels = {
+  status: {
+    queued: "В очереди",
+    running: "Выполняется",
+    completed: "Завершено",
+    partial: "Частично",
+    failed: "Ошибка",
+    cancelled: "Отменено",
+    pending: "Ожидает",
+    skipped: "Пропущено",
+    ready: "Готово",
+    empty: "Пусто",
+  },
+  kind: {
+    upload: "Загрузка файлов",
+    corpus: "Корпус сервера",
+    general: "Обычный документ",
+    textbook: "Учебник",
+    lab_instruction: "Лабораторная работа",
+  },
+  stage: {
+    extracting: "Извлечение текста",
+    parsing: "Разбор",
+    chunking: "Разбиение",
+    embedding: "Создание векторов",
+    indexing: "Индексация",
+    uploading: "Загрузка",
+    finalizing: "Завершение",
+    done: "Готово",
+  },
+  subject: {
+    physics: "Физика",
+    chemistry: "Химия",
+    biology: "Биология",
+  },
+  language: {
+    ru: "Русский",
+    kk: "Казахский",
+    en: "Английский",
+  },
+  field: {
+    kind: "Тип",
+    subject: "Предмет",
+    grade: "Класс",
+    lang: "Язык",
+    lab_number: "Номер лабораторной работы",
+  },
+};
+
+const messageLabels = {
+  "Invalid credentials": "Неверный логин или пароль",
+  "Too many login attempts": "Слишком много попыток входа. Повторите позже.",
+  "Authentication required": "Требуется вход",
+  "Invalid CSRF token": "Сессия устарела. Войдите снова.",
+  "Backend admin API unavailable": "Сервер администрирования недоступен",
+  "Cancelled by administrator": "Отменено администратором",
+  "No usable text extracted": "Не удалось извлечь текст",
+  "Interrupted while processing": "Обработка была прервана",
+  "Unrecognised corpus path": "Путь в корпусе не распознан",
+  "Unrecognized corpus path": "Путь в корпусе не распознан",
+  "Job not found": "Задание не найдено",
+  "Document not found": "Документ не найден",
+};
+
+function label(group, value) {
+  return labels[group]?.[value] || value || "";
+}
+
+function translateMessage(message) {
+  return messageLabels[message] || message || "";
+}
+
 async function request(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const headers = new Headers(options.headers || {});
@@ -28,7 +100,7 @@ async function request(path, options = {}) {
   const payload = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
     const detail = typeof payload === "object" ? payload.detail : payload;
-    const error = new Error(detail || `Request failed with ${response.status}`);
+    const error = new Error(detail || `Запрос завершился с ошибкой ${response.status}`);
     error.status = response.status;
     throw error;
   }
@@ -180,15 +252,15 @@ function renderServiceStatus(status, corpusStatus) {
   const qdrantReady = ["ready", "empty"].includes(corpusStatus.status);
   const active = state.jobs.find((job) => job.status === "running");
   const badges = [
-    statusBadge("Backend online", "success"),
-    statusBadge(`Qdrant ${corpusStatus.status}`, qdrantReady ? "success" : "warning"),
-    statusBadge(status.worker.online ? "Worker online" : "Worker offline", status.worker.online ? "success" : "danger"),
-    statusBadge(`Queued ${status.queue.queued || 0}`, status.queue.queued ? "warning" : ""),
-    statusBadge(`Running ${status.queue.running || 0}`, status.queue.running ? "warning" : ""),
+    statusBadge("Сервер доступен", "success"),
+    statusBadge(`Qdrant: ${label("status", corpusStatus.status)}`, qdrantReady ? "success" : "warning"),
+    statusBadge(status.worker.online ? "Обработчик доступен" : "Обработчик недоступен", status.worker.online ? "success" : "danger"),
+    statusBadge(`В очереди: ${status.queue.queued || 0}`, status.queue.queued ? "warning" : ""),
+    statusBadge(`Выполняется: ${status.queue.running || 0}`, status.queue.running ? "warning" : ""),
   ];
   if (active) {
-    const activity = [active.current_item, active.current_stage].filter(Boolean).join(": ");
-    badges.push(statusBadge(`Active ${activity || active.id.slice(0, 8)}`, "warning"));
+    const activity = [active.current_item, label("stage", active.current_stage)].filter(Boolean).join(": ");
+    badges.push(statusBadge(`Активно: ${activity || active.id.slice(0, 8)}`, "warning"));
   }
   strip.replaceChildren(...badges);
 }
@@ -205,7 +277,7 @@ function showError(error) {
     showLogin();
     return;
   }
-  showToast(error.message || "Unexpected error");
+  showToast(translateMessage(error.message) || "Непредвиденная ошибка");
 }
 
 function selectControl(values, value, field, id) {
@@ -213,7 +285,7 @@ function selectControl(values, value, field, id) {
   select.dataset.field = field;
   select.dataset.id = id;
   const row = state.files.find((item) => item.id === id);
-  select.setAttribute("aria-label", `${field.replace("_", " ")} for ${row ? row.filename : "file"}`);
+  select.setAttribute("aria-label", `${label("field", field)}: ${row ? row.filename : "файл"}`);
   for (const [optionValue, label] of values) {
     const option = document.createElement("option");
     option.value = optionValue;
@@ -269,21 +341,21 @@ async function previewPaths(rows) {
 }
 
 function validateRow(row) {
-  const errors = [...row.previewErrors];
+  const errors = row.previewErrors.map(translateMessage);
   if (![".pdf", ".docx", ".epub", ".txt", ".md"].some((suffix) => row.filename.toLowerCase().endsWith(suffix))) {
-    errors.push("Unsupported file type");
+    errors.push("Неподдерживаемый тип файла");
   }
   if (row.kind !== "general") {
-    if (!row.subject) errors.push("Subject is required");
-    if (!row.grade) errors.push("Grade is required");
-    if (!row.lang) errors.push("Language is required");
+    if (!row.subject) errors.push("Укажите предмет");
+    if (!row.grade) errors.push("Укажите класс");
+    if (!row.lang) errors.push("Укажите язык");
   }
-  if (row.kind === "lab_instruction" && !row.lab_number) errors.push("Lab number is required");
-  if (row.kind === "textbook" && row.lab_number) errors.push("Textbooks cannot have a lab number");
+  if (row.kind === "lab_instruction" && !row.lab_number) errors.push("Укажите номер лабораторной работы");
+  if (row.kind === "textbook" && row.lab_number) errors.push("Для учебника нельзя указывать номер лабораторной работы");
   const identity = stagingIdentity(row);
   // ponytail: O(n^2) over at most 100 staged files; index only if that limit grows.
   if (identity && state.files.filter((item) => stagingIdentity(item) === identity).length > 1) {
-    errors.push("Duplicate document identity");
+    errors.push("Документ с такими реквизитами уже добавлен");
   }
   return errors;
 }
@@ -315,22 +387,22 @@ function renderStaging() {
     valid = valid && errors.length === 0;
     tr.append(
       cell(row.relative_path),
-      cell(selectControl([["general", "General"], ["textbook", "Textbook"], ["lab_instruction", "Lab instruction"]], row.kind, "kind", row.id)),
-      cell(selectControl([["", "None"], ["physics", "Physics"], ["chemistry", "Chemistry"], ["biology", "Biology"]], row.subject, "subject", row.id)),
-      cell(selectControl([["", "None"], ...[7, 8, 9, 10, 11].map((grade) => [String(grade), String(grade)])], row.grade, "grade", row.id)),
-      cell(selectControl([["", "None"], ["ru", "ru"], ["kk", "kk"], ["en", "en"]], row.lang, "lang", row.id)),
-      cell(selectControl([["", "None"], ...Array.from({ length: 99 }, (_, index) => [String(index + 1), String(index + 1)])], row.lab_number, "lab_number", row.id)),
+      cell(selectControl([["general", "Обычный документ"], ["textbook", "Учебник"], ["lab_instruction", "Лабораторная работа"]], row.kind, "kind", row.id)),
+      cell(selectControl([["", "Не указано"], ["physics", "Физика"], ["chemistry", "Химия"], ["biology", "Биология"]], row.subject, "subject", row.id)),
+      cell(selectControl([["", "Не указано"], ...[7, 8, 9, 10, 11].map((grade) => [String(grade), String(grade)])], row.grade, "grade", row.id)),
+      cell(selectControl([["", "Не указано"], ["ru", "Русский"], ["kk", "Казахский"], ["en", "Английский"]], row.lang, "lang", row.id)),
+      cell(selectControl([["", "Не указано"], ...Array.from({ length: 99 }, (_, index) => [String(index + 1), String(index + 1)])], row.lab_number, "lab_number", row.id)),
     );
     const ocr = document.createElement("input");
     ocr.type = "checkbox";
     ocr.checked = row.ocr;
-    ocr.setAttribute("aria-label", `OCR ${row.filename}`);
+    ocr.setAttribute("aria-label", `OCR: ${row.filename}`);
     ocr.addEventListener("change", () => updateStagingItem(row.id, "ocr", ocr.checked));
-    tr.append(cell(ocr), cell(errors.length ? errors.join("; ") : "Ready"));
+    tr.append(cell(ocr), cell(errors.length ? errors.join("; ") : "Готово"));
     const remove = document.createElement("button");
     remove.type = "button";
-    remove.textContent = "Remove";
-    remove.setAttribute("aria-label", `Remove ${row.filename}`);
+    remove.textContent = "Удалить";
+    remove.setAttribute("aria-label", `Удалить ${row.filename}`);
     remove.addEventListener("click", () => {
       state.files = state.files.filter((item) => item.id !== row.id);
       renderStaging();
@@ -394,7 +466,7 @@ async function previewCorpus() {
 async function queueCorpus() {
   if (!state.corpusPreview) return;
   const options = corpusOptions();
-  if (options.prune && !await confirmChange("Queue a full-root ingest that may prune missing corpus documents?")) return;
+  if (options.prune && !await confirmChange("Поставить в очередь полное сканирование с удалением отсутствующих документов?")) return;
   const job = await request("/api/admin/ingestion/jobs/corpus", {
     method: "POST",
     json: options,
@@ -437,24 +509,24 @@ function renderCorpusPreview() {
   }
   const summary = document.createElement("p");
   const typeCounts = Object.entries(state.corpusPreview.counts_by_type || {})
-    .map(([name, count]) => `${name} ${count}`)
+    .map(([name, count]) => `${label("kind", name)}: ${count}`)
     .join(", ");
   const languageCounts = Object.entries(state.corpusPreview.counts_by_language || {})
-    .map(([name, count]) => `${name} ${count}`)
+    .map(([name, count]) => `${label("language", name)}: ${count}`)
     .join(", ");
-  summary.textContent = `${state.corpusPreview.recognized} recognized of ${state.corpusPreview.total}; ${state.corpusPreview.skipped.length} skipped; ${state.corpusPreview.prunable} prunable; types ${typeCounts || "none"}; languages ${languageCounts || "none"}`;
+  summary.textContent = `Распознано ${state.corpusPreview.recognized} из ${state.corpusPreview.total}; пропущено: ${state.corpusPreview.skipped.length}; к удалению: ${state.corpusPreview.prunable}; типы: ${typeCounts || "нет"}; языки: ${languageCounts || "нет"}`;
   container.append(summary);
   if ((state.corpusPreview.duplicate_lab_ids || []).length) {
     const duplicates = document.createElement("p");
     duplicates.className = "error";
-    duplicates.textContent = `Duplicate labs: ${state.corpusPreview.duplicate_lab_ids.join(", ")}`;
+    duplicates.textContent = `Повторяющиеся лабораторные работы: ${state.corpusPreview.duplicate_lab_ids.join(", ")}`;
     container.append(duplicates);
   }
   if (state.corpusPreview.skipped.length) {
     const list = document.createElement("ul");
     for (const item of state.corpusPreview.skipped) {
       const entry = document.createElement("li");
-      entry.textContent = `${item.source}: ${item.error}`;
+      entry.textContent = `${item.source}: ${translateMessage(item.error)}`;
       list.append(entry);
     }
     container.append(list);
@@ -503,20 +575,20 @@ async function loadJob(id, options = {}) {
   details.replaceChildren();
   details.hidden = false;
   const heading = document.createElement("h2");
-  heading.textContent = `Job ${job.id}`;
+  heading.textContent = `Задание ${job.id}`;
   const summary = document.createElement("p");
-  summary.textContent = `${job.status}; ${job.completed_items}/${job.total_items} completed; ${job.failed_items} failed; ${job.skipped_items} skipped`;
+  summary.textContent = `${label("status", job.status)}; выполнено ${job.completed_items}/${job.total_items}; с ошибкой: ${job.failed_items}; пропущено: ${job.skipped_items}`;
   const timestamps = document.createElement("p");
-  timestamps.textContent = `Created ${job.created_at}; started ${job.started_at || "not started"}; finished ${job.finished_at || "not finished"}`;
+  timestamps.textContent = `Создано: ${job.created_at}; запущено: ${job.started_at || "не запущено"}; завершено: ${job.finished_at || "не завершено"}`;
   const table = document.createElement("table");
   const head = document.createElement("thead");
   const headRow = document.createElement("tr");
-  for (const label of ["File", "Status", "Stage", "Chunks", "Error"]) headRow.append(cell(label));
+  for (const headingLabel of ["Файл", "Статус", "Этап", "Фрагменты", "Ошибка"]) headRow.append(cell(headingLabel));
   head.append(headRow);
   const body = document.createElement("tbody");
   for (const item of job.items) {
     const row = document.createElement("tr");
-    row.append(cell(item.relative_path || item.filename), cell(item.status), cell(item.stage), cell(item.chunks ?? ""), cell(item.error || ""));
+    row.append(cell(item.relative_path || item.filename), cell(label("status", item.status)), cell(label("stage", item.stage)), cell(item.chunks ?? ""), cell(translateMessage(item.error)));
     body.append(row);
   }
   table.append(head, body);
@@ -528,7 +600,7 @@ async function loadJob(id, options = {}) {
     if (!message) continue;
     const notice = document.createElement("p");
     notice.className = className;
-    notice.textContent = message;
+    notice.textContent = translateMessage(message);
     details.append(notice);
   }
   details.append(tableWrap);
@@ -540,7 +612,7 @@ async function refreshSelectedJob() {
 }
 
 async function cancelJob(id) {
-  if (!await confirmChange("Cancel this ingestion job?")) return;
+  if (!await confirmChange("Отменить это задание на загрузку?")) return;
   await request(`/api/admin/ingestion/jobs/${id}/cancel`, { method: "POST" });
   await loadJobs();
   await loadJob(id, { quietMissing: true });
@@ -553,7 +625,7 @@ async function retryJob(id) {
 }
 
 async function deleteJob(id) {
-  if (!await confirmChange("Delete this job history and its retained upload files?")) return;
+  if (!await confirmChange("Удалить историю задания и сохранённые загруженные файлы?")) return;
   await request(`/api/admin/ingestion/jobs/${id}`, { method: "DELETE" });
   clearJobDetails();
   await loadJobs();
@@ -566,21 +638,21 @@ function renderJobs() {
     const row = document.createElement("tr");
     const actions = document.createElement("div");
     actions.className = "command-row";
-    actions.append(commandButton("Details", () => loadJob(job.id).catch(showError)));
+    actions.append(commandButton("Детали", () => loadJob(job.id).catch(showError)));
     if (["queued", "running"].includes(job.status)) {
-      actions.append(commandButton("Cancel", () => cancelJob(job.id).catch(showError), true));
+      actions.append(commandButton("Отменить", () => cancelJob(job.id).catch(showError), true));
     }
     if (["failed", "partial", "cancelled"].includes(job.status)) {
-      actions.append(commandButton("Retry", () => retryJob(job.id).catch(showError)));
+      actions.append(commandButton("Повторить", () => retryJob(job.id).catch(showError)));
     }
     if (["completed", "partial", "failed", "cancelled"].includes(job.status)) {
-      actions.append(commandButton("Delete", () => deleteJob(job.id).catch(showError), true));
+      actions.append(commandButton("Удалить", () => deleteJob(job.id).catch(showError), true));
     }
     row.append(
-      cell(job.status),
-      cell(job.kind),
+      cell(label("status", job.status)),
+      cell(label("kind", job.kind)),
       cell(`${job.completed_items}/${job.total_items}`),
-      cell([job.current_item, job.current_stage].filter(Boolean).join("; ")),
+      cell([job.current_item, label("stage", job.current_stage)].filter(Boolean).join("; ")),
       cell(job.created_at),
       cell(actions),
     );
@@ -589,11 +661,11 @@ function renderJobs() {
 }
 
 function renderCorpusSummary(status) {
-  $("corpusSummary").textContent = `${status.documents || 0} documents; ${status.points || 0} chunks; ${status.status}`;
+  $("corpusSummary").textContent = `${status.documents || 0} документов; ${status.points || 0} фрагментов; ${label("status", status.status)}`;
 }
 
 async function deleteDocument(fileId, filename) {
-  if (!await confirmChange(`Delete ${filename} from the knowledge base?`)) return;
+  if (!await confirmChange(`Удалить ${filename} из базы знаний?`)) return;
   await request(`/api/admin/documents/${encodeURIComponent(fileId)}`, { method: "DELETE" });
   await loadDocuments();
 }
@@ -615,18 +687,18 @@ function renderDocuments() {
   body.replaceChildren();
   for (const item of filtered) {
     const remove = commandButton(
-      "Delete",
+      "Удалить",
       () => deleteDocument(item.file_id, item.filename || item.file_id).catch(showError),
       true,
     );
-    remove.setAttribute("aria-label", `Delete ${item.filename || item.file_id}`);
+    remove.setAttribute("aria-label", `Удалить ${item.filename || item.file_id}`);
     const row = document.createElement("tr");
     row.append(
       cell(item.filename || ""),
-      cell(item.doc_type || item.source_type || "general"),
-      cell(item.subject || ""),
+      cell(label("kind", item.doc_type || item.source_type || "general")),
+      cell(label("subject", item.subject)),
       cell(item.grade || ""),
-      cell(item.lang || ""),
+      cell(label("language", item.lang)),
       cell(item.chunks || 0),
       cell(remove),
     );
@@ -648,7 +720,7 @@ document.addEventListener("DOMContentLoaded", () => {
       showApp();
       await refreshAll();
     } catch (error) {
-      $("loginError").textContent = error.message;
+      $("loginError").textContent = translateMessage(error.message);
     }
   });
   $("logoutButton").addEventListener("click", async () => {
