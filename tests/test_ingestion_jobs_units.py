@@ -118,6 +118,101 @@ def test_retry_upload_job_copies_only_failed_and_cancelled_items(job_dir):
     assert [path.read_text(encoding="utf-8") for path in copied] == ["failed", "cancelled"]
 
 
+def test_cancel_running_job_is_idempotent_when_already_requested(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    ingestion_jobs.claim_next_job("worker-1")
+
+    first = ingestion_jobs.request_cancel(job["id"])
+    second = ingestion_jobs.request_cancel(job["id"])
+
+    assert first["status"] == "running"
+    assert first["cancel_requested"] is True
+    assert second["status"] == "running"
+    assert second["cancel_requested"] is True
+
+
+def test_cancel_rejects_terminal_job(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    ingestion_jobs.finish_job(job["id"], status="completed")
+
+    with pytest.raises(ValueError, match="queued or running"):
+        ingestion_jobs.request_cancel(job["id"])
+
+
+def test_retry_rejects_non_retryable_statuses(job_dir):
+    queued = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    running = ingestion_jobs.enqueue_corpus_job({"subtree": "B", "ocr": False, "prune": False})
+    ingestion_jobs.claim_next_job("worker-1")
+    completed = ingestion_jobs.enqueue_corpus_job({"subtree": "C", "ocr": False, "prune": False})
+    ingestion_jobs.finish_job(completed["id"], status="completed")
+
+    for job_id in (queued["id"], running["id"], completed["id"]):
+        with pytest.raises(ValueError, match="failed, partial, or cancelled"):
+            ingestion_jobs.retry_job(job_id)
+
+
+def test_retry_upload_job_rejects_without_failed_or_cancelled_items(job_dir):
+    upload_dir = job_dir / "uploads" / "job-1"
+    upload_dir.mkdir(parents=True)
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+    )
+    ingestion_jobs.update_item("item-1", status="completed", stage="done")
+    ingestion_jobs.finish_job("job-1", status="partial")
+
+    with pytest.raises(ValueError, match="no failed or cancelled items"):
+        ingestion_jobs.retry_job("job-1")
+
+
+def test_retry_upload_job_cleans_copied_files_when_enqueue_fails(job_dir, monkeypatch):
+    upload_dir = job_dir / "uploads" / "job-1"
+    upload_dir.mkdir(parents=True)
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+    )
+    ingestion_jobs.update_item("item-1", status="failed", stage="done", error="boom")
+    ingestion_jobs.finish_job("job-1", status="failed", error="boom")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db write failed")
+
+    monkeypatch.setattr(ingestion_jobs, "enqueue_upload_job", boom)
+
+    with pytest.raises(RuntimeError, match="db write failed"):
+        ingestion_jobs.retry_job("job-1")
+    assert [path.name for path in (job_dir / "uploads").iterdir()] == ["job-1"]
+
+
 def test_delete_rejects_active_job_and_removes_terminal_artifacts(job_dir):
     upload_dir = job_dir / "uploads" / "job-1"
     upload_dir.mkdir(parents=True)

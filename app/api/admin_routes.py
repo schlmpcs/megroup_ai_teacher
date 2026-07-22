@@ -63,6 +63,24 @@ class CorpusJobRequest(BaseModel):
 _manifest_adapter = TypeAdapter(list[UploadManifestItem])
 
 
+def _validated_relative_upload_path(relative_path: str, filename: str) -> str:
+    raw = str(relative_path or filename).replace("\\", "/").strip()
+    path = PurePath(raw)
+    if not raw or not path.parts:
+        raise ValueError("relative_path must include a filename")
+    if path.is_absolute():
+        raise ValueError("relative_path must be relative")
+    if ".." in path.parts:
+        raise ValueError("relative_path must not contain '..'")
+    if path.name != filename:
+        raise ValueError("relative_path leaf must match filename")
+    return path.as_posix()
+
+
+def _general_upload_doc_key(relative_path: str, filename: str) -> str:
+    return f"admin_uploads/general/{_validated_relative_upload_path(relative_path, filename)}"
+
+
 def _preview_path(path: str) -> dict:
     filename = PurePath(path.replace("\\", "/")).name
     parsed = corpus_meta.parse_path(path)
@@ -79,6 +97,11 @@ def _preview_path(path: str) -> dict:
                 lang=parsed.get("lang"),
                 lab_number=parsed.get("lab_number"),
             )
+        except ValueError as exc:
+            errors.append(str(exc))
+    else:
+        try:
+            doc_key = _general_upload_doc_key(path, filename)
         except ValueError as exc:
             errors.append(str(exc))
     return {
@@ -200,9 +223,15 @@ async def create_upload_job(
         if Path(filename).suffix.lower() not in ingestion.SUPPORTED_EXTENSIONS:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}")
         try:
+            relative_path = _validated_relative_upload_path(item.relative_path, filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
             metadata, doc_key = item.metadata_and_key()
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if doc_key is None:
+            doc_key = _general_upload_doc_key(relative_path, filename)
         identity = doc_key or filename
         if identity in identities:
             raise HTTPException(status_code=400, detail=f"Duplicate document identity: {identity}")
@@ -211,7 +240,7 @@ async def create_upload_job(
             {
                 "position": position,
                 "filename": filename,
-                "relative_path": item.relative_path,
+                "relative_path": relative_path,
                 "metadata": metadata,
                 "doc_key": doc_key,
                 "ocr": item.ocr,

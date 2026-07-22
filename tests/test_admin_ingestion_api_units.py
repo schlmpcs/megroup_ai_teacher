@@ -45,6 +45,21 @@ def test_preview_marks_duplicate_suggested_identity(client, admin_auth):
     )
 
 
+def test_preview_uses_relative_path_identity_for_general_uploads(client, admin_auth):
+    response = client.post(
+        "/admin/ingestion/preview",
+        headers=admin_auth,
+        json={"paths": ["folder-a/notes.md", "folder-b/notes.md", "folder-a/notes.md"]},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["doc_key"] == "admin_uploads/general/folder-a/notes.md"
+    assert items[1]["doc_key"] == "admin_uploads/general/folder-b/notes.md"
+    assert "duplicate document identity" in items[0]["errors"][0].lower()
+    assert "duplicate document identity" in items[2]["errors"][0].lower()
+    assert items[1]["errors"] == []
+
+
 def test_upload_job_streams_files_and_returns_202(client, admin_auth):
     manifest = [
         {
@@ -68,8 +83,62 @@ def test_upload_job_streams_files_and_returns_202(client, admin_auth):
     job = response.json()
     assert job["kind"] == "upload"
     assert job["status"] == "queued"
+    assert job["items"][0]["doc_key"] == "admin_uploads/textbook/physics/8/ru/Physics 8.md"
     stored = Path(ingestion_jobs.settings.INGESTION_DATA_DIR) / job["items"][0]["stored_path"]
     assert stored.read_bytes() == b"theory"
+
+
+def test_upload_job_accepts_same_filename_from_different_relative_paths(client, admin_auth):
+    manifest = [
+        {"filename": "notes.md", "relative_path": relative_path, "ocr": False}
+        for relative_path in ("folder-a/notes.md", "folder-b/notes.md")
+    ]
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[
+            ("files", ("notes.md", b"one", "text/markdown")),
+            ("files", ("notes.md", b"two", "text/markdown")),
+        ],
+        data={"manifest": json.dumps(manifest)},
+    )
+    assert response.status_code == 202
+    items = response.json()["items"]
+    assert [item["doc_key"] for item in items] == [
+        "admin_uploads/general/folder-a/notes.md",
+        "admin_uploads/general/folder-b/notes.md",
+    ]
+
+
+@pytest.mark.parametrize("relative_path", ["/notes.md", "../notes.md", "folder/../notes.md"])
+def test_upload_job_rejects_invalid_relative_path(client, admin_auth, relative_path):
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={
+            "manifest": json.dumps(
+                [{"filename": "notes.md", "relative_path": relative_path, "ocr": False}]
+            )
+        },
+    )
+    assert response.status_code == 400
+    assert "relative_path" in response.json()["detail"]
+
+
+def test_upload_job_rejects_relative_path_leaf_mismatch(client, admin_auth):
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={
+            "manifest": json.dumps(
+                [{"filename": "notes.md", "relative_path": "folder/other.md", "ocr": False}]
+            )
+        },
+    )
+    assert response.status_code == 400
+    assert "relative_path" in response.json()["detail"]
 
 
 def test_upload_job_rejects_duplicate_identity_and_cleans_tmp(client, admin_auth):
@@ -168,6 +237,30 @@ def test_job_lifecycle_endpoints(client, admin_auth):
         f"/admin/ingestion/jobs/{created['id']}", headers=admin_auth
     )
     assert deleted.json() == {"deleted": True, "job_id": created["id"]}
+
+
+def test_job_lifecycle_conflicts(client, admin_auth):
+    queued = client.post(
+        "/admin/ingestion/jobs/corpus",
+        headers=admin_auth,
+        json={"subtree": "", "ocr": False, "prune": False},
+    ).json()
+    completed = client.post(
+        "/admin/ingestion/jobs/corpus",
+        headers=admin_auth,
+        json={"subtree": "", "ocr": False, "prune": False},
+    ).json()
+    ingestion_jobs.finish_job(completed["id"], status="completed")
+
+    retry_queued = client.post(
+        f"/admin/ingestion/jobs/{queued['id']}/retry", headers=admin_auth
+    )
+    cancel_completed = client.post(
+        f"/admin/ingestion/jobs/{completed['id']}/cancel", headers=admin_auth
+    )
+
+    assert retry_queued.status_code == 409
+    assert cancel_completed.status_code == 409
 
 
 def test_upload_job_rejects_malformed_manifest(client, admin_auth):

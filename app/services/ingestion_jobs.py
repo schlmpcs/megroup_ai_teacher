@@ -560,6 +560,8 @@ def request_cancel(job_id: str) -> dict:
         job = _get_job(connection, job_id)
         if job is None:
             raise KeyError(job_id)
+        if job["status"] not in {"queued", "running"}:
+            raise ValueError("Cancel is allowed only for queued or running jobs")
         connection.execute(
             "UPDATE jobs SET cancel_requested = 1 WHERE id = ?",
             (job_id,),
@@ -682,12 +684,16 @@ def retry_job(job_id: str) -> dict:
     original = get_job(job_id)
     if original is None:
         raise KeyError(job_id)
+    if original["status"] not in {"failed", "partial", "cancelled"}:
+        raise ValueError("Retry is allowed only for failed, partial, or cancelled jobs")
     if original["kind"] == "corpus":
         return enqueue_corpus_job(original["options"], retry_of=original["id"])
 
     eligible = [
         item for item in original["items"] if item["status"] in {"failed", "cancelled"}
     ]
+    if not eligible:
+        raise ValueError("Upload retry has no failed or cancelled items")
     retry_id = new_id()
     copied_paths = []
     retry_items = []
@@ -718,6 +724,15 @@ def retry_job(job_id: str) -> dict:
                     "ocr": item["ocr"],
                 }
             )
+        try:
+            return enqueue_upload_job(retry_id, retry_items, retry_of=original["id"])
+        except Exception:
+            for copied_path in reversed(copied_paths):
+                copied_path.unlink(missing_ok=True)
+            retry_dir = _artifact_dir("uploads", retry_id)
+            if retry_dir.exists():
+                shutil.rmtree(retry_dir)
+            raise
     except Exception:
         for copied_path in reversed(copied_paths):
             copied_path.unlink(missing_ok=True)
@@ -725,7 +740,6 @@ def retry_job(job_id: str) -> dict:
         if retry_dir.exists():
             shutil.rmtree(retry_dir)
         raise
-    return enqueue_upload_job(retry_id, retry_items, retry_of=original["id"])
 
 
 def delete_job(job_id: str) -> bool:
