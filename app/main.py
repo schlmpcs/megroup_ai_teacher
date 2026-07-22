@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
     ingestion_jobs.initialize()
+    ingestion_jobs.cleanup_pending_deletions()
     ingestion_jobs.cleanup_stale_tmp()
     logging.getLogger("assistant").info(
         "Retrieval backend: Qdrant %s (collection '%s'), embedder %s",

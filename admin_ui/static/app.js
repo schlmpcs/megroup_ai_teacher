@@ -7,6 +7,8 @@ const state = {
   selectedJobId: null,
   activeView: "ingest",
   activeSource: "upload",
+  ocrDefault: false,
+  ocrDefaultInitialized: false,
   pollTimer: null,
 };
 
@@ -41,6 +43,8 @@ function showLogin() {
   state.documents = [];
   state.selectedJobId = null;
   state.activeSource = "upload";
+  state.ocrDefault = false;
+  state.ocrDefaultInitialized = false;
   $("loginView").hidden = false;
   $("appView").hidden = true;
   $("fileInput").value = "";
@@ -115,6 +119,17 @@ function hasActiveJobs() {
   return state.jobs.some((job) => ["queued", "running"].includes(job.status));
 }
 
+function initializeOcrDefault(value) {
+  if (state.ocrDefaultInitialized) return;
+  state.ocrDefault = Boolean(value);
+  state.ocrDefaultInitialized = true;
+  for (const row of state.files) {
+    if (!row.ocrOverridden) row.ocr = state.ocrDefault;
+  }
+  $("corpusOcr").checked = state.ocrDefault;
+  renderStaging();
+}
+
 async function refreshAll() {
   if (refreshing || $("appView").hidden) return;
   refreshing = true;
@@ -123,6 +138,7 @@ async function refreshAll() {
       request("/api/admin/ingestion/status"),
       request("/api/admin/corpus_status"),
     ]);
+    initializeOcrDefault(status.ocr_default);
     await loadJobs();
     await refreshSelectedJob();
     renderServiceStatus(status, corpusStatus);
@@ -220,7 +236,8 @@ async function addFiles(fileList) {
     grade: "",
     lang: "",
     lab_number: "",
-    ocr: false,
+    ocr: state.ocrDefault,
+    ocrOverridden: false,
     previewErrors: [],
   }));
   state.files.push(...rows);
@@ -328,6 +345,7 @@ function updateStagingItem(id, field, value) {
   const row = state.files.find((item) => item.id === id);
   if (!row) return;
   row[field] = value;
+  if (field === "ocr") row.ocrOverridden = true;
   row.previewErrors = [];
   if (field === "kind" && value !== "lab_instruction") row.lab_number = "";
   if (field === "kind" && value === "general") {

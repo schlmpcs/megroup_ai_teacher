@@ -68,9 +68,12 @@ services:
     build: ./admin_ui
     ports:
       - "8004:8000"
-    env_file:
-      - .env
     environment:
+      - ADMIN_UI_USERNAME=${ADMIN_UI_USERNAME}
+      - ADMIN_UI_PASSWORD_HASH=${ADMIN_UI_PASSWORD_HASH}
+      - ADMIN_UI_SESSION_SECRET=${ADMIN_UI_SESSION_SECRET}
+      - ADMIN_UI_SESSION_TTL_S=${ADMIN_UI_SESSION_TTL_S:-28800}
+      - ADMIN_UI_COOKIE_SECURE=${ADMIN_UI_COOKIE_SECURE:-true}
       - BACKEND_BASE_URL=http://api:8000
       - BACKEND_ADMIN_API_KEY=${ADMIN_API_KEY}
     depends_on:

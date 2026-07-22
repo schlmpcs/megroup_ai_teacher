@@ -52,6 +52,15 @@ app.mount(
 login_limiter = LoginLimiter()
 
 
+@app.middleware("http")
+async def disable_session_caching(request: Request, call_next):
+    response = await call_next(request)
+    session_path = request.url.path in {"/auth/login", "/api/session", "/auth/logout"}
+    if session_path or request.url.path.startswith("/api/admin/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str

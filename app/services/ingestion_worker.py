@@ -1,8 +1,9 @@
 import asyncio
+import fcntl
 import logging
 import os
 import socket
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import httpx
@@ -13,6 +14,24 @@ from app.services import ingestion, ingestion_jobs
 logger = logging.getLogger("assistant.ingestion_worker")
 _HEARTBEAT_S = 5.0
 _POLL_S = 1.0
+
+
+@contextmanager
+def worker_lock():
+    lock_path = ingestion_jobs.data_dir() / "worker.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")
+    try:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("An ingestion worker is already running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 async def invalidate_answer_cache() -> bool:
@@ -300,18 +319,19 @@ async def _heartbeat_loop(worker_id: str) -> None:
 
 async def run_forever(worker_id: str | None = None) -> None:
     ingestion_jobs.initialize()
-    recovered = ingestion_jobs.recover_interrupted_jobs()
-    if recovered:
-        if not await invalidate_answer_cache():
-            logger.warning("Answer-cache invalidation failed after recovering jobs")
-    worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
-    heartbeat = asyncio.create_task(_heartbeat_loop(worker_id))
-    try:
-        while True:
-            worked = await run_once(worker_id)
-            if not worked:
-                await asyncio.sleep(_POLL_S)
-    finally:
-        heartbeat.cancel()
-        with suppress(asyncio.CancelledError):
-            await heartbeat
+    with worker_lock():
+        recovered = ingestion_jobs.recover_interrupted_jobs()
+        if recovered:
+            if not await invalidate_answer_cache():
+                logger.warning("Answer-cache invalidation failed after recovering jobs")
+        worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
+        heartbeat = asyncio.create_task(_heartbeat_loop(worker_id))
+        try:
+            while True:
+                worked = await run_once(worker_id)
+                if not worked:
+                    await asyncio.sleep(_POLL_S)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat

@@ -336,6 +336,7 @@ async def create_corpus_job(request: CorpusJobRequest):
 @admin_router.get("/ingestion/status")
 async def ingestion_status():
     return {
+        "ocr_default": settings.OCR_ENABLED,
         "queue": ingestion_jobs.queue_status(),
         "worker": ingestion_jobs.worker_status(),
     }

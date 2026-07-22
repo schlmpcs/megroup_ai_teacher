@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from admin_ui.auth import hash_password
-from admin_ui.config import get_settings
+from admin_ui.config import AdminSettings, get_settings
 from admin_ui.main import app, login_limiter
 
 
@@ -18,6 +18,23 @@ def _configure(monkeypatch):
     monkeypatch.setenv("BACKEND_BASE_URL", "http://backend")
     monkeypatch.setenv("BACKEND_ADMIN_API_KEY", "backend-admin-key")
     get_settings.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["ADMIN_UI_SESSION_SECRET", "BACKEND_ADMIN_API_KEY"],
+)
+def test_settings_reject_known_secret_placeholder(field):
+    values = {
+        "ADMIN_UI_USERNAME": "admin",
+        "ADMIN_UI_PASSWORD_HASH": hash_password("secret"),
+        "ADMIN_UI_SESSION_SECRET": "session-secret-1234567890-abcdef",
+        "BACKEND_ADMIN_API_KEY": "backend-admin-key",
+    }
+    values[field] = "generate-with-python-secrets-token-urlsafe-32"
+
+    with pytest.raises(ValueError, match=field):
+        AdminSettings(**values)
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +58,22 @@ def test_login_sets_http_only_cookie_and_returns_csrf(monkeypatch):
     assert response.json()["csrf_token"]
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=strict" in response.headers["set-cookie"]
+
+
+def test_session_endpoints_and_admin_proxy_disable_caching(monkeypatch):
+    _configure(monkeypatch)
+    app.state.backend_transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"status": "ready"})
+    )
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        csrf = login.json()["csrf_token"]
+        session = client.get("/api/session")
+        proxy = client.get("/api/admin/corpus_status")
+        logout = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
+
+    for response in (login, session, proxy, logout):
+        assert response.headers["cache-control"] == "no-store"
 
 
 def test_index_serves_operator_shell_without_backend_secrets(monkeypatch):
@@ -130,6 +163,19 @@ def test_static_javascript_resets_form_controls_and_requires_corpus_preview(monk
         "if (!state.corpusPreview) return;",
     ]:
         assert reset in response.text
+
+
+def test_static_javascript_initializes_ocr_default_once_per_session(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    assert "ocrDefaultInitialized: false" in response.text
+    assert "if (state.ocrDefaultInitialized) return;" in response.text
+    assert "if (!row.ocrOverridden) row.ocr = state.ocrDefault;" in response.text
+    assert 'if (field === "ocr") row.ocrOverridden = true;' in response.text
+    assert "ocr: state.ocrDefault" in response.text
+    assert 'initializeOcrDefault(status.ocr_default);' in response.text
 
 
 def test_static_javascript_polling_respects_hidden_app(monkeypatch):

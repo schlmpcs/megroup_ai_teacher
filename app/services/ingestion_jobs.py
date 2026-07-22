@@ -57,12 +57,17 @@ CREATE TABLE IF NOT EXISTS job_items (
     UNIQUE(job_id, position)
 );
 CREATE INDEX IF NOT EXISTS job_items_job_idx ON job_items(job_id, position);
+CREATE TABLE IF NOT EXISTS job_deletions (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    plan_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS worker_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     worker_id TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL
 );
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 """
 
 TERMINAL_STATUSES = frozenset({"completed", "partial", "failed", "cancelled"})
@@ -147,31 +152,66 @@ def _remove_tree_if_exists(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _quarantine_path(path: Path) -> Path:
-    return path.with_name(f"{path.name}.delete-{new_id()}")
+def _deletion_plan(job_id: str) -> list[dict[str, str]]:
+    return [
+        {
+            "original": f"{kind}/{job_id}",
+            "quarantine": f"{kind}/{job_id}.delete-{new_id()}",
+        }
+        for kind in ("uploads", "tmp")
+    ]
 
 
-def _quarantine_artifacts(job_id: str) -> list[tuple[Path, Path]]:
-    moved = []
-    for kind in ("uploads", "tmp"):
-        original = _artifact_dir(kind, job_id)
-        if not original.exists():
-            continue
-        quarantine = _quarantine_path(original)
-        try:
-            os.replace(original, quarantine)
-        except Exception:
-            for restore_original, restore_quarantine in reversed(moved):
-                os.replace(restore_quarantine, restore_original)
-            raise
-        moved.append((original, quarantine))
-    return moved
+def _validated_deletion_plan(job_id: str, value) -> list[tuple[Path, Path]]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("Malformed deletion plan")
+    root = data_dir().resolve()
+    paths = []
+    kinds = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("Malformed deletion plan")
+        original_value = item.get("original")
+        quarantine_value = item.get("quarantine")
+        if not isinstance(original_value, str) or not isinstance(quarantine_value, str):
+            raise ValueError("Malformed deletion plan")
+        original_relative = PurePosixPath(original_value)
+        quarantine_relative = PurePosixPath(quarantine_value)
+        if (
+            original_relative.is_absolute()
+            or quarantine_relative.is_absolute()
+            or ".." in original_relative.parts
+            or ".." in quarantine_relative.parts
+            or len(original_relative.parts) != 2
+            or len(quarantine_relative.parts) != 2
+        ):
+            raise ValueError("Deletion path must stay inside ingestion data")
+        kind = original_relative.parts[0]
+        if (
+            kind not in {"uploads", "tmp"}
+            or quarantine_relative.parts[0] != kind
+            or original_relative.parts[1] != job_id
+            or not quarantine_relative.parts[1].startswith(f"{job_id}.delete-")
+        ):
+            raise ValueError("Deletion path does not match job artifacts")
+        parent = (root / kind).resolve(strict=True)
+        if not parent.is_relative_to(root):
+            raise ValueError("Deletion path must stay inside ingestion data")
+        original = root / original_relative
+        quarantine = root / quarantine_relative
+        kinds.add(kind)
+        paths.append((original, quarantine))
+    if kinds != {"uploads", "tmp"}:
+        raise ValueError("Malformed deletion plan")
+    return paths
 
 
-def _restore_quarantined_artifacts(moved: list[tuple[Path, Path]]) -> None:
-    for original, quarantine in reversed(moved):
-        if quarantine.exists():
-            os.replace(quarantine, original)
+def _remove_deletion_path(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("Deletion path must not be a symlink")
+    if path.exists() and not path.is_dir():
+        raise ValueError("Deletion path must be a directory")
+    _remove_tree_if_exists(path)
 
 
 def _item_from_row(row: sqlite3.Row) -> dict:
@@ -410,6 +450,11 @@ def claim_next_job(worker_id: str) -> dict | None:
     started_at = _now()
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if connection.execute(
+            "SELECT 1 FROM jobs WHERE status = 'running' LIMIT 1"
+        ).fetchone():
+            connection.commit()
+            return None
         row = connection.execute(
             """
             SELECT rowid, id
@@ -682,9 +727,15 @@ def worker_status() -> dict:
 
 
 def retry_job(job_id: str) -> dict:
-    original = get_job(job_id)
-    if original is None:
-        raise KeyError(job_id)
+    with connect() as connection:
+        original = _get_job(connection, job_id)
+        if original is None:
+            raise KeyError(job_id)
+        if connection.execute(
+            "SELECT 1 FROM job_deletions WHERE job_id = ?",
+            (job_id,),
+        ).fetchone():
+            raise ValueError("Retry is not allowed while deletion is pending")
     if original["status"] not in {"failed", "partial", "cancelled"}:
         raise ValueError("Retry is allowed only for failed, partial, or cancelled jobs")
     if original["kind"] == "corpus":
@@ -743,26 +794,70 @@ def retry_job(job_id: str) -> dict:
         raise
 
 
+def _resume_job_deletion(job_id: str) -> bool:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT plan_json FROM job_deletions WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+    try:
+        plan = _json_load(row["plan_json"])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Malformed deletion plan") from exc
+    for original, quarantine in _validated_deletion_plan(job_id, plan):
+        if original.is_symlink() or quarantine.is_symlink():
+            raise ValueError("Deletion path must not be a symlink")
+        if original.exists():
+            if quarantine.exists():
+                _remove_deletion_path(original)
+            else:
+                os.replace(original, quarantine)
+        _remove_deletion_path(quarantine)
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        connection.commit()
+    return True
+
+
 def delete_job(job_id: str) -> bool:
     with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         job = _get_job(connection, job_id)
         if job is None:
+            connection.commit()
             return False
         if job["status"] not in TERMINAL_STATUSES:
             raise ValueError("Only terminal jobs can be deleted")
-    moved = _quarantine_artifacts(job_id)
+        if not connection.execute(
+            "SELECT 1 FROM job_deletions WHERE job_id = ?",
+            (job_id,),
+        ).fetchone():
+            connection.execute(
+                "INSERT INTO job_deletions (job_id, plan_json, created_at) VALUES (?, ?, ?)",
+                (job_id, _json_dump(_deletion_plan(job_id)), _now()),
+            )
+        connection.commit()
+    return _resume_job_deletion(job_id)
+
+
+def cleanup_pending_deletions() -> int:
     with connect() as connection:
+        job_ids = [
+            row["job_id"]
+            for row in connection.execute(
+                "SELECT job_id FROM job_deletions ORDER BY created_at ASC, rowid ASC"
+            ).fetchall()
+        ]
+    completed = 0
+    for job_id in job_ids:
         try:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            _restore_quarantined_artifacts(moved)
-            raise
-    for _, quarantine in moved:
-        _remove_tree_if_exists(quarantine)
-    return True
+            completed += int(_resume_job_deletion(job_id))
+        except OSError:
+            continue
+    return completed
 
 
 def cleanup_stale_tmp() -> int:

@@ -17,7 +17,10 @@ def job_dir(tmp_path, monkeypatch):
 def test_initialize_creates_versioned_schema(job_dir):
     assert (job_dir / "jobs.sqlite3").is_file()
     with ingestion_jobs.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'job_deletions'"
+        ).fetchone()
 
 
 def test_claim_next_job_is_fifo_and_atomic(job_dir):
@@ -28,6 +31,15 @@ def test_claim_next_job_is_fifo_and_atomic(job_dir):
 
     assert claimed["id"] == first["id"]
     assert claimed["status"] == "running"
+    assert ingestion_jobs.get_job(second["id"])["status"] == "queued"
+
+
+def test_claim_next_job_refuses_second_running_job(job_dir):
+    first = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    second = ingestion_jobs.enqueue_corpus_job({"subtree": "B", "ocr": False, "prune": False})
+
+    assert ingestion_jobs.claim_next_job("worker-1")["id"] == first["id"]
+    assert ingestion_jobs.claim_next_job("worker-2") is None
     assert ingestion_jobs.get_job(second["id"])["status"] == "queued"
 
 
@@ -399,20 +411,34 @@ def test_delete_job_keeps_row_when_artifact_cleanup_fails(job_dir, monkeypatch):
     )
     ingestion_jobs.finish_job("job-1", status="failed", error="boom")
 
+    real_rmtree = ingestion_jobs.shutil.rmtree
+
     def _boom(path, *args, **kwargs):
         if Path(path).name.startswith("job-1.delete-"):
             raise OSError("disk error")
-        return None
+        return real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(ingestion_jobs.shutil, "rmtree", _boom)
 
     with pytest.raises(OSError, match="disk error"):
         ingestion_jobs.delete_job("job-1")
-    assert ingestion_jobs.get_job("job-1") is None
+    assert ingestion_jobs.get_job("job-1") is not None
     assert any(path.name.startswith("job-1.delete-") for path in (job_dir / "uploads").iterdir())
+    with ingestion_jobs.connect() as connection:
+        assert connection.execute(
+            "SELECT plan_json FROM job_deletions WHERE job_id = ?", ("job-1",)
+        ).fetchone()
+    with pytest.raises(ValueError, match="deletion is pending"):
+        ingestion_jobs.retry_job("job-1")
+
+    assert ingestion_jobs.cleanup_pending_deletions() == 0
+    assert ingestion_jobs.get_job("job-1") is not None
+    monkeypatch.setattr(ingestion_jobs.shutil, "rmtree", real_rmtree)
+    assert ingestion_jobs.cleanup_pending_deletions() == 1
+    assert ingestion_jobs.get_job("job-1") is None
 
 
-def test_delete_job_restores_artifacts_when_sqlite_delete_fails(job_dir):
+def test_delete_job_retries_database_delete_after_artifact_cleanup(job_dir):
     upload_dir = job_dir / "uploads" / "job-1"
     tmp_dir = job_dir / "tmp" / "job-1"
     upload_dir.mkdir(parents=True)
@@ -452,10 +478,60 @@ def test_delete_job_restores_artifacts_when_sqlite_delete_fails(job_dir):
         ingestion_jobs.delete_job("job-1")
 
     assert ingestion_jobs.get_job("job-1") is not None
-    assert upload_dir.is_dir()
-    assert tmp_dir.is_dir()
-    assert (upload_dir / "item-1").read_text(encoding="utf-8") == "content"
-    assert (tmp_dir / "scratch.txt").read_text(encoding="utf-8") == "tmp"
+    assert not upload_dir.exists()
+    assert not tmp_dir.exists()
+    with ingestion_jobs.connect() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM job_deletions WHERE job_id = ?", ("job-1",)
+        ).fetchone()
+        connection.execute("DROP TRIGGER jobs_abort_delete")
+
+    assert ingestion_jobs.cleanup_pending_deletions() == 1
+    assert ingestion_jobs.get_job("job-1") is None
+
+
+def test_pending_deletion_paths_are_confined_to_ingestion_data(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    ingestion_jobs.finish_job(job["id"], status="failed", error="boom")
+    outside = job_dir.parent / "outside-job-artifacts"
+    outside.mkdir()
+    with ingestion_jobs.connect() as connection:
+        connection.execute(
+            "INSERT INTO job_deletions (job_id, plan_json, created_at) VALUES (?, ?, ?)",
+            (
+                job["id"],
+                ingestion_jobs._json_dump(
+                    [
+                        {
+                            "original": "../outside-job-artifacts",
+                            "quarantine": f"uploads/{job['id']}.delete-test",
+                        },
+                        {
+                            "original": f"tmp/{job['id']}",
+                            "quarantine": f"tmp/{job['id']}.delete-test",
+                        },
+                    ]
+                ),
+                ingestion_jobs.now(),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="Deletion path"):
+        ingestion_jobs.cleanup_pending_deletions()
+    assert outside.exists()
+
+
+def test_pending_deletion_rejects_symlinked_job_artifacts(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    ingestion_jobs.finish_job(job["id"], status="failed", error="boom")
+    other = job_dir / "uploads" / "other-job"
+    other.mkdir()
+    (other / "keep.txt").write_text("keep", encoding="utf-8")
+    (job_dir / "uploads" / job["id"]).symlink_to(other, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        ingestion_jobs.delete_job(job["id"])
+    assert (other / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
 def test_cleanup_stale_tmp_preserves_terminal_job_directory(job_dir):

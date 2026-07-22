@@ -32,6 +32,7 @@ async def corpus_status():
 @app.get("/admin/ingestion/status", dependencies=[Depends(authorize)])
 async def ingestion_status():
     return {
+        "ocr_default": True,
         "queue": {
             "queued": sum(job["status"] == "queued" for job in jobs.values()),
             "running": sum(job["status"] == "running" for job in jobs.values()),

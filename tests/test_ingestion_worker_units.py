@@ -41,6 +41,35 @@ async def successful_invalidation():
     return True
 
 
+def test_worker_lock_is_exclusive(worker_store):
+    with ingestion_worker.worker_lock():
+        with pytest.raises(RuntimeError, match="already running"):
+            with ingestion_worker.worker_lock():
+                pass
+
+
+def test_worker_lock_is_released(worker_store):
+    with ingestion_worker.worker_lock():
+        pass
+    with ingestion_worker.worker_lock():
+        pass
+
+
+async def test_second_worker_fails_before_recovery(worker_store, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        ingestion_worker.ingestion_jobs,
+        "recover_interrupted_jobs",
+        lambda: events.append("recover"),
+    )
+
+    with ingestion_worker.worker_lock():
+        with pytest.raises(RuntimeError, match="already running"):
+            await ingestion_worker.run_forever("worker-2")
+
+    assert events == []
+
+
 async def test_run_once_processes_one_upload_job_and_updates_stages(worker_store, monkeypatch):
     queue_upload(worker_store, "job-1", ["notes.md"])
     stages = []

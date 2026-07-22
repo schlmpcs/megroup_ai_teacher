@@ -355,10 +355,15 @@ def test_job_queries_validate_pagination_and_missing_ids(client, admin_auth):
     assert client.post(f"/admin/ingestion/jobs/{missing}/retry", headers=admin_auth).status_code == 404
 
 
-def test_ingestion_status_reports_offline_worker(client, admin_auth):
+@pytest.mark.parametrize("configured", [False, True])
+def test_ingestion_status_reports_offline_worker_and_ocr_default(
+    client, admin_auth, monkeypatch, configured
+):
+    monkeypatch.setattr(admin_routes.settings, "OCR_ENABLED", configured)
     response = client.get("/admin/ingestion/status", headers=admin_auth)
     assert response.status_code == 200
     assert response.json()["worker"]["online"] is False
+    assert response.json()["ocr_default"] is configured
 
 
 def test_clear_answer_cache_uses_admin_boundary(client, auth, admin_auth, monkeypatch):

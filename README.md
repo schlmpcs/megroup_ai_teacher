@@ -66,7 +66,12 @@ OpenAI: Responses API (генерация, ключ OpenAI)
 Проще всего поднять весь стек через Docker:
 
 ```bash
-cp .env.example .env          # заполнить INTERNAL_API_KEY и OPENAI_API_KEY
+cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(32))"  # INTERNAL_API_KEY
+python -c "import secrets; print(secrets.token_urlsafe(32))"  # distinct ADMIN_API_KEY
+python -c "import secrets; print(secrets.token_urlsafe(32))"  # ADMIN_UI_SESSION_SECRET
+python -m admin_ui.hash_password                              # ADMIN_UI_PASSWORD_HASH
+# Set OPENAI_API_KEY and the four generated values in .env.
 docker compose up --build     # 7 сервисов (порты ниже)
 ```
 
@@ -89,7 +94,10 @@ docker compose up --build     # 7 сервисов (порты ниже)
 
 ### Operator UI
 
-Generate the operator UI password hash:
+The full quick start above requires distinct generated `INTERNAL_API_KEY` and
+`ADMIN_API_KEY` values, `OPENAI_API_KEY`, a generated
+`ADMIN_UI_SESSION_SECRET`, and the output of `python -m admin_ui.hash_password`.
+To start only the operator services after configuring `.env`:
 
 ```bash
 python -m admin_ui.hash_password

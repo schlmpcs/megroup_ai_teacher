@@ -67,6 +67,29 @@ def test_health_no_auth(client):
     assert response.json()["supported_languages"] == ["ru", "kk", "en"]
 
 
+async def test_startup_resumes_pending_deletions_after_schema_init(monkeypatch):
+    import app.main as main
+
+    events = []
+    monkeypatch.setattr(main, "missing_required_env_vars", lambda: [])
+    monkeypatch.setattr(main.ingestion_jobs, "initialize", lambda: events.append("initialize"))
+    monkeypatch.setattr(
+        main.ingestion_jobs,
+        "cleanup_pending_deletions",
+        lambda: events.append("pending"),
+    )
+    monkeypatch.setattr(
+        main.ingestion_jobs,
+        "cleanup_stale_tmp",
+        lambda: events.append("stale"),
+    )
+
+    async with main.lifespan(main.app):
+        pass
+
+    assert events == ["initialize", "pending", "stale"]
+
+
 # ── /ask ──────────────────────────────────────────────────────────────────
 
 

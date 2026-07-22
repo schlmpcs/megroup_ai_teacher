@@ -66,12 +66,17 @@ def test_admin_ui_end_to_end(tmp_path):
             page.click("#loginForm button[type=submit]")
             expect(page.locator("#appView")).to_be_visible()
             expect(page.locator("#loginView")).to_be_hidden()
+            expect(page.locator("#corpusOcr")).to_be_checked()
 
             page.set_input_files(
                 "#fileInput",
                 {"name": "notes.md", "mimeType": "text/markdown", "buffer": b"notes"},
             )
             expect(page.locator("#stagingTable tbody tr")).to_have_count(1)
+            upload_ocr = page.locator('#stagingTable input[type="checkbox"]')
+            expect(upload_ocr).to_be_checked()
+            upload_ocr.uncheck()
+            expect(upload_ocr).not_to_be_checked()
             page.select_option("#stagingTable select[data-field=kind]", "textbook")
             page.select_option("#stagingTable select[data-field=subject]", "physics")
             page.select_option("#stagingTable select[data-field=grade]", "8")
@@ -88,6 +93,7 @@ def test_admin_ui_end_to_end(tmp_path):
 
             page.click('[data-view="ingest"]')
             page.click('[data-source="corpus"]')
+            page.locator("#corpusOcr").uncheck()
             page.click("#previewCorpus")
             expect(page.locator("#corpusPreview")).to_contain_text("1 recognized of 2")
             expect(page.locator("#corpusPreview")).to_contain_text("misc.md")
