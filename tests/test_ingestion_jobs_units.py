@@ -273,7 +273,7 @@ def test_delete_job_keeps_row_when_artifact_cleanup_fails(job_dir, monkeypatch):
     ingestion_jobs.finish_job("job-1", status="failed", error="boom")
 
     def _boom(path, *args, **kwargs):
-        if Path(path) == upload_dir:
+        if Path(path).name.startswith("job-1.delete-"):
             raise OSError("disk error")
         return None
 
@@ -281,4 +281,85 @@ def test_delete_job_keeps_row_when_artifact_cleanup_fails(job_dir, monkeypatch):
 
     with pytest.raises(OSError, match="disk error"):
         ingestion_jobs.delete_job("job-1")
+    assert ingestion_jobs.get_job("job-1") is None
+    assert any(path.name.startswith("job-1.delete-") for path in (job_dir / "uploads").iterdir())
+
+
+def test_delete_job_restores_artifacts_when_sqlite_delete_fails(job_dir):
+    upload_dir = job_dir / "uploads" / "job-1"
+    tmp_dir = job_dir / "tmp" / "job-1"
+    upload_dir.mkdir(parents=True)
+    tmp_dir.mkdir(parents=True)
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    (tmp_dir / "scratch.txt").write_text("tmp", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+    )
+    ingestion_jobs.finish_job("job-1", status="failed", error="boom")
+    with ingestion_jobs.connect() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER jobs_abort_delete
+            BEFORE DELETE ON jobs
+            BEGIN
+                SELECT RAISE(ABORT, 'db delete blocked');
+            END;
+            """
+        )
+
+    with pytest.raises(Exception, match="db delete blocked"):
+        ingestion_jobs.delete_job("job-1")
+
     assert ingestion_jobs.get_job("job-1") is not None
+    assert upload_dir.is_dir()
+    assert tmp_dir.is_dir()
+    assert (upload_dir / "item-1").read_text(encoding="utf-8") == "content"
+    assert (tmp_dir / "scratch.txt").read_text(encoding="utf-8") == "tmp"
+
+
+def test_cleanup_stale_tmp_preserves_terminal_job_directory(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
+    ingestion_jobs.finish_job(job["id"], status="failed", error="boom")
+    tmp_dir = job_dir / "tmp" / job["id"]
+    tmp_dir.mkdir(parents=True)
+    cutoff = datetime.now(UTC) - timedelta(hours=25)
+    import os
+
+    os.utime(tmp_dir, (cutoff.timestamp(), cutoff.timestamp()))
+
+    assert ingestion_jobs.cleanup_stale_tmp() == 0
+    assert tmp_dir.exists()
+
+
+def test_cleanup_stale_tmp_surfaces_removal_failure(job_dir, monkeypatch):
+    old = job_dir / "tmp" / "old-job"
+    old.mkdir(parents=True)
+    cutoff = datetime.now(UTC) - timedelta(hours=25)
+    import os
+
+    os.utime(old, (cutoff.timestamp(), cutoff.timestamp()))
+
+    def _boom(path, *args, **kwargs):
+        if Path(path) == old:
+            raise OSError("cannot remove")
+        return None
+
+    monkeypatch.setattr(ingestion_jobs.shutil, "rmtree", _boom)
+
+    with pytest.raises(OSError, match="cannot remove"):
+        ingestion_jobs.cleanup_stale_tmp()
+    assert old.exists()

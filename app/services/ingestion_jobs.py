@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import sqlite3
 import uuid
@@ -144,6 +145,33 @@ def _artifact_dir(kind: str, job_id: str) -> Path:
 def _remove_tree_if_exists(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
+
+
+def _quarantine_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.delete-{new_id()}")
+
+
+def _quarantine_artifacts(job_id: str) -> list[tuple[Path, Path]]:
+    moved = []
+    for kind in ("uploads", "tmp"):
+        original = _artifact_dir(kind, job_id)
+        if not original.exists():
+            continue
+        quarantine = _quarantine_path(original)
+        try:
+            os.replace(original, quarantine)
+        except Exception:
+            for restore_original, restore_quarantine in reversed(moved):
+                os.replace(restore_quarantine, restore_original)
+            raise
+        moved.append((original, quarantine))
+    return moved
+
+
+def _restore_quarantined_artifacts(moved: list[tuple[Path, Path]]) -> None:
+    for original, quarantine in reversed(moved):
+        if quarantine.exists():
+            os.replace(quarantine, original)
 
 
 def _item_from_row(row: sqlite3.Row) -> dict:
@@ -706,10 +734,18 @@ def delete_job(job_id: str) -> bool:
             return False
         if job["status"] not in TERMINAL_STATUSES:
             raise ValueError("Only terminal jobs can be deleted")
-    _remove_tree_if_exists(_artifact_dir("uploads", job_id))
-    _remove_tree_if_exists(_artifact_dir("tmp", job_id))
+    moved = _quarantine_artifacts(job_id)
     with connect() as connection:
-        connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            _restore_quarantined_artifacts(moved)
+            raise
+    for _, quarantine in moved:
+        _remove_tree_if_exists(quarantine)
     return True
 
 
@@ -718,22 +754,20 @@ def cleanup_stale_tmp() -> int:
     if not tmp_root.exists():
         return 0
     with connect() as connection:
-        active_ids = {
+        known_ids = {
             row["id"]
-            for row in connection.execute(
-                "SELECT id FROM jobs WHERE status NOT IN ('completed', 'partial', 'failed', 'cancelled')"
-            ).fetchall()
+            for row in connection.execute("SELECT id FROM jobs").fetchall()
         }
     now_ts = datetime.now(UTC).timestamp()
     removed = 0
     for path in tmp_root.iterdir():
         if not path.is_dir():
             continue
-        if path.name in active_ids:
+        if path.name in known_ids:
             continue
         age_s = now_ts - path.stat().st_mtime
         if age_s <= _TMP_MAX_AGE_S:
             continue
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path)
         removed += 1
     return removed
