@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 import uuid
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -26,13 +28,16 @@ def authorize(authorization: str = Header("")):
 
 @app.get("/admin/corpus_status", dependencies=[Depends(authorize)])
 async def corpus_status():
+    if os.environ.get("FAKE_CORPUS_STATUS_FAIL", "false").lower() == "true":
+        raise HTTPException(status_code=503, detail="Synthetic corpus status failure")
     return {"status": "ready", "documents": len(documents), "points": 3}
 
 
 @app.get("/admin/ingestion/status", dependencies=[Depends(authorize)])
 async def ingestion_status():
+    await asyncio.sleep(float(os.environ.get("FAKE_INGESTION_STATUS_DELAY_S", "0")))
     return {
-        "ocr_default": True,
+        "ocr_default": os.environ.get("FAKE_OCR_DEFAULT", "true").lower() == "true",
         "queue": {
             "queued": sum(job["status"] == "queued" for job in jobs.values()),
             "running": sum(job["status"] == "running" for job in jobs.values()),

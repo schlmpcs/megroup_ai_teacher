@@ -9,6 +9,7 @@ const state = {
   activeSource: "upload",
   ocrDefault: false,
   ocrDefaultInitialized: false,
+  corpusOcrOverridden: false,
   pollTimer: null,
 };
 
@@ -45,6 +46,7 @@ function showLogin() {
   state.activeSource = "upload";
   state.ocrDefault = false;
   state.ocrDefaultInitialized = false;
+  state.corpusOcrOverridden = false;
   $("loginView").hidden = false;
   $("appView").hidden = true;
   $("fileInput").value = "";
@@ -126,7 +128,7 @@ function initializeOcrDefault(value) {
   for (const row of state.files) {
     if (!row.ocrOverridden) row.ocr = state.ocrDefault;
   }
-  $("corpusOcr").checked = state.ocrDefault;
+  if (!state.corpusOcrOverridden) $("corpusOcr").checked = state.ocrDefault;
   renderStaging();
 }
 
@@ -134,11 +136,9 @@ async function refreshAll() {
   if (refreshing || $("appView").hidden) return;
   refreshing = true;
   try {
-    const [status, corpusStatus] = await Promise.all([
-      request("/api/admin/ingestion/status"),
-      request("/api/admin/corpus_status"),
-    ]);
+    const status = await request("/api/admin/ingestion/status");
     initializeOcrDefault(status.ocr_default);
+    const corpusStatus = await request("/api/admin/corpus_status");
     await loadJobs();
     await refreshSelectedJob();
     renderServiceStatus(status, corpusStatus);
@@ -668,6 +668,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("queueUpload").addEventListener("click", () => queueUpload().catch(showError));
   $("previewCorpus").addEventListener("click", () => previewCorpus().catch(showError));
   $("queueCorpus").addEventListener("click", () => queueCorpus().catch(showError));
+  $("corpusOcr").addEventListener("change", () => {
+    state.corpusOcrOverridden = true;
+  });
   $("corpusSubtree").addEventListener("input", () => {
     const hasSubtree = Boolean($("corpusSubtree").value.trim());
     $("corpusPrune").checked = false;

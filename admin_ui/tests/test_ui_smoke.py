@@ -45,6 +45,9 @@ def test_admin_ui_end_to_end(tmp_path):
         "ADMIN_UI_COOKIE_SECURE": "false",
         "BACKEND_BASE_URL": f"http://127.0.0.1:{backend_port}",
         "BACKEND_ADMIN_API_KEY": "smoke-backend-key",
+        "FAKE_CORPUS_STATUS_FAIL": "false",
+        "FAKE_INGESTION_STATUS_DELAY_S": "0",
+        "FAKE_OCR_DEFAULT": "true",
     }
     backend = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "admin_ui.tests.fake_backend:app", "--port", str(backend_port)],
@@ -165,6 +168,75 @@ def test_admin_ui_end_to_end(tmp_path):
             browser.close()
             assert desktop_screenshot.stat().st_size > 1000
             assert mobile_screenshot.stat().st_size > 1000
+    finally:
+        ui.terminate()
+        backend.terminate()
+        ui.wait(timeout=10)
+        backend.wait(timeout=10)
+
+
+def test_ocr_default_survives_corpus_failure_and_early_operator_override():
+    from playwright.sync_api import expect, sync_playwright
+
+    from admin_ui.auth import hash_password
+
+    backend_port = free_port()
+    ui_port = free_port()
+    env = {
+        **os.environ,
+        "ADMIN_UI_USERNAME": "admin",
+        "ADMIN_UI_PASSWORD_HASH": hash_password("secret"),
+        "ADMIN_UI_SESSION_SECRET": "session-secret-1234567890-abcdef",
+        "ADMIN_UI_COOKIE_SECURE": "false",
+        "BACKEND_BASE_URL": f"http://127.0.0.1:{backend_port}",
+        "BACKEND_ADMIN_API_KEY": "smoke-backend-key",
+        "FAKE_CORPUS_STATUS_FAIL": "true",
+        "FAKE_INGESTION_STATUS_DELAY_S": "1",
+        "FAKE_OCR_DEFAULT": "true",
+    }
+    backend = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "admin_ui.tests.fake_backend:app", "--port", str(backend_port)],
+        env=env,
+    )
+    ui = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "admin_ui.main:app", "--port", str(ui_port)],
+        env=env,
+    )
+    try:
+        wait_ready(f"http://127.0.0.1:{backend_port}/docs")
+        wait_ready(f"http://127.0.0.1:{ui_port}/health")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page()
+            page.goto(f"http://127.0.0.1:{ui_port}")
+            page.fill("#username", "admin")
+            page.fill("#password", "secret")
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/admin/ingestion/status")
+            ) as status_response, page.expect_response(
+                lambda response: response.url.endswith("/api/admin/corpus_status")
+            ) as corpus_response:
+                page.click("#loginForm button[type=submit]")
+                expect(page.locator("#appView")).to_be_visible()
+                page.click('[data-source="corpus"]')
+                corpus_ocr = page.locator("#corpusOcr")
+                corpus_ocr.check()
+                corpus_ocr.uncheck()
+                page.click('[data-source="upload"]')
+                page.set_input_files(
+                    "#fileInput",
+                    {"name": "early.md", "mimeType": "text/markdown", "buffer": b"early"},
+                )
+                upload_ocr = page.locator('#stagingTable input[type="checkbox"]')
+                expect(upload_ocr).not_to_be_checked()
+
+            assert status_response.value.status == 200
+            assert corpus_response.value.status == 503
+            expect(upload_ocr).to_be_checked()
+            expect(corpus_ocr).not_to_be_checked()
+            page.evaluate("refreshAll().catch(() => {})")
+            expect(corpus_ocr).not_to_be_checked()
+            browser.close()
     finally:
         ui.terminate()
         backend.terminate()

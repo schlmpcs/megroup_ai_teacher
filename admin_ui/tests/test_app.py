@@ -146,6 +146,7 @@ def test_static_javascript_resets_form_controls_and_requires_corpus_preview(monk
     assert response.status_code == 200
     for reset in [
         'state.activeSource = "upload";',
+        "state.corpusOcrOverridden = false;",
         '$("fileInput").value = "";',
         '$("folderInput").value = "";',
         '$("corpusSubtree").value = "";',
@@ -171,11 +172,23 @@ def test_static_javascript_initializes_ocr_default_once_per_session(monkeypatch)
         response = client.get("/static/app.js")
     assert response.status_code == 200
     assert "ocrDefaultInitialized: false" in response.text
+    assert "corpusOcrOverridden: false" in response.text
     assert "if (state.ocrDefaultInitialized) return;" in response.text
     assert "if (!row.ocrOverridden) row.ocr = state.ocrDefault;" in response.text
+    assert 'if (!state.corpusOcrOverridden) $("corpusOcr").checked = state.ocrDefault;' in response.text
     assert 'if (field === "ocr") row.ocrOverridden = true;' in response.text
+    assert '$("corpusOcr").addEventListener("change", () => {' in response.text
+    assert "state.corpusOcrOverridden = true;" in response.text
     assert "ocr: state.ocrDefault" in response.text
     assert 'initializeOcrDefault(status.ocr_default);' in response.text
+    status_request = response.text.index(
+        'const status = await request("/api/admin/ingestion/status");'
+    )
+    initialization = response.text.index("initializeOcrDefault(status.ocr_default);")
+    corpus_request = response.text.index(
+        'const corpusStatus = await request("/api/admin/corpus_status");'
+    )
+    assert status_request < initialization < corpus_request
 
 
 def test_static_javascript_polling_respects_hidden_app(monkeypatch):
