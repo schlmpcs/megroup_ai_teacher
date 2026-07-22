@@ -240,3 +240,72 @@ async def test_run_once_fatal_exit_invalidates_and_cancels_pending_items(
     assert "cache" in job["warning"].lower()
     assert invalidations == [True]
     assert [item["status"] for item in job["items"]] == ["failed", "cancelled"]
+
+
+async def test_prune_failure_invalidates_even_when_items_only_skipped(
+    worker_store, monkeypatch
+):
+    corpus = worker_store / "corpus"
+    source = corpus / "School materials" / "Biology" / "en" / "Empty Grade 9.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("thin", encoding="utf-8")
+    monkeypatch.setattr(ingestion_worker.settings, "CORPUS_ROOT", str(corpus))
+    ingestion_jobs.enqueue_corpus_job({"subtree": "", "ocr": False, "prune": True})
+    job_id = ingestion_jobs.list_jobs()[0]["id"]
+    pruned = []
+    invalidations = []
+
+    def fake_scan(root, *, subtree="", only=None):
+        return {
+            "root": str(corpus),
+            "subtree": "",
+            "total": 1,
+            "filtered": 0,
+            "candidates": [
+                {
+                    "path": str(source),
+                    "metadata": {
+                        "source": "School materials/Biology/en/Empty Grade 9.md",
+                        "doc_type": "textbook",
+                        "subject": "biology",
+                        "grade": 9,
+                        "lang": "en",
+                    },
+                    "doc_id": "doc-empty",
+                }
+            ],
+            "skipped": [],
+            "errors": [],
+            "present_doc_ids": {"doc-empty"},
+        }
+
+    async def empty_upload(filename, content, **kwargs):
+        await kwargs["progress"]("extracting")
+        return {"file_id": "doc-empty", "filename": filename, "status": "empty", "chunks": 0}
+
+    async def failing_prune(present_doc_ids):
+        pruned.append("deleted-one")
+        raise RuntimeError("prune crashed")
+
+    async def failed_invalidation():
+        invalidations.append(True)
+        return False
+
+    monkeypatch.setattr(ingestion_worker.ingestion, "scan_corpus_tree", fake_scan)
+    monkeypatch.setattr(ingestion_worker.ingestion, "upload_document", empty_upload)
+    monkeypatch.setattr(
+        ingestion_worker.ingestion,
+        "prune_missing_corpus_documents",
+        failing_prune,
+    )
+    monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", failed_invalidation)
+
+    assert await ingestion_worker.run_once("worker-1") is True
+    job = ingestion_jobs.get_job(job_id)
+    assert job["status"] == "failed"
+    assert job["error"] == "prune crashed"
+    assert job["completed_items"] == 0
+    assert job["skipped_items"] == 1
+    assert "cache" in job["warning"].lower()
+    assert pruned == ["deleted-one"]
+    assert invalidations == [True]

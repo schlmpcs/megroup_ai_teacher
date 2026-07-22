@@ -238,7 +238,17 @@ async def _run_corpus_job(job: dict) -> tuple[bool, bool]:
     ):
         current = ingestion_jobs.get_job(job["id"])
         if current["failed_items"] == 0:
-            pruned = await ingestion.prune_missing_corpus_documents(scan["present_doc_ids"])
+            try:
+                pruned = await ingestion.prune_missing_corpus_documents(
+                    scan["present_doc_ids"]
+                )
+            except Exception:
+                if not await invalidate_answer_cache():
+                    ingestion_jobs.update_job(
+                        job["id"],
+                        warning=_cache_warning(current.get("warning")),
+                    )
+                raise
             mutated = mutated or pruned > 0
     return mutated, ambiguous
 
