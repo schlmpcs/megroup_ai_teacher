@@ -936,7 +936,7 @@ def scan_corpus_tree(
         raise ValueError("subtree and only cannot be combined")
     root_path, scope = resolve_corpus_scope(root, subtree)
     files = iter_corpus_files(str(scope))
-    present_doc_ids = {_doc_id(str(path.relative_to(root_path))) for path in files}
+    present_doc_ids: set[str] = set()
     candidates: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
@@ -945,11 +945,21 @@ def scan_corpus_tree(
         if only and only not in str(path):
             filtered += 1
             continue
+        source = str(path.relative_to(root_path))
+        if not path.resolve().is_relative_to(root_path):
+            issue = {
+                "source": source,
+                "error": "Corpus file must remain inside CORPUS_ROOT",
+            }
+            skipped.append(issue)
+            errors.append(issue)
+            continue
+        present_doc_ids.add(_doc_id(source))
         meta = corpus_meta.parse_path(str(path), corpus_root=str(root_path))
         if meta is None:
             skipped.append(
                 {
-                    "source": str(path.relative_to(root_path)),
+                    "source": source,
                     "error": "Unrecognised corpus path",
                 }
             )

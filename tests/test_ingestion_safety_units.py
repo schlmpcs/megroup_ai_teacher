@@ -262,6 +262,29 @@ def test_scan_corpus_tree_reports_same_candidates_as_bulk_validation(tmp_path):
     assert scan["duplicate_lab_ids"] == []
 
 
+def test_scan_corpus_tree_skips_supported_file_symlink_that_escapes_root(tmp_path):
+    root = tmp_path / "corpus"
+    book_dir = _book_dir(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "Biology Grade 9.md"
+    target.write_text("cell theory", encoding="utf-8")
+    (book_dir / "Biology Grade 9.md").symlink_to(target)
+
+    scan = ingestion.scan_corpus_tree(str(root))
+
+    assert scan["candidates"] == []
+    assert scan["counts_by_type"] == {}
+    assert scan["counts_by_language"] == {}
+    assert scan["skipped"] == [
+        {
+            "source": "School materials/Biology/en/Biology Grade 9.md",
+            "error": "Corpus file must remain inside CORPUS_ROOT",
+        }
+    ]
+    assert scan["errors"] == scan["skipped"]
+
+
 def test_scan_corpus_tree_reports_duplicate_lab_ids(tmp_path):
     lab_dir = _lab_dir(tmp_path)
     (lab_dir / "Lab work 1.md").write_text("first", encoding="utf-8")
