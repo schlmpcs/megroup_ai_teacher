@@ -106,6 +106,32 @@ def test_static_javascript_login_reset_and_logout_clear_state(monkeypatch):
     assert "showLogin();" in response.text
 
 
+def test_static_javascript_resets_form_controls_and_requires_corpus_preview(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    for reset in [
+        'state.activeSource = "upload";',
+        '$("fileInput").value = "";',
+        '$("folderInput").value = "";',
+        '$("corpusSubtree").value = "";',
+        '$("corpusOcr").checked = false;',
+        '$("corpusPrune").checked = false;',
+        '$("corpusPrune").disabled = false;',
+        '$("queueCorpus").disabled = true;',
+        '$("documentSearch").value = "";',
+        '$("documentType").value = "";',
+        '$("documentSubject").value = "";',
+        '$("documentGrade").value = "";',
+        '$("documentLanguage").value = "";',
+        'selectSource("upload");',
+        "if (!state.corpusPreview) {",
+        "if (!state.corpusPreview) return;",
+    ]:
+        assert reset in response.text
+
+
 def test_static_javascript_polling_respects_hidden_app(monkeypatch):
     _configure(monkeypatch)
     with TestClient(app) as client:

@@ -40,8 +40,22 @@ function showLogin() {
   state.jobs = [];
   state.documents = [];
   state.selectedJobId = null;
+  state.activeSource = "upload";
   $("loginView").hidden = false;
   $("appView").hidden = true;
+  $("fileInput").value = "";
+  $("folderInput").value = "";
+  $("corpusSubtree").value = "";
+  $("corpusOcr").checked = false;
+  $("corpusPrune").checked = false;
+  $("corpusPrune").disabled = false;
+  $("queueCorpus").disabled = true;
+  $("documentSearch").value = "";
+  $("documentType").value = "";
+  $("documentSubject").value = "";
+  $("documentGrade").value = "";
+  $("documentLanguage").value = "";
+  selectSource("upload");
   renderStaging();
   renderCorpusPreview();
   renderJobs();
@@ -54,6 +68,7 @@ function showApp() {
   $("loginView").hidden = true;
   $("appView").hidden = false;
   selectView("ingest");
+  selectSource("upload");
   startPolling();
 }
 
@@ -359,6 +374,7 @@ async function previewCorpus() {
 }
 
 async function queueCorpus() {
+  if (!state.corpusPreview) return;
   const options = corpusOptions();
   if (options.prune && !await confirmChange("Queue a full-root ingest that may prune missing corpus documents?")) return;
   const job = await request("/api/admin/ingestion/jobs/corpus", {
@@ -397,7 +413,10 @@ function corpusOptions() {
 function renderCorpusPreview() {
   const container = $("corpusPreview");
   container.replaceChildren();
-  if (!state.corpusPreview) return;
+  if (!state.corpusPreview) {
+    $("queueCorpus").disabled = true;
+    return;
+  }
   const summary = document.createElement("p");
   const typeCounts = Object.entries(state.corpusPreview.counts_by_type || {})
     .map(([name, count]) => `${name} ${count}`)
