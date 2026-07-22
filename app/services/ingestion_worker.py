@@ -136,6 +136,35 @@ def _terminal_status(job: dict) -> str:
     return "failed"
 
 
+def _cache_warning(warning: str | None) -> str:
+    message = "Corpus changed but answer-cache invalidation failed"
+    if not warning:
+        return message
+    if "cache" in warning.lower():
+        return warning
+    return f"{warning}; {message}"
+
+
+def _needs_cache_invalidation(job: dict) -> bool:
+    return any(
+        item["status"] == "completed" or item["stage"] == "indexing"
+        for item in job["items"]
+    )
+
+
+def _fail_active_items(job: dict, error: str) -> None:
+    for item in job["items"]:
+        if item["status"] == "running":
+            ingestion_jobs.update_item(
+                item["id"],
+                status="failed",
+                stage="done",
+                error=error,
+                finished_at=ingestion_jobs.now(),
+            )
+    ingestion_jobs.cancel_pending_items(job["id"])
+
+
 async def _run_upload_job(job: dict) -> tuple[bool, bool]:
     mutated = False
     ambiguous = False
@@ -225,7 +254,15 @@ async def run_once(worker_id: str) -> bool:
         else:
             mutated, ambiguous = await _run_corpus_job(job)
     except Exception as exc:
-        ingestion_jobs.finish_job(job["id"], status="failed", error=str(exc)[:2000])
+        error = str(exc)[:2000]
+        failed = ingestion_jobs.get_job(job["id"])
+        warning = failed.get("warning") if failed else None
+        if failed and _needs_cache_invalidation(failed):
+            if not await invalidate_answer_cache():
+                warning = _cache_warning(warning)
+        if failed:
+            _fail_active_items(failed, error)
+        ingestion_jobs.finish_job(job["id"], status="failed", error=error, warning=warning)
         return True
 
     final = ingestion_jobs.get_job(job["id"])
@@ -233,7 +270,7 @@ async def run_once(worker_id: str) -> bool:
     warning = final.get("warning")
     if mutated or ambiguous:
         if not await invalidate_answer_cache():
-            warning = "Corpus changed but answer-cache invalidation failed"
+            warning = _cache_warning(warning)
             if status_value == "completed":
                 status_value = "partial"
     ingestion_jobs.finish_job(
@@ -253,7 +290,10 @@ async def _heartbeat_loop(worker_id: str) -> None:
 
 async def run_forever(worker_id: str | None = None) -> None:
     ingestion_jobs.initialize()
-    ingestion_jobs.recover_interrupted_jobs()
+    recovered = ingestion_jobs.recover_interrupted_jobs()
+    if recovered:
+        if not await invalidate_answer_cache():
+            logger.warning("Answer-cache invalidation failed after recovering jobs")
     worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
     heartbeat = asyncio.create_task(_heartbeat_loop(worker_id))
     try:

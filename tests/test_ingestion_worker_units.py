@@ -188,3 +188,55 @@ async def test_cache_invalidation_failure_marks_successful_job_partial(worker_st
     assert job["status"] == "partial"
     assert job["items"][0]["status"] == "completed"
     assert "cache" in job["warning"].lower()
+
+
+async def test_run_forever_invalidates_after_recovering_interrupted_jobs(worker_store, monkeypatch):
+    events = []
+
+    async def fake_invalidate():
+        events.append("invalidate")
+        return True
+
+    async def stop_after_startup(worker_id):
+        events.append("poll")
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(ingestion_worker.ingestion_jobs, "recover_interrupted_jobs", lambda: 1)
+    monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", fake_invalidate)
+    monkeypatch.setattr(ingestion_worker, "run_once", stop_after_startup)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        await ingestion_worker.run_forever("worker-1")
+
+    assert events == ["invalidate", "poll"]
+
+
+async def test_run_once_fatal_exit_invalidates_and_cancels_pending_items(
+    worker_store, monkeypatch
+):
+    queue_upload(worker_store, "job-1", ["started.md", "pending.md"])
+    invalidations = []
+
+    async def fatal_runner(job):
+        ingestion_jobs.update_item(
+            "item-0",
+            status="running",
+            stage="indexing",
+            started_at=ingestion_jobs.now(),
+        )
+        raise RuntimeError("qdrant write crashed")
+
+    async def failed_invalidation():
+        invalidations.append(True)
+        return False
+
+    monkeypatch.setattr(ingestion_worker, "_run_upload_job", fatal_runner)
+    monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", failed_invalidation)
+
+    assert await ingestion_worker.run_once("worker-1") is True
+    job = ingestion_jobs.get_job("job-1")
+    assert job["status"] == "failed"
+    assert job["error"] == "qdrant write crashed"
+    assert "cache" in job["warning"].lower()
+    assert invalidations == [True]
+    assert [item["status"] for item in job["items"]] == ["failed", "cancelled"]
