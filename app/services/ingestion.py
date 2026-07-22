@@ -36,6 +36,7 @@ import re
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Awaitable, Callable
 from collections import Counter
 from html import unescape as _html_unescape
 from pathlib import Path
@@ -110,6 +111,13 @@ _EPUB_MIN_WORDS = 50
 # the OCR helpers so the serving path (and the test suite) never need them.
 _IMG_SRC_RE = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*['"]([^'"]+)['"]""", re.IGNORECASE)
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
+
+ProgressCallback = Callable[[str], Awaitable[None]]
+CancelCheck = Callable[[], Awaitable[bool]]
+
+
+class IngestionCancelled(Exception):
+    """Raised when an administrator cancels ingestion at a safe boundary."""
 
 
 def _tesseract_lang(lang: str | None) -> str:
@@ -780,12 +788,25 @@ def _chunk_records(
     return records
 
 
+async def _stage(
+    name: str,
+    progress: ProgressCallback | None,
+    should_cancel: CancelCheck | None,
+) -> None:
+    if should_cancel is not None and await should_cancel():
+        raise IngestionCancelled("Ingestion cancelled")
+    if progress is not None:
+        await progress(name)
+
+
 async def upload_document(
     filename: str,
     content: bytes,
     metadata: dict | None = None,
     doc_key: str | None = None,
     ocr: bool | None = None,
+    progress: ProgressCallback | None = None,
+    should_cancel: CancelCheck | None = None,
     **_,
 ) -> dict:
     """Convert to Markdown, chunk, embed and upsert one document into Qdrant.
@@ -812,6 +833,7 @@ async def upload_document(
     doc_id = _doc_id(key)
     lang = (metadata or {}).get("lang")
     ocr_enabled = settings.OCR_ENABLED if ocr is None else ocr
+    await _stage("extracting", progress, should_cancel)
     text = await asyncio.to_thread(
         to_markdown, filename, content, ocr=ocr_enabled, lang=lang
     )
@@ -830,7 +852,9 @@ async def upload_document(
         )
         return {"file_id": doc_id, "filename": filename, "status": "empty", "chunks": 0}
 
+    await _stage("embedding", progress, should_cancel)
     embeddings_list = await embeddings.embed_texts(chunks)
+    await _stage("indexing", progress, should_cancel)
     await vectorstore.ensure_collection()
 
     base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}
@@ -887,6 +911,121 @@ def _missing_metadata(meta: dict) -> list[str]:
     return [field for field in required if meta.get(field) is None]
 
 
+def resolve_corpus_scope(root: str, subtree: str = "") -> tuple[Path, Path]:
+    root_path = Path(root).resolve()
+    if not root_path.is_dir():
+        raise ValueError(f"Corpus root is not a directory: {root}")
+    relative = Path(subtree or ".")
+    if relative.is_absolute():
+        raise ValueError("Corpus subtree must be relative to CORPUS_ROOT")
+    scope = (root_path / relative).resolve()
+    if not scope.is_relative_to(root_path):
+        raise ValueError("Corpus subtree must remain inside CORPUS_ROOT")
+    if not scope.is_dir():
+        raise ValueError(f"Corpus subtree is not a directory: {subtree}")
+    return root_path, scope
+
+
+def scan_corpus_tree(
+    root: str,
+    *,
+    subtree: str = "",
+    only: str | None = None,
+) -> dict:
+    if subtree and only is not None:
+        raise ValueError("subtree and only cannot be combined")
+    root_path, scope = resolve_corpus_scope(root, subtree)
+    files = iter_corpus_files(str(scope))
+    present_doc_ids = {_doc_id(str(path.relative_to(root_path))) for path in files}
+    candidates: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    filtered = 0
+    for path in files:
+        if only and only not in str(path):
+            filtered += 1
+            continue
+        meta = corpus_meta.parse_path(str(path), corpus_root=str(root_path))
+        if meta is None:
+            skipped.append(
+                {
+                    "source": str(path.relative_to(root_path)),
+                    "error": "Unrecognised corpus path",
+                }
+            )
+            continue
+        missing = _missing_metadata(meta)
+        if missing:
+            issue = {
+                "source": meta["source"],
+                "error": f"Incomplete metadata: {', '.join(missing)}",
+            }
+            skipped.append(issue)
+            errors.append(issue)
+            continue
+        candidates.append(
+            {
+                "path": str(path),
+                "metadata": meta,
+                "doc_id": _doc_id(meta["source"]),
+            }
+        )
+
+    lab_counts = Counter(
+        item["metadata"]["lab_id"]
+        for item in candidates
+        if item["metadata"]["doc_type"] == "lab_instruction"
+    )
+    duplicate_lab_ids = {
+        lab_id for lab_id, count in lab_counts.items() if count > 1
+    }
+    accepted = []
+    for item in candidates:
+        lab_id = item["metadata"].get("lab_id")
+        if lab_id in duplicate_lab_ids:
+            issue = {
+                "source": item["metadata"]["source"],
+                "error": f"Duplicate lab_id: {lab_id}",
+            }
+            skipped.append(issue)
+            errors.append(issue)
+            continue
+        accepted.append(item)
+
+    counts_by_type = Counter(item["metadata"]["doc_type"] for item in accepted)
+    counts_by_language = Counter(item["metadata"]["lang"] for item in accepted)
+    return {
+        "root": str(root_path),
+        "subtree": subtree,
+        "total": len(files),
+        "filtered": filtered,
+        "candidates": accepted,
+        "skipped": skipped,
+        "errors": errors,
+        "present_doc_ids": present_doc_ids,
+        "duplicate_lab_ids": sorted(duplicate_lab_ids),
+        "counts_by_type": dict(sorted(counts_by_type.items())),
+        "counts_by_language": dict(sorted(counts_by_language.items())),
+    }
+
+
+async def prune_missing_corpus_documents(present_doc_ids: set[str]) -> int:
+    pruned = 0
+    for document in await vectorstore.list_documents():
+        source = document.get("source_path")
+        file_id = document.get("file_id")
+        if (
+            source
+            and file_id
+            and not source.startswith("admin_uploads/")
+            and corpus_meta.parse_path(source) is not None
+            and file_id not in present_doc_ids
+            and await vectorstore.delete_document(file_id)
+        ):
+            pruned += 1
+    return pruned
+
+
 async def bulk_ingest_tree(
     root: str,
     *,
@@ -909,63 +1048,27 @@ async def bulk_ingest_tree(
     """
     if prune and only is not None:
         raise ValueError("prune cannot be combined with a filtered bulk ingest")
-    files = iter_corpus_files(root)
-    base = Path(root)
-    current_doc_ids = {
-        _doc_id(str(path.relative_to(base)))
-        for path in files
-    }
+    scan = scan_corpus_tree(root, only=only)
     ocr_enabled = settings.OCR_ENABLED if ocr is None else ocr
     summary = {
         "root": root,
-        "total": len(files),
+        "total": scan["total"],
         "ready": 0,
         "empty": 0,
-        "skipped": 0,
-        "filtered": 0,
-        "errors": [],
+        "skipped": len(scan["skipped"]),
+        "filtered": scan["filtered"],
+        "errors": list(scan["errors"]),
         "documents": [],
         "documents_by_language": {},
         "pruned": 0,
     }
-    candidates: list[tuple[Path, dict]] = []
-    for path in files:
-        if only and only not in str(path):
-            summary["filtered"] += 1
+    for issue in scan["skipped"]:
+        if issue in scan["errors"]:
             continue
-        meta = corpus_meta.parse_path(str(path), corpus_root=root)
-        if meta is None:
-            summary["skipped"] += 1
-            logger.info("Skip (unrecognised path): %s", path)
-            continue
-        missing = _missing_metadata(meta)
-        if missing:
-            summary["skipped"] += 1
-            summary["errors"].append(
-                {
-                    "source": meta["source"],
-                    "error": f"Incomplete metadata: {', '.join(missing)}",
-                }
-            )
-            continue
-        candidates.append((path, meta))
-
-    lab_counts = Counter(
-        meta["lab_id"]
-        for _, meta in candidates
-        if meta["doc_type"] == "lab_instruction"
-    )
-    duplicate_lab_ids = {lab_id for lab_id, count in lab_counts.items() if count > 1}
-    for path, meta in candidates:
-        if meta.get("lab_id") in duplicate_lab_ids:
-            summary["skipped"] += 1
-            summary["errors"].append(
-                {
-                    "source": meta["source"],
-                    "error": f"Duplicate lab_id: {meta['lab_id']}",
-                }
-            )
-            continue
+        logger.info("Skip (unrecognised path): %s", issue["source"])
+    for item in scan["candidates"]:
+        path = Path(item["path"])
+        meta = item["metadata"]
         try:
             result = await upload_document(
                 path.name,
@@ -986,19 +1089,11 @@ async def bulk_ingest_tree(
                 summary["documents_by_language"].get(language, 0) + 1
             )
 
-    if prune and candidates and not summary["errors"]:
+    if prune and scan["candidates"] and not summary["errors"]:
         try:
-            for document in await vectorstore.list_documents():
-                source = document.get("source_path")
-                file_id = document.get("file_id")
-                if (
-                    source
-                    and file_id
-                    and corpus_meta.parse_path(source) is not None
-                    and file_id not in current_doc_ids
-                    and await vectorstore.delete_document(file_id)
-                ):
-                    summary["pruned"] += 1
+            summary["pruned"] = await prune_missing_corpus_documents(
+                scan["present_doc_ids"]
+            )
         except Exception as exc:  # noqa: BLE001 - report prune failure with the run
             summary["errors"].append({"source": "<prune>", "error": str(exc)})
     logger.info(

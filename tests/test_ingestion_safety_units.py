@@ -234,6 +234,86 @@ def _book_dir(root: Path) -> Path:
     return path
 
 
+async def test_resolve_corpus_scope_rejects_traversal_and_escaping_symlink(tmp_path):
+    root = tmp_path / "corpus"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="inside CORPUS_ROOT"):
+        ingestion.resolve_corpus_scope(str(root), "../outside")
+    with pytest.raises(ValueError, match="inside CORPUS_ROOT"):
+        ingestion.resolve_corpus_scope(str(root), "escape")
+
+
+def test_scan_corpus_tree_reports_same_candidates_as_bulk_validation(tmp_path):
+    path = _book_dir(tmp_path) / "Biology Grade 9.md"
+    path.write_text("cell theory", encoding="utf-8")
+
+    scan = ingestion.scan_corpus_tree(str(tmp_path), subtree="School materials")
+
+    assert [item["metadata"]["source"] for item in scan["candidates"]] == [
+        "School materials/Biology/en/Biology Grade 9.md"
+    ]
+    assert scan["skipped"] == []
+    assert scan["counts_by_type"] == {"textbook": 1}
+    assert scan["counts_by_language"] == {"en": 1}
+    assert scan["duplicate_lab_ids"] == []
+
+
+def test_scan_corpus_tree_reports_duplicate_lab_ids(tmp_path):
+    lab_dir = _lab_dir(tmp_path)
+    (lab_dir / "Lab work 1.md").write_text("first", encoding="utf-8")
+    (lab_dir / "Lab work No. 1.md").write_text("second", encoding="utf-8")
+
+    scan = ingestion.scan_corpus_tree(str(tmp_path))
+
+    assert scan["candidates"] == []
+    assert scan["duplicate_lab_ids"] == ["physics-10-en-01"]
+    assert len(scan["errors"]) == 2
+
+
+async def test_upload_document_reports_stages_and_stops_before_indexing(monkeypatch):
+    stages = []
+    indexed = []
+
+    async def progress(stage):
+        stages.append(stage)
+
+    async def should_cancel():
+        return stages == ["extracting", "embedding"]
+
+    async def fake_embed(chunks):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(dense=[0.1], sparse_indices=[], sparse_values=[])
+            for _ in chunks
+        ]
+
+    async def fake_upsert(points):
+        indexed.extend(points)
+        return len(points)
+
+    monkeypatch.setattr(
+        ingestion, "to_markdown", lambda *args, **kwargs: "usable educational text"
+    )
+    monkeypatch.setattr(ingestion.embeddings, "embed_texts", fake_embed)
+    monkeypatch.setattr(ingestion.vectorstore, "upsert_points", fake_upsert)
+
+    with pytest.raises(ingestion.IngestionCancelled):
+        await ingestion.upload_document(
+            "notes.md",
+            b"content",
+            progress=progress,
+            should_cancel=should_cancel,
+        )
+
+    assert stages == ["extracting", "embedding"]
+    assert indexed == []
+
+
 async def test_bulk_ingest_rejects_missing_root():
     with pytest.raises(ValueError, match="Corpus root"):
         await ingestion.bulk_ingest_tree("/definitely/not/a/corpus")
