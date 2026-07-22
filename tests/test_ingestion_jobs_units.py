@@ -185,3 +185,100 @@ def test_cleanup_removes_only_orphaned_old_tmp_directories(job_dir):
     assert ingestion_jobs.cleanup_stale_tmp() == 1
     assert not old.exists()
     assert new.exists()
+
+
+@pytest.mark.parametrize(
+    ("stored_path", "expected"),
+    [
+        ("/tmp/escape", "absolute"),
+        ("uploads/other-job/item-1", "job"),
+        ("uploads/job-1/other-item", "item"),
+        ("uploads/job-1/item-1/../../escape", "stored_path"),
+    ],
+)
+def test_enqueue_upload_job_rejects_invalid_stored_paths(job_dir, stored_path, expected):
+    with pytest.raises(ValueError, match=expected):
+        ingestion_jobs.enqueue_upload_job(
+            "job-1",
+            [
+                {
+                    "id": "item-1",
+                    "position": 0,
+                    "filename": "one.md",
+                    "relative_path": "one.md",
+                    "stored_path": stored_path,
+                    "source_path": None,
+                    "metadata": None,
+                    "doc_key": None,
+                    "ocr": False,
+                }
+            ],
+        )
+
+
+def test_retry_upload_job_rejects_tampered_stored_path(job_dir):
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).parent.mkdir(parents=True, exist_ok=True)
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+    )
+    ingestion_jobs.update_item("item-1", status="failed", stage="done", error="boom")
+    ingestion_jobs.finish_job("job-1", status="failed", error="boom")
+    with ingestion_jobs.connect() as connection:
+        connection.execute(
+            "UPDATE job_items SET stored_path = ? WHERE id = ?",
+            ("../outside/item-1", "item-1"),
+        )
+
+    with pytest.raises(ValueError, match="stored_path"):
+        ingestion_jobs.retry_job("job-1")
+    assert [job["id"] for job in ingestion_jobs.list_jobs()] == ["job-1"]
+
+
+def test_delete_job_keeps_row_when_artifact_cleanup_fails(job_dir, monkeypatch):
+    upload_dir = job_dir / "uploads" / "job-1"
+    upload_dir.mkdir(parents=True)
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+    )
+    ingestion_jobs.finish_job("job-1", status="failed", error="boom")
+
+    def _boom(path, *args, **kwargs):
+        if Path(path) == upload_dir:
+            raise OSError("disk error")
+        return None
+
+    monkeypatch.setattr(ingestion_jobs.shutil, "rmtree", _boom)
+
+    with pytest.raises(OSError, match="disk error"):
+        ingestion_jobs.delete_job("job-1")
+    assert ingestion_jobs.get_job("job-1") is not None

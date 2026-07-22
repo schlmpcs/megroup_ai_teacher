@@ -4,6 +4,7 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from app.core.config import settings
 
@@ -116,6 +117,35 @@ def _path_value(value):
     return None if value is None else str(value)
 
 
+def _validated_upload_stored_path(stored_path: str | None, *, job_id: str, item_id: str) -> str | None:
+    if stored_path is None:
+        return None
+    path = PurePosixPath(str(stored_path))
+    if path.is_absolute():
+        raise ValueError("stored_path must not be absolute")
+    if ".." in path.parts:
+        raise ValueError("stored_path must stay inside uploads")
+    expected = ("uploads", job_id, item_id)
+    if path.parts[:1] != ("uploads",):
+        raise ValueError("stored_path must stay inside uploads")
+    if len(path.parts) != 3:
+        raise ValueError("stored_path must match uploads/<job_id>/<item_id>")
+    if path.parts[1] != job_id:
+        raise ValueError("stored_path job segment must match job id")
+    if path.parts[2] != item_id:
+        raise ValueError("stored_path item segment must match item id")
+    return path.as_posix()
+
+
+def _artifact_dir(kind: str, job_id: str) -> Path:
+    return data_dir() / kind / job_id
+
+
+def _remove_tree_if_exists(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
 def _item_from_row(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -226,6 +256,11 @@ def _update_row(
 def _insert_items(connection: sqlite3.Connection, job_id: str, items: list[dict]) -> None:
     rows = []
     for item in items:
+        stored_path = _validated_upload_stored_path(
+            item.get("stored_path"),
+            job_id=job_id,
+            item_id=item["id"],
+        )
         rows.append(
             (
                 item["id"],
@@ -233,7 +268,7 @@ def _insert_items(connection: sqlite3.Connection, job_id: str, items: list[dict]
                 item["position"],
                 item["filename"],
                 _path_value(item.get("relative_path")),
-                _path_value(item.get("stored_path")),
+                stored_path,
                 _path_value(item.get("source_path")),
                 None if item.get("metadata") is None else _json_dump(item.get("metadata")),
                 item.get("doc_key"),
@@ -631,7 +666,12 @@ def retry_job(job_id: str) -> dict:
         for position, item in enumerate(eligible):
             item_id = new_id()
             stored_path = f"uploads/{retry_id}/{item_id}"
-            source = data_dir() / str(item["stored_path"])
+            source_stored_path = _validated_upload_stored_path(
+                item["stored_path"],
+                job_id=original["id"],
+                item_id=item["id"],
+            )
+            source = data_dir() / source_stored_path
             target = data_dir() / stored_path
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
@@ -652,7 +692,9 @@ def retry_job(job_id: str) -> dict:
     except Exception:
         for copied_path in reversed(copied_paths):
             copied_path.unlink(missing_ok=True)
-        shutil.rmtree(data_dir() / "uploads" / retry_id, ignore_errors=True)
+        retry_dir = _artifact_dir("uploads", retry_id)
+        if retry_dir.exists():
+            shutil.rmtree(retry_dir)
         raise
     return enqueue_upload_job(retry_id, retry_items, retry_of=original["id"])
 
@@ -664,9 +706,10 @@ def delete_job(job_id: str) -> bool:
             return False
         if job["status"] not in TERMINAL_STATUSES:
             raise ValueError("Only terminal jobs can be deleted")
+    _remove_tree_if_exists(_artifact_dir("uploads", job_id))
+    _remove_tree_if_exists(_artifact_dir("tmp", job_id))
+    with connect() as connection:
         connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    shutil.rmtree(data_dir() / "uploads" / job_id, ignore_errors=True)
-    shutil.rmtree(data_dir() / "tmp" / job_id, ignore_errors=True)
     return True
 
 
