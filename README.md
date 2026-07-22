@@ -72,14 +72,15 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"  # distinct ADMIN_A
 python -c "import secrets; print(secrets.token_urlsafe(32))"  # ADMIN_UI_SESSION_SECRET
 python -m admin_ui.hash_password                              # ADMIN_UI_PASSWORD_HASH
 # Set OPENAI_API_KEY and the four generated values in .env.
-docker compose up --build     # 7 сервисов (порты ниже)
+docker compose up --build     # 8 сервисов (порты ниже)
 ```
 
-`docker compose` поднимает **семь** сервисов:
+`docker compose` поднимает **восемь** сервисов:
 
 | Сервис | Образ / build | Порт (хост → контейнер) | GPU |
 |--------|---------------|--------------------------|-----|
-| `api` | `.` | `8001 → 8000` | нет |
+| `gateway` | `nginx:alpine` | `8001 → 8080` | нет |
+| `api` | `.` | нет, доступен через `gateway` | нет |
 | `ingestion-worker` | `.` | нет | нет |
 | `admin-ui` | `./admin_ui` | `8004 → 8000` | нет |
 | `qdrant` | `qdrant/qdrant:latest` | `6333 → 6333`, `6334 → 6334` | нет |
@@ -92,25 +93,25 @@ docker compose up --build     # 7 сервисов (порты ниже)
 (bge-m3, Whisper, TTS), поэтому
 стартует медленно.
 
-### Operator UI
+### Панель оператора
 
-The full quick start above requires distinct generated `INTERNAL_API_KEY` and
-`ADMIN_API_KEY` values, `OPENAI_API_KEY`, a generated
-`ADMIN_UI_SESSION_SECRET`, and the output of `python -m admin_ui.hash_password`.
-To start only the operator services after configuring `.env`:
+Для полного запуска нужны разные значения `INTERNAL_API_KEY` и
+`ADMIN_API_KEY`, ключ `OPENAI_API_KEY`, сгенерированный
+`ADMIN_UI_SESSION_SECRET` и хэш из `python -m admin_ui.hash_password`.
+После настройки `.env` операторские сервисы запускаются так:
 
 ```bash
 python -m admin_ui.hash_password
-docker compose up -d --build api ingestion-worker admin-ui
+docker compose up -d --build api ingestion-worker admin-ui gateway
 open http://localhost:8004
 ```
 
-Local HTTP testing at `http://localhost:8004` requires
-`ADMIN_UI_COOKIE_SECURE=false`. Restore `ADMIN_UI_COOKIE_SECURE=true` in
-production behind HTTPS. `BACKEND_ADMIN_API_KEY` stays server-side and is never
-sent to the browser. Prune is available only for a full-root run with an empty
-`Relative subtree`. Upload artifacts and retained job history remain until the
-terminal job is deleted from the UI.
+Для локальной проверки по HTTP на `http://localhost:8004` задайте
+`ADMIN_UI_COOKIE_SECURE=false`. В продакшене за HTTPS используйте
+`ADMIN_UI_COOKIE_SECURE=true`. `BACKEND_ADMIN_API_KEY` остаётся на сервере и не
+передаётся в браузер. Удаление отсутствующих документов доступно только при
+полном сканировании с пустым относительным путём. Загруженные файлы и история
+задания хранятся до удаления завершённого задания из панели.
 
 Локальная разработка прокси (Qdrant и embedder при этом удобно держать в Docker):
 
@@ -440,12 +441,14 @@ curl -sS "$API_BASE/admin/corpus_status" -H "Authorization: Bearer $KEY"
 
 ### Публичный доступ (Tailscale Funnel, HTTPS)
 
-API выставлен наружу через **Tailscale Funnel**, публичный HTTPS-эндпоинт с
+Gateway выставлен наружу через **Tailscale Funnel**, публичный HTTPS-эндпоинт с
 автоматическим TLS, без проброса портов и без Tailscale на стороне клиента.
-Наружу выставлен **только API (порт 8001)**; голосовой порт `8002` не публикуется.
+На порту `8001` gateway сохраняет все API-маршруты и отдаёт панель администратора
+на `/`; голосовой порт `8002` не публикуется.
 
 | Что | URL | Авторизация |
 |-----|-----|-------------|
+| Панель администратора | `https://megroup-b560m-hdv-m-2.tail7dd37a.ts.net` | логин и пароль администратора |
 | API прокси (`/ask`, `/voice_ask`, `/hint`, …) | `https://megroup-b560m-hdv-m-2.tail7dd37a.ts.net` | `Authorization: Bearer <INTERNAL_API_KEY>` |
 | Swagger UI | `https://megroup-b560m-hdv-m-2.tail7dd37a.ts.net/docs` | вызовы требуют Bearer-ключ |
 | Healthcheck | `https://megroup-b560m-hdv-m-2.tail7dd37a.ts.net/health` | нет |
