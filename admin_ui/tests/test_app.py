@@ -1,0 +1,140 @@
+import json
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from admin_ui.auth import hash_password
+from admin_ui.config import get_settings
+from admin_ui.main import app, login_limiter
+
+
+def _configure(monkeypatch):
+    monkeypatch.setenv("ADMIN_UI_USERNAME", "admin")
+    monkeypatch.setenv("ADMIN_UI_PASSWORD_HASH", hash_password("secret"))
+    monkeypatch.setenv("ADMIN_UI_SESSION_SECRET", "session-secret-1234567890-abcdef")
+    monkeypatch.setenv("ADMIN_UI_COOKIE_SECURE", "false")
+    monkeypatch.setenv("BACKEND_BASE_URL", "http://backend")
+    monkeypatch.setenv("BACKEND_ADMIN_API_KEY", "backend-admin-key")
+    get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_admin_state():
+    get_settings.cache_clear()
+    login_limiter.failures.clear()
+    if hasattr(app.state, "backend_transport"):
+        delattr(app.state, "backend_transport")
+    yield
+    get_settings.cache_clear()
+    login_limiter.failures.clear()
+    if hasattr(app.state, "backend_transport"):
+        delattr(app.state, "backend_transport")
+
+
+def test_login_sets_http_only_cookie_and_returns_csrf(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+    assert response.status_code == 200
+    assert response.json()["csrf_token"]
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=strict" in response.headers["set-cookie"]
+
+
+def test_mutating_proxy_requires_csrf(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        response = client.post("/api/admin/ingestion/jobs/corpus", json={})
+    assert login.status_code == 200
+    assert response.status_code == 403
+
+
+def test_proxy_injects_backend_key_and_strips_browser_authorization(monkeypatch):
+    _configure(monkeypatch)
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"status": "ready"})
+
+    app.state.backend_transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        csrf = login.json()["csrf_token"]
+        response = client.get(
+            "/api/admin/corpus_status",
+            headers={"Authorization": "Bearer browser-key", "X-CSRF-Token": csrf},
+        )
+    assert response.status_code == 200
+    assert captured["authorization"] == "Bearer backend-admin-key"
+
+
+def test_invalid_credentials_are_generic(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        response = client.post("/auth/login", json={"username": "admin", "password": "wrong"})
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid credentials"
+
+
+def test_sixth_failed_login_is_rate_limited(monkeypatch):
+    _configure(monkeypatch)
+    login_limiter.clear("testclient")
+    with TestClient(app) as client:
+        for _ in range(5):
+            assert client.post("/auth/login", json={"username": "bad", "password": "bad"}).status_code == 401
+        assert client.post("/auth/login", json={"username": "bad", "password": "bad"}).status_code == 429
+
+
+def test_logout_requires_csrf_and_expires_cookie(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        csrf = login.json()["csrf_token"]
+        assert client.post("/auth/logout").status_code == 403
+        response = client.post("/auth/logout", headers={"X-CSRF-Token": csrf})
+    assert response.status_code == 200
+    assert "admin_session=" in response.headers["set-cookie"]
+
+
+def test_proxy_rejects_missing_session_and_disallowed_path(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        assert client.get("/api/admin/corpus_status").status_code == 401
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        assert login.status_code == 200
+        assert client.get("/api/admin/not-allowed").status_code == 404
+
+
+def test_proxy_forwards_body_query_and_maps_transport_failure(monkeypatch):
+    _configure(monkeypatch)
+    captured = {}
+
+    async def handler(request: httpx.Request):
+        query = request.url.query
+        captured["query"] = query.decode() if isinstance(query, bytes) else str(query)
+        captured["body"] = await request.aread()
+        return httpx.Response(202, json={"ok": True})
+
+    app.state.backend_transport = httpx.MockTransport(handler)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        csrf = login.json()["csrf_token"]
+        response = client.post(
+            "/api/admin/ingestion/jobs/corpus?source=ui",
+            headers={"X-CSRF-Token": csrf},
+            json={"subtree": "", "ocr": False, "prune": False},
+        )
+    assert response.status_code == 202
+    assert captured["query"] == "source=ui"
+    assert json.loads(captured["body"]) == {"subtree": "", "ocr": False, "prune": False}
+
+    async def broken_handler(request: httpx.Request):
+        raise httpx.ConnectError("offline", request=request)
+
+    app.state.backend_transport = httpx.MockTransport(broken_handler)
+    with TestClient(app) as client:
+        login = client.post("/auth/login", json={"username": "admin", "password": "secret"})
+        assert client.get("/api/admin/corpus_status").status_code == 502
