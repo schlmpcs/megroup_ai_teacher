@@ -13,6 +13,7 @@ from app.api.admin_routes import admin_router
 from app.api.routes import limiter, router
 from app.core.config import missing_required_env_vars, settings
 from app.core.languages import SUPPORTED_LANGUAGES
+from app.services import ingestion_jobs
 
 
 def setup_logging() -> None:
@@ -47,6 +48,8 @@ async def lifespan(app: FastAPI):
     missing = missing_required_env_vars()
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+    ingestion_jobs.initialize()
+    ingestion_jobs.cleanup_stale_tmp()
     logging.getLogger("assistant").info(
         "Retrieval backend: Qdrant %s (collection '%s'), embedder %s",
         settings.QDRANT_URL,

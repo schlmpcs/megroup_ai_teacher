@@ -6,6 +6,8 @@ __pycache__/
 .DS_Store
 data/uploads/*
 !data/uploads/.gitkeep
+data/ingestion/*
+!data/ingestion/.gitkeep
 
 # Large source corpus (copyrighted textbooks + video), ingested locally and not committed
 /Лабораторные физхимбио/
