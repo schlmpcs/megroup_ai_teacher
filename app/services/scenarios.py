@@ -20,25 +20,59 @@ from functools import lru_cache
 from typing import Any, Optional
 
 from app.core.config import settings
+from app.core.languages import LanguageCode, is_language_code
 
 logger = logging.getLogger("assistant.scenarios")
 
 # Fields rendered into the system prompt, in display order. Mirrors the table
 # in the spec (ts_scenarios.md). Missing fields are simply skipped.
-_FIELD_LABELS: list[tuple[str, str]] = [
-    ("scenario_name", "Сценарий"),
-    ("subject", "Предмет"),
-    ("topic", "Тема"),
-    ("lab_number", "Номер лабораторной работы"),
-    ("environment_description", "Виртуальное окружение"),
-    ("objects", "Ключевые объекты"),
-    ("action_sequence", "Последовательность действий"),
-    ("current_step_hint", "Подсказка по текущему шагу"),
-    ("risks", "Возможные риски"),
-    ("common_mistakes", "Типовые ошибки"),
-    ("correct_behavior", "Правильная логика поведения"),
-    ("regulations", "Связанные материалы и инструкции"),
-]
+_FIELD_KEYS = (
+    "scenario_name",
+    "language",
+    "subject",
+    "topic",
+    "lab_number",
+    "environment_description",
+    "objects",
+    "action_sequence",
+    "current_step_hint",
+    "risks",
+    "common_mistakes",
+    "correct_behavior",
+    "regulations",
+)
+_FIELD_LABELS: dict[str, dict[str, str]] = {
+    "ru": {
+        "scenario_name": "Сценарий",
+        "language": "Язык",
+        "subject": "Предмет",
+        "topic": "Тема",
+        "lab_number": "Номер лабораторной работы",
+        "environment_description": "Виртуальное окружение",
+        "objects": "Ключевые объекты",
+        "action_sequence": "Последовательность действий",
+        "current_step_hint": "Подсказка по текущему шагу",
+        "risks": "Возможные риски",
+        "common_mistakes": "Типовые ошибки",
+        "correct_behavior": "Правильная логика поведения",
+        "regulations": "Связанные материалы и инструкции",
+    },
+    "en": {
+        "scenario_name": "Scenario",
+        "language": "Language",
+        "subject": "Subject",
+        "topic": "Topic",
+        "lab_number": "Laboratory activity number",
+        "environment_description": "Virtual environment",
+        "objects": "Key objects",
+        "action_sequence": "Action sequence",
+        "current_step_hint": "Current step hint",
+        "risks": "Risks",
+        "common_mistakes": "Common mistakes",
+        "correct_behavior": "Correct behavior",
+        "regulations": "Related materials and instructions",
+    },
+}
 
 
 class ScenarioNotFoundError(Exception):
@@ -75,7 +109,7 @@ def load_scenario(scenario_id: str) -> dict[str, Any]:
 
 
 def list_scenarios() -> list[dict[str, Any]]:
-    """List available scenarios as {scenario_id, scenario_name, subject}."""
+    """List available scenarios with additive declared-language metadata."""
     directory = settings.SCENARIOS_DIR
     if not os.path.isdir(directory):
         return []
@@ -94,6 +128,7 @@ def list_scenarios() -> list[dict[str, Any]]:
                 "scenario_id": scenario_id,
                 "scenario_name": doc.get("scenario_name"),
                 "subject": doc.get("subject"),
+                "language": doc.get("language"),
             }
         )
     return out
@@ -110,11 +145,17 @@ def _render_value(value: Any) -> str:
     return str(value)
 
 
-def format_scenario_context(doc: dict[str, Any]) -> str:
+def format_scenario_context(
+    doc: dict[str, Any], language: Optional[LanguageCode] = None
+) -> str:
     """Render a scenario document into the labelled block injected into the
     system prompt. Only non-empty known fields are included."""
+    declared = doc.get("language")
+    selected = language or (declared if is_language_code(declared) else "ru")
+    labels = _FIELD_LABELS.get(selected, _FIELD_LABELS["en"])
     lines: list[str] = []
-    for key, label in _FIELD_LABELS:
+    for key in _FIELD_KEYS:
+        label = labels.get(key, key)
         value = doc.get(key)
         if value in (None, "", [], {}):
             continue
@@ -141,6 +182,7 @@ def format_scenario_state(
     allowed_actions: Optional[list[str]] = None,
     last_action: Optional[str] = None,
     last_action_result: Optional[str] = None,
+    language: LanguageCode = "ru",
 ) -> str:
     """Render the LIVE per-request scene state (ТЗ §3.2) into a labelled block.
 
@@ -149,6 +191,62 @@ def format_scenario_state(
     ``нет`` so the model can distinguish "none" from an omitted/unknown field.
     Returns "" when no usable live state was supplied.
     """
+    labels = {
+        "ru": {
+            "current_step_id": "ID текущего шага",
+            "current_step_index": "Индекс текущего шага",
+            "current_step": "Текущий шаг ученика",
+            "next_step_id": "ID следующего шага",
+            "next_step": "Следующий шаг, назначенный симулятором",
+            "completed_steps": "Завершённые шаги",
+            "held_items": "Предметы в руках у ученика",
+            "visible_items": "Предметы, видимые ученику",
+            "allowed_actions": "Разрешённые действия сейчас",
+            "last_action": "Последнее действие ученика",
+            "last_action_result": "Результат последнего действия",
+            "none": "нет",
+            "authority": (
+                "Авторитетность: это актуальный снимок сцены от симулятора для "
+                "текущего запроса. При расхождении со статическим описанием "
+                "сценария эти данные имеют приоритет."
+            ),
+        },
+        "en": {
+            "current_step_id": "current_step_id",
+            "current_step_index": "current_step_index",
+            "current_step": "current_step",
+            "next_step_id": "next_step_id",
+            "next_step": "next_step",
+            "completed_steps": "completed_steps",
+            "held_items": "held_items",
+            "visible_items": "visible_items",
+            "allowed_actions": "allowed_actions",
+            "last_action": "last_action",
+            "last_action_result": "last_action_result",
+            "none": "none",
+            "authority": (
+                "Authority: this is the simulator's live state for the current "
+                "request. It takes priority over conflicting static scenario data."
+            ),
+        },
+    }.get(language, {})
+    if not labels:
+        labels = {
+            **_FIELD_LABELS["en"],
+            "current_step_id": "current_step_id",
+            "current_step_index": "current_step_index",
+            "current_step": "current_step",
+            "next_step_id": "next_step_id",
+            "next_step": "next_step",
+            "completed_steps": "completed_steps",
+            "held_items": "held_items",
+            "visible_items": "visible_items",
+            "allowed_actions": "allowed_actions",
+            "last_action": "last_action",
+            "last_action_result": "last_action_result",
+            "none": "none",
+            "authority": "Authority: live simulator state for this request.",
+        }
     lines: list[str] = []
 
     def add_text(label: str, value: Optional[str]) -> None:
@@ -159,30 +257,25 @@ def format_scenario_state(
         if values is None:
             return
         items = [str(item).strip() for item in values if str(item).strip()]
-        lines.append(f"{label}: {', '.join(items) if items else 'нет'}")
+        lines.append(f"{label}: {', '.join(items) if items else labels['none']}")
 
-    add_text("ID текущего шага", current_step_id)
+    add_text(labels["current_step_id"], current_step_id)
     if current_step_index is not None:
-        lines.append(f"Индекс текущего шага: {current_step_index}")
+        lines.append(f"{labels['current_step_index']}: {current_step_index}")
     if current_step and current_step.strip():
-        lines.append(f"Текущий шаг ученика: {current_step.strip()}")
-    add_text("ID следующего шага", next_step_id)
-    add_text("Следующий шаг, назначенный симулятором", next_step)
-    add_list("Завершённые шаги", completed_steps)
-    add_list("Предметы в руках у ученика", held_items)
-    add_list("Предметы, видимые ученику", visible_items)
-    add_list("Разрешённые действия сейчас", allowed_actions)
-    add_text("Последнее действие ученика", last_action)
-    add_text("Результат последнего действия", last_action_result)
+        lines.append(f"{labels['current_step']}: {current_step.strip()}")
+    add_text(labels["next_step_id"], next_step_id)
+    add_text(labels["next_step"], next_step)
+    add_list(labels["completed_steps"], completed_steps)
+    add_list(labels["held_items"], held_items)
+    add_list(labels["visible_items"], visible_items)
+    add_list(labels["allowed_actions"], allowed_actions)
+    add_text(labels["last_action"], last_action)
+    add_text(labels["last_action_result"], last_action_result)
 
     if not lines:
         return ""
-    authority = (
-        "Авторитетность: это актуальный снимок сцены от симулятора для текущего "
-        "запроса. При расхождении со статическим описанием сценария эти данные "
-        "имеют приоритет."
-    )
-    return "\n".join([authority, *lines])
+    return "\n".join([labels["authority"], *lines])
 
 
 def get_scenario_context(scenario_id: Optional[str]) -> Optional[str]:

@@ -7,11 +7,11 @@ ENV PIP_DEFAULT_TIMEOUT=180 \
 WORKDIR /app
 
 # OCR engine for scanned textbooks (opt-in via OCR_ENABLED; ingest-time only).
-# The tesseract binary + Russian/Kazakh language data; PDF rendering itself is a
+# The tesseract binary plus Russian, Kazakh, and English language data. PDF rendering is a
 # pure pypdfium2 wheel, so no poppler is needed. Slim layer: drop apt lists.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tesseract-ocr tesseract-ocr-rus tesseract-ocr-kaz \
+        tesseract-ocr tesseract-ocr-rus tesseract-ocr-kaz tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

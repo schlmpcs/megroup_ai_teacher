@@ -3,6 +3,8 @@ from typing import List
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.languages import normalize_language_code
+
 _DEFAULT_SECRETS = {"change_me", "generate-with-python-secrets-token-urlsafe-32", ""}
 
 
@@ -76,9 +78,9 @@ class Settings(BaseSettings):
     LABS_MANIFEST: str = "./labs.json"
 
     # ── OCR fallback (opt-in; ingest-time only, server-side) ─────────────────
-    # Some textbooks are scanned page-images with no text layer (e.g. the RU
-    # biology 7/8/9 EPUBs). When OCR_ENABLED *and* normal extraction yields ~no
-    # Cyrillic text, ingestion renders the pages and runs Tesseract (rus/kaz)
+    # Some textbooks are scanned page-images with no text layer. When OCR_ENABLED
+    # and normal extraction yields too little educational text, ingestion renders
+    # the pages and runs Tesseract (rus/kaz/eng)
     # instead of skipping. OFF by default so plain bulk-ingest never shells out
     # to Tesseract and the serving path is untouched. OCR_DPI is the PDF render
     # resolution; OCR_MAX_PAGES caps pages per document (0 = all).
@@ -88,17 +90,18 @@ class Settings(BaseSettings):
 
     # ── Voice (in-repo STT/TTS sidecar; see ./voice) ─────────────────────────
     # The GPU `voice` container (docker-compose service) serves STT (Whisper
-    # ru/kk/auto) and TTS (Qwen3-TTS/Supertonic ru + MMS kaz) over plain HTTP.
+    # ru/kk/en/auto) and TTS (shared Qwen3-TTS/Supertonic ru+en + MMS kaz) over HTTP.
     # Kazakh OmniVoice is isolated in its own service because it requires a
     # newer Transformers release than the existing Qwen TTS backend. In compose
     # the api reaches these services by their Docker DNS names; the defaults
     # below target host-mapped ports for local development. Omitted STT language
-    # auto-detects RU/KK; omitted standalone TTS language follows DEFAULT_LANGUAGE.
+    # auto-detects RU/KK/EN; omitted standalone TTS language follows DEFAULT_LANGUAGE.
     # VOICE_VERIFY_SSL is irrelevant over internal HTTP but kept for the client.
     VOICE_BASE_URL: str = "http://localhost:8002"
     VOICE_VERIFY_SSL: bool = False
     VOICE_TIMEOUT_S: float = 120.0  # generous: covers GPU cold start + ≤120s audio
     VOICE_TTS_RU_DEFAULT_BACKEND: str = "supertonic"
+    VOICE_TTS_EN_DEFAULT_BACKEND: str = "supertonic"
     VOICE_KK_OMNIVOICE_BASE_URL: str = "http://localhost:8003"
     VOICE_TTS_KK_DEFAULT_BACKEND: str = "omnivoice"
 
@@ -109,6 +112,16 @@ class Settings(BaseSettings):
         if normalized not in {"mms", "qwen", "supertonic"}:
             raise ValueError(
                 "VOICE_TTS_RU_DEFAULT_BACKEND must be one of: mms, qwen, supertonic"
+            )
+        return normalized
+
+    @field_validator("VOICE_TTS_EN_DEFAULT_BACKEND")
+    @classmethod
+    def _valid_english_tts_backend(cls, v: str) -> str:
+        normalized = v.strip().lower()
+        if normalized not in {"qwen", "supertonic"}:
+            raise ValueError(
+                "VOICE_TTS_EN_DEFAULT_BACKEND must be one of: qwen, supertonic"
             )
         return normalized
 
@@ -124,6 +137,11 @@ class Settings(BaseSettings):
 
     # ── Behaviour ────────────────────────────────────────────────────────────
     DEFAULT_LANGUAGE: str = "ru"
+
+    @field_validator("DEFAULT_LANGUAGE")
+    @classmethod
+    def _valid_default_language(cls, v: str) -> str:
+        return normalize_language_code(v, field="DEFAULT_LANGUAGE")
     MAX_INPUT_CHARS: int = 4000
     LLM_MAX_TOKENS: int = 600
     LLM_TEMPERATURE: float = 0.2
@@ -146,6 +164,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "*"
     RATE_LIMIT_PER_MINUTE: int = 60  # per client IP; <=0 disables rate limiting
     MAX_UPLOAD_BYTES: int = 26_214_400  # 25 MB — OpenAI per-file ceiling for STT.
+    MAX_DOCUMENT_UPLOAD_BYTES: int = 104_857_600  # 100 MB for KB admin uploads.
 
     # ── Runtime toggles ──────────────────────────────────────────────────────
     ENABLE_DOCS: bool = True

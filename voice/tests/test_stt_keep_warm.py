@@ -205,7 +205,7 @@ class _FakeTtsBackend:
         return b"RIFF"
 
 
-async def test_lifespan_warms_after_models_and_health_shape_is_unchanged():
+async def test_lifespan_warms_after_models_and_reports_language_capabilities():
     events = []
     settings = Settings(stt_keep_warm_enabled=False)
     app = create_app(
@@ -231,6 +231,7 @@ async def test_lifespan_warms_after_models_and_health_shape_is_unchanged():
     assert response.status_code == 200
     assert set(response.json()) == {
         "status",
+        "supported_languages",
         "stt_models",
         "tts_models",
         "tts_backends",

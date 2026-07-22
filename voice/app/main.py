@@ -237,12 +237,14 @@ def create_app(
 
         return {
             "status": "ok",
+            "supported_languages": ["ru", "kk", "en"],
             "stt_models": loaded_language_keys(stt_backend, "stt_"),
             "tts_models": loaded_language_keys(tts_backend, "tts_"),
             "tts_backends": getattr(tts_backend, "available_backends", {}),
             "tts_default_backends": getattr(tts_backend, "default_backends", {}),
             "tts_number_normalization": {
                 "ru": settings.tts_normalize_ru_numbers,
+                "en": settings.tts_normalize_en_numbers,
             },
         }
 
@@ -307,7 +309,10 @@ def create_app(
         return Response(
             content=wav_bytes,
             media_type="audio/wav",
-            headers={"X-TTS-Backend": selected_backend},
+            headers={
+                "X-TTS-Backend": selected_backend,
+                "Content-Language": req.language,
+            },
         )
 
     return app

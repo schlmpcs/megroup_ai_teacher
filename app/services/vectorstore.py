@@ -17,11 +17,14 @@ Failures are mapped onto the shared service-layer exceptions
 them to 504/502 just like OpenAI failures.
 """
 
+import asyncio
 import logging
+import uuid
 
 from qdrant_client import AsyncQdrantClient, models
 
 from app.core.config import settings
+from app.core.languages import SUPPORTED_LANGUAGES
 from app.services.errors import LLMError, LLMTimeoutError, LLMUpstreamError
 
 logger = logging.getLogger("assistant.vectorstore")
@@ -34,6 +37,17 @@ _SCROLL_PAGE = 256
 
 # Lazy, patchable singleton client (tests monkeypatch ``_client`` or ``get_client``).
 _client: AsyncQdrantClient | None = None
+
+# ponytail: one write lock is enough for admin/bulk ingest; use per-document
+# locks if concurrent ingest throughput becomes important.
+_upsert_lock = asyncio.Lock()
+
+
+def _point_id_key(point_id) -> str:
+    try:
+        return uuid.UUID(str(point_id)).hex
+    except ValueError:
+        return str(point_id)
 
 
 def get_client() -> AsyncQdrantClient:
@@ -134,9 +148,43 @@ async def upsert_points(points: list[dict]) -> int:
         )
         for p in points
     ]
+    doc_ids = {point["payload"].get("doc_id") for point in points}
+    replace_doc_id = doc_ids.pop() if len(doc_ids) == 1 else None
+    new_ids = {_point_id_key(point["id"]) for point in points}
     client = get_client()
     try:
-        await client.upsert(collection_name=settings.QDRANT_COLLECTION, points=structs)
+        async with _upsert_lock:
+            old_ids: dict[str, object] = {}
+            if replace_doc_id:
+                offset = None
+                while True:
+                    records, offset = await client.scroll(
+                        collection_name=settings.QDRANT_COLLECTION,
+                        scroll_filter=_doc_filter(replace_doc_id),
+                        limit=_SCROLL_PAGE,
+                        offset=offset,
+                        with_payload=False,
+                        with_vectors=False,
+                    )
+                    old_ids.update(
+                        {_point_id_key(record.id): record.id for record in records}
+                    )
+                    if offset is None:
+                        break
+
+            await client.upsert(
+                collection_name=settings.QDRANT_COLLECTION,
+                points=structs,
+            )
+
+            stale_ids = [
+                point_id for key, point_id in old_ids.items() if key not in new_ids
+            ]
+            if stale_ids:
+                await client.delete(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    points_selector=models.PointIdsList(points=stale_ids),
+                )
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
     return len(structs)
@@ -181,6 +229,60 @@ async def hybrid_search(
     return [{"score": point.score, "payload": point.payload} for point in result.points]
 
 
+def _is_pending_lab_payload(payload: dict) -> bool:
+    status = payload.get("status")
+    return isinstance(status, str) and status.lower() in {"pending", "staging"}
+
+
+def _ordered_lab_payloads(payloads: list[dict]) -> list[dict]:
+    if all(
+        isinstance(payload.get("char_start"), int) and isinstance(payload.get("char_end"), int)
+        for payload in payloads
+    ):
+        return sorted(
+            payloads,
+            key=lambda payload: (
+                payload["char_start"],
+                payload["char_end"],
+                payload.get("chunk_index", 0),
+                payload.get("text", ""),
+            ),
+        )
+    return sorted(
+        payloads,
+        key=lambda payload: (
+            payload.get("chunk_index", 0),
+            payload.get("text", ""),
+        ),
+    )
+
+
+def _reconstruct_lab_text(payloads: list[dict]) -> str:
+    ordered = _ordered_lab_payloads(payloads)
+    if not ordered:
+        return ""
+    if not all(
+        isinstance(payload.get("char_start"), int) and isinstance(payload.get("char_end"), int)
+        for payload in ordered
+    ):
+        return "\n".join(payload.get("text", "") for payload in ordered if payload.get("text")).strip()
+
+    parts: list[str] = []
+    previous_end: int | None = None
+    for payload in ordered:
+        text = payload.get("text", "")
+        if not text:
+            continue
+        start = payload["char_start"]
+        if previous_end is None:
+            parts.append(text)
+        else:
+            overlap = max(previous_end - start, 0)
+            parts.append(text[min(overlap, len(text)):])
+        previous_end = max(previous_end or payload["char_end"], payload["char_end"])
+    return "".join(parts).strip()
+
+
 async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
     """Return procedure text plus its stored chunk payloads for ``lab_id``.
 
@@ -196,7 +298,7 @@ async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
     try:
         if not await client.collection_exists(settings.QDRANT_COLLECTION):
             return None
-        rows: list[tuple[int, str, dict]] = []
+        rows: list[dict] = []
         offset = None
         while True:
             records, offset = await client.scroll(
@@ -209,21 +311,31 @@ async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
             )
             for rec in records:
                 payload = dict(rec.payload or {})
-                rows.append(
-                    (payload.get("chunk_index", 0), payload.get("text", ""), payload)
-                )
+                if _is_pending_lab_payload(payload):
+                    continue
+                rows.append(payload)
             if offset is None:
                 break
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
-    ordered = sorted(rows, key=lambda row: row[0])
-    text = "\n".join(text for _, text, _ in ordered if text).strip()
-    if not text:
+
+    docs: dict[str, list[dict]] = {}
+    for payload in rows:
+        doc_id = payload.get("doc_id")
+        if not doc_id:
+            continue
+        docs.setdefault(doc_id, []).append(payload)
+
+    matches: list[dict] = []
+    for doc_payloads in docs.values():
+        ordered = _ordered_lab_payloads(doc_payloads)
+        text = _reconstruct_lab_text(ordered)
+        if text:
+            matches.append({"text": text, "payloads": ordered})
+
+    if len(matches) != 1:
         return None
-    return {
-        "text": text,
-        "payloads": [payload for _, _, payload in ordered],
-    }
+    return matches[0]
 
 
 async def fetch_lab_instruction(lab_id: str) -> str:
@@ -339,6 +451,10 @@ async def collection_status() -> dict:
                 "points": 0,
                 "documents": 0,
                 "file_counts": {"total": 0},
+                "documents_by_language": {
+                    language: 0 for language in SUPPORTED_LANGUAGES
+                },
+                "supported_languages": list(SUPPORTED_LANGUAGES),
             }
         points = (
             await client.count(collection_name=settings.QDRANT_COLLECTION, exact=True)
@@ -346,11 +462,18 @@ async def collection_status() -> dict:
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
 
-    documents = len(await list_documents())
+    document_rows = await list_documents()
+    documents = len(document_rows)
+    documents_by_language = {
+        language: sum(1 for row in document_rows if row.get("lang") == language)
+        for language in SUPPORTED_LANGUAGES
+    }
     return {
         "status": "ready" if points else "empty",
         "collection": settings.QDRANT_COLLECTION,
         "points": points,
         "documents": documents,
         "file_counts": {"total": documents},
+        "documents_by_language": documents_by_language,
+        "supported_languages": list(SUPPORTED_LANGUAGES),
     }

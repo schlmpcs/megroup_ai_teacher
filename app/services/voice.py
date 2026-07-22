@@ -10,8 +10,9 @@ exposes a plain HTTP API:
        (json: text/language/speed/backend/voice)
        -> audio/wav bytes
 
-STT runs a multilingual Whisper (ru/kk/auto). Russian TTS defaults to Supertonic
-and can explicitly select Qwen3-TTS 0.6B. Kazakh defaults to the fixed young
+STT runs a multilingual Whisper (ru/kk/en/auto). Russian and English TTS share
+Supertonic and Qwen3-TTS 0.6B model instances, with Supertonic as their default.
+Kazakh defaults to the fixed young
 male OmniVoice profile, which is served by a separate container because its
 Transformers requirement conflicts with Qwen TTS; MMS remains available as a
 fallback. The local ``voice`` control selects the Qwen speaker or Supertonic
@@ -32,6 +33,13 @@ from typing import Optional
 import httpx
 
 from app.core.config import settings
+from app.core.languages import (
+    LanguageCode,
+    SpeechRecognitionLanguage,
+    is_language_code,
+    normalize_language_code,
+    normalize_speech_language,
+)
 from app.services.errors import (
     LLMError,
     LLMMalformedResponseError,
@@ -44,6 +52,11 @@ logger = logging.getLogger("assistant.voice")
 
 # The sidecar only ever returns WAV.
 _TTS_MEDIA_TYPE = "audio/wav"
+_TTS_BACKENDS: dict[LanguageCode, tuple[str, ...]] = {
+    "ru": ("supertonic", "qwen", "mms"),
+    "kk": ("omnivoice", "mms"),
+    "en": ("supertonic", "qwen"),
+}
 
 # Answers repeat across students (and across the sentence-chunked streaming
 # path), so cache synthesized WAVs by (text, language). ~0.5MB per entry.
@@ -107,17 +120,17 @@ def _map_http_error(exc: Exception) -> Exception:
 async def transcribe_with_language(
     audio_bytes: bytes,
     filename: str = "audio.wav",
-    language: Optional[str] = None,
+    language: Optional[SpeechRecognitionLanguage] = None,
     prompt: Optional[str] = None,  # noqa: ARG001, accepted for call-site compat
 ) -> tuple[str, str]:
     """Transcribe audio and return ``(text, resolved_language)``.
 
-    ``language`` is ``"ru"``, ``"kk"`` or ``"auto"`` (Whisper language
+    ``language`` is ``"ru"``, ``"kk"``, ``"en"`` or ``"auto"`` (Whisper language
     detection); omission defaults to ``"auto"``. ``prompt`` is ignored because the
     local Whisper backend does not take a decoding prompt, but it is kept in the
     signature so callers need not special-case the backend.
     """
-    lang = language or "auto"
+    lang = normalize_speech_language(language or "auto")
     files = {"audio": (filename, audio_bytes, "application/octet-stream")}
 
     try:
@@ -134,8 +147,8 @@ async def transcribe_with_language(
         raise LLMMalformedResponseError("Voice sidecar transcription returned no text")
 
     resolved_language = payload.get("language")
-    if resolved_language not in {"ru", "kk"}:
-        if lang in {"ru", "kk"}:
+    if not is_language_code(resolved_language):
+        if is_language_code(lang):
             resolved_language = lang
         else:
             raise LLMMalformedResponseError(
@@ -147,7 +160,7 @@ async def transcribe_with_language(
 async def transcribe(
     audio_bytes: bytes,
     filename: str = "audio.wav",
-    language: Optional[str] = None,
+    language: Optional[SpeechRecognitionLanguage] = None,
     prompt: Optional[str] = None,
 ) -> str:
     """Transcribe recorded mic audio, auto-detecting language when omitted."""
@@ -160,36 +173,51 @@ async def transcribe(
     return text
 
 
+def resolve_tts_backend(
+    language: LanguageCode, backend: Optional[str] = None
+) -> str:
+    """Resolve and validate the local TTS backend for one canonical language."""
+    lang = normalize_language_code(language)
+    defaults = {
+        "ru": settings.VOICE_TTS_RU_DEFAULT_BACKEND,
+        "kk": settings.VOICE_TTS_KK_DEFAULT_BACKEND,
+        "en": settings.VOICE_TTS_EN_DEFAULT_BACKEND,
+    }
+    selected = (backend or defaults[lang]).strip().lower()
+    if selected not in _TTS_BACKENDS[lang]:
+        choices = ", ".join(_TTS_BACKENDS[lang])
+        raise ValueError(
+            f"TTS backend '{selected}' is incompatible with language '{lang}'; "
+            f"available backends: {choices}"
+        )
+    return selected
+
+
 async def synthesize(
     text: str,
     voice: Optional[str] = None,
     response_format: Optional[str] = None,  # noqa: ARG001, sidecar always WAV
     instructions: Optional[str] = None,  # noqa: ARG001, no instruction control
-    language: Optional[str] = None,
+    language: Optional[LanguageCode] = None,
     backend: Optional[str] = None,
 ) -> tuple[bytes, str]:
     """Synthesize ``text`` to speech via the sidecar. Returns (audio_bytes, media_type).
 
-    Russian supports ``qwen`` and ``supertonic`` backends. Supertonic is selected
-    by default and ``voice`` chooses its style (or the Qwen speaker). Kazakh
+    Russian and English support shared ``qwen`` and ``supertonic`` model
+    instances. Supertonic is selected by default and ``voice`` chooses its style
+    (or the Qwen speaker). Kazakh
     defaults to the fixed young-male ``omnivoice`` backend; ``mms`` remains a
     fallback. Output is always WAV.
     """
-    lang = language or settings.DEFAULT_LANGUAGE
-    selected_backend = backend
-    if selected_backend is None:
-        if lang == "ru":
-            selected_backend = settings.VOICE_TTS_RU_DEFAULT_BACKEND
-        elif lang == "kk":
-            selected_backend = settings.VOICE_TTS_KK_DEFAULT_BACKEND
+    lang = normalize_language_code(language or settings.DEFAULT_LANGUAGE)
+    selected_backend = resolve_tts_backend(lang, backend)
 
     cache_key = (text, lang, selected_backend, voice)
     cached = _tts_cache.get(cache_key)
     if cached is not None:
         return cached
     body = {"text": text, "language": lang, "speed": 1.0}
-    if selected_backend is not None:
-        body["backend"] = selected_backend
+    body["backend"] = selected_backend
     if voice is not None:
         body["voice"] = voice
 

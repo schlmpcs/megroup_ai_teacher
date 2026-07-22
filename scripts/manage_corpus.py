@@ -50,7 +50,7 @@ async def _list() -> None:
     for f in await ingestion.list_documents():
         print(
             f"  {f['status']:>10}  {f['file_id']}  chunks={f.get('chunks', 0):<4}  "
-            f"{f.get('filename') or ''}"
+            f"lang={f.get('lang') or '-':<2}  {f.get('filename') or ''}"
         )
 
 
@@ -63,7 +63,7 @@ async def _delete(doc_id: str) -> None:
     print("deleted" if ok else "not found", doc_id)
 
 
-async def _bulk_ingest(root: str, ocr: bool = False, only: str | None = None) -> None:
+async def _bulk_ingest(root: str, ocr: bool | None = None, only: str | None = None) -> dict:
     summary = await ingestion.bulk_ingest_tree(root, ocr=ocr, only=only)
     print(
         f"Bulk ingest of {summary['root']}: "
@@ -73,6 +73,7 @@ async def _bulk_ingest(root: str, ocr: bool = False, only: str | None = None) ->
     )
     for err in summary["errors"]:
         print(f"  ERROR  {err['source']}: {err['error']}", file=sys.stderr)
+    return summary
 
 
 def _gen_manifest(root: str, out: str) -> None:
@@ -83,6 +84,7 @@ def _gen_manifest(root: str, out: str) -> None:
         f"Manifest written to {out}: {len(labs)} labs "
         f"({len(labs) - stub} complete, {stub} stub), "
         f"{manifest['textbooks']} textbook files, "
+        f"coverage={manifest.get('textbooks_by_language', {})}, "
         f"{len(manifest['missing_metadata'])} unrecognised paths"
     )
 
@@ -100,7 +102,8 @@ def main() -> None:
     p_bulk.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
     p_bulk.add_argument(
         "--ocr",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="OCR scanned/image-only PDFs & EPUBs (server-side, opt-in; needs Tesseract)",
     )
     p_bulk.add_argument(
@@ -127,7 +130,15 @@ def main() -> None:
     elif args.cmd == "upload":
         asyncio.run(_upload(args.paths))
     elif args.cmd == "bulk-ingest":
-        asyncio.run(_bulk_ingest(args.root, ocr=args.ocr, only=args.only))
+        summary = asyncio.run(
+            _bulk_ingest(
+                args.root,
+                ocr=settings.OCR_ENABLED if args.ocr is None else args.ocr,
+                only=args.only,
+            )
+        )
+        if summary.get("errors"):
+            raise SystemExit(1)
     elif args.cmd == "gen-manifest":
         _gen_manifest(args.root, args.out)
     elif args.cmd == "list":

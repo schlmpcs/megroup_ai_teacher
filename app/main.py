@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.routes import limiter, router
 from app.core.config import missing_required_env_vars, settings
+from app.core.languages import SUPPORTED_LANGUAGES
 
 
 def setup_logging() -> None:
@@ -79,7 +80,12 @@ app.include_router(router)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": settings.VERSION, "model": settings.OPENAI_MODEL}
+    return {
+        "status": "ok",
+        "version": settings.VERSION,
+        "model": settings.OPENAI_MODEL,
+        "supported_languages": list(SUPPORTED_LANGUAGES),
+    }
 
 
 @app.get("/ready")
@@ -90,4 +96,5 @@ async def readiness_check():
         "qdrant_url": settings.QDRANT_URL,
         "qdrant_collection": settings.QDRANT_COLLECTION,
         "embedding_base_url": settings.EMBEDDING_BASE_URL,
+        "supported_languages": list(SUPPORTED_LANGUAGES),
     }

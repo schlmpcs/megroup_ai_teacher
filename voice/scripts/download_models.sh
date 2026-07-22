@@ -11,7 +11,7 @@ cache_dir = os.environ.get("HF_HOME", "/models/hf_cache")
 qwen_model = os.environ.get(
     "TTS_RU_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 )
-ru_backends = {
+shared_backends = {
     item.strip().lower()
     for item in os.environ.get("TTS_RU_BACKENDS", "supertonic,qwen").split(",")
     if item.strip()
@@ -22,10 +22,13 @@ repos = [
     os.environ.get("STT_RU_MODEL", "openai/whisper-large-v3-turbo"),
     os.environ.get("TTS_KK_MODEL", "facebook/mms-tts-kaz"),
 ]
-if "mms" in ru_backends:
+if "mms" in shared_backends:
     repos.append(os.environ.get("TTS_RU_MODEL", "facebook/mms-tts-rus"))
-if "qwen" in ru_backends:
+if "qwen" in shared_backends:
     repos.append(qwen_model)
+
+# English Whisper uses the same large-v3-turbo checkpoint, and English TTS uses
+# the same Supertonic/Qwen instances as Russian, so no English-only model is added.
 
 for repo in dict.fromkeys(repos):
     # qwen-tts resolves its nested speech tokenizer through HF_HOME/hub and has

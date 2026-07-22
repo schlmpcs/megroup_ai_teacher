@@ -82,6 +82,18 @@ async def test_transcribe_with_language_returns_detected_language(monkeypatch):
     assert fake.calls[0][1]["data"] == {"language": "auto"}
 
 
+async def test_transcribe_accepts_explicit_and_detected_english(monkeypatch):
+    fake = _FakeHTTP(
+        _FakeResponse(json_body={"text": "  What is next?  ", "language": "en"})
+    )
+    monkeypatch.setattr(voice, "_http", lambda: fake)
+
+    text, language = await voice.transcribe_with_language(b"x", language="en")
+
+    assert (text, language) == ("What is next?", "en")
+    assert fake.calls[0][1]["data"] == {"language": "en"}
+
+
 async def test_transcribe_missing_text_raises(monkeypatch):
     fake = _FakeHTTP(_FakeResponse(json_body={"language": "ru"}))
     monkeypatch.setattr(voice, "_http", lambda: fake)
@@ -145,6 +157,25 @@ async def test_synthesize_can_select_qwen_and_forward_voice(monkeypatch):
 
     assert fake.calls[0][1]["json"]["backend"] == "qwen"
     assert fake.calls[0][1]["json"]["voice"] == "Aiden"
+
+
+async def test_synthesize_defaults_english_to_supertonic(monkeypatch):
+    fake = _FakeHTTP(_FakeResponse(content=b"WAVDATA"))
+    monkeypatch.setattr(voice, "_http", lambda: fake)
+
+    await voice.synthesize("Heat the water", language="en")
+
+    assert fake.calls[0][1]["json"] == {
+        "text": "Heat the water",
+        "language": "en",
+        "speed": 1.0,
+        "backend": "supertonic",
+    }
+
+
+def test_resolve_tts_backend_rejects_english_omnivoice():
+    with pytest.raises(ValueError, match="incompatible"):
+        voice.resolve_tts_backend("en", "omnivoice")
 
 
 async def test_synthesize_empty_audio_raises(monkeypatch):

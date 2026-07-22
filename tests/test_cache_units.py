@@ -170,7 +170,12 @@ async def test_stream_answer_cache_hit_yields_full_answer():
     events = [e async for e in llm.stream_answer("Вопрос?")]
     assert events == [
         {"type": "delta", "text": "Готовый ответ."},
-        {"type": "done", "citations": result.citations, "usage": result.usage},
+        {
+            "type": "done",
+            "citations": result.citations,
+            "usage": result.usage,
+            "language": "ru",
+        },
     ]
 
 

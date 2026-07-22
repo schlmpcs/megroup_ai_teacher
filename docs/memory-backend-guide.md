@@ -21,6 +21,11 @@ The client must still send current `scenario_state` and `lab` fields on every
 request. Conversation history helps interpret dialogue, but it is not treated
 as an authoritative source for the live VR scene.
 
+For Russian, Kazakh, or English conversations, also resend an explicit
+`language` when a short follow-up may be ambiguous. The current query is detected
+independently on every turn. `lab.lang` remains the corpus language and may differ
+from the answer language.
+
 ## Text integration: `/ask`
 
 Start a conversation without an ID:
@@ -46,6 +51,7 @@ The response contains the generated ID:
 ```json
 {
   "answer": "...",
+  "language": "ru",
   "conversation_id": "0e8c0ea8-3ad6-49c4-8678-7f12c33024b2",
   "citations": []
 }
@@ -78,6 +84,7 @@ curl -X POST "$API_BASE/voice_ask" \
   -H "Authorization: Bearer $INTERNAL_API_KEY" \
   -F "file=@question.webm" \
   -F "conversation_id=$CONVERSATION_ID" \
+  -F "language=auto" \
   -F "subject=physics" \
   -F "grade=10" \
   -F "lang=ru" \
@@ -86,6 +93,10 @@ curl -X POST "$API_BASE/voice_ask" \
 
 For streaming voice requests, `conversation_id` is present in both the first
 SSE `question` event and the final `done` event.
+
+For English voice follow-ups, use `language=en` or `language=auto`. Add
+`response_language=en` only when the spoken input language and desired answer
+language differ. The response and relevant SSE events include language metadata.
 
 The same ID can be shared between `/ask` and `/voice_ask`, so a student may ask
 the first question by text and continue by voice, or the other way around.

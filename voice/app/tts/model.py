@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .abbreviation_normalization import normalize_russian_tts_text
+from .normalization import normalize_tts_text
 from .text_normalization import transform_unprotected
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ class LocalTtsBackend:
         self.loaded: list[str] = []
         self._models = {}
         self._tokenizers = {}
-        self._ru_models = {}
+        self._shared_models = {}
         self._supertonic_styles = {}
         self._synthesis_lock = threading.Lock()
 
@@ -103,6 +103,10 @@ class LocalTtsBackend:
             raise ValueError("TTS_RU_BACKENDS must enable at least one Russian backend")
         if self.settings.tts_ru_backend not in enabled:
             raise ValueError("TTS_RU_BACKEND must be included in TTS_RU_BACKENDS")
+        if self.settings.tts_en_backend not in {"qwen", "supertonic"}:
+            raise ValueError("TTS_EN_BACKEND must be one of: qwen, supertonic")
+        if self.settings.tts_en_backend not in enabled:
+            raise ValueError("TTS_EN_BACKEND must be included in TTS_RU_BACKENDS")
 
         self._load_mms_model("kk", self.settings.tts_kk_model)
         self.loaded = ["tts_kk"]
@@ -110,21 +114,30 @@ class LocalTtsBackend:
         for backend in enabled:
             if backend == "mms":
                 self._load_mms_model("ru", self.settings.tts_ru_model)
-                self._ru_models[backend] = self._models["ru"]
+                self._shared_models[backend] = self._models["ru"]
             elif backend == "qwen":
-                self._load_qwen_ru_model()
+                self._load_qwen_model()
             elif backend == "supertonic":
-                self._load_supertonic_ru_model()
+                self._load_supertonic_model()
 
-        self.loaded.append("tts_ru")
+        self.loaded.extend(["tts_ru", "tts_en"])
 
     @property
     def available_backends(self) -> dict[str, list[str]]:
-        return {"kk": ["mms"], "ru": list(self._ru_models)}
+        shared = list(self._shared_models)
+        return {
+            "kk": ["mms"],
+            "ru": shared,
+            "en": [backend for backend in shared if backend in {"qwen", "supertonic"}],
+        }
 
     @property
     def default_backends(self) -> dict[str, str]:
-        return {"kk": "mms", "ru": self.settings.tts_ru_backend}
+        return {
+            "kk": "mms",
+            "ru": self.settings.tts_ru_backend,
+            "en": self.settings.tts_en_backend,
+        }
 
     def _load_mms_model(self, language: str, model_id: str) -> None:
         from transformers import AutoTokenizer, VitsModel
@@ -138,7 +151,7 @@ class LocalTtsBackend:
             model_id, cache_dir=self.settings.hf_cache
         )
 
-    def _load_qwen_ru_model(self) -> None:
+    def _load_qwen_model(self) -> None:
         import torch
         from qwen_tts import Qwen3TTSModel
 
@@ -167,16 +180,19 @@ class LocalTtsBackend:
         if self.settings.tts_ru_qwen_attention:
             load_kwargs["attn_implementation"] = self.settings.tts_ru_qwen_attention
 
-        self._ru_models["qwen"] = Qwen3TTSModel.from_pretrained(
+        self._shared_models["qwen"] = Qwen3TTSModel.from_pretrained(
             self.settings.tts_ru_qwen_model,
             **load_kwargs,
         )
 
-    def _load_supertonic_ru_model(self) -> None:
+    def _load_supertonic_model(self) -> None:
         from supertonic import TTS
 
-        model = TTS(auto_download=True)
-        self._ru_models["supertonic"] = model
+        model = TTS(
+            model_dir=self.settings.tts_supertonic_model_dir,
+            auto_download=True,
+        )
+        self._shared_models["supertonic"] = model
         voice = self.settings.tts_ru_supertonic_voice_style
         self._supertonic_styles[voice] = model.get_voice_style(voice_name=voice)
 
@@ -189,18 +205,21 @@ class LocalTtsBackend:
         voice: str | None = None,
     ) -> bytes:
         selected = self.select_backend(language, backend)
-        synthesis_text = (
-            normalize_russian_tts_text(text)
-            if language == "ru" and self.settings.tts_normalize_ru_numbers
-            else text
-        )
+        synthesis_text = normalize_tts_text(text, language, self.settings)
 
         with self._synthesis_lock:
             if selected == "qwen":
-                return self._synthesize_qwen_ru(synthesis_text, speed, voice)
+                return self._synthesize_qwen(
+                    synthesis_text, language, speed, voice
+                )
             if selected == "supertonic":
-                return self._synthesize_supertonic_ru(
-                    _transliterate_latin(synthesis_text), speed, voice
+                normalized_text = (
+                    _transliterate_latin(synthesis_text)
+                    if language == "ru"
+                    else synthesis_text
+                )
+                return self._synthesize_supertonic(
+                    normalized_text, language, speed, voice
                 )
             if selected == "mms":
                 normalized_text = (
@@ -235,23 +254,31 @@ class LocalTtsBackend:
         sample_rate = model.config.sampling_rate
         return self._wav_bytes(waveform, sample_rate, speed)
 
-    def _synthesize_qwen_ru(
-        self, text: str, speed: float = 1.0, voice: str | None = None
+    def _synthesize_qwen(
+        self,
+        text: str,
+        language: str,
+        speed: float = 1.0,
+        voice: str | None = None,
     ) -> bytes:
-        model = self._ru_models["qwen"]
+        model = self._shared_models["qwen"]
         wavs, sample_rate = model.generate_custom_voice(
             text=text,
-            language="Russian",
+            language={"ru": "Russian", "en": "English"}[language],
             speaker=voice or self.settings.tts_ru_qwen_speaker,
             max_new_tokens=self.settings.tts_ru_qwen_max_new_tokens,
         )
         waveform = np.asarray(wavs[0], dtype=np.float32).squeeze()
         return self._wav_bytes(waveform, sample_rate, speed)
 
-    def _synthesize_supertonic_ru(
-        self, text: str, speed: float = 1.0, voice: str | None = None
+    def _synthesize_supertonic(
+        self,
+        text: str,
+        language: str,
+        speed: float = 1.0,
+        voice: str | None = None,
     ) -> bytes:
-        model = self._ru_models["supertonic"]
+        model = self._shared_models["supertonic"]
         voice_name = voice or self.settings.tts_ru_supertonic_voice_style
         voice_style = self._supertonic_styles.get(voice_name)
         if voice_style is None:
@@ -259,7 +286,7 @@ class LocalTtsBackend:
             self._supertonic_styles[voice_name] = voice_style
         wav, _ = model.synthesize(
             text=text,
-            lang="ru",
+            lang=language,
             voice_style=voice_style,
             total_steps=self.settings.tts_ru_supertonic_steps,
             speed=speed,

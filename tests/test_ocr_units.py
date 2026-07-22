@@ -72,8 +72,9 @@ def _make_epub(files: dict[str, str], *, spine: list[tuple[str, str]] | None = N
 def test_tesseract_lang_mapping():
     assert ingestion._tesseract_lang("ru") == "rus"
     assert ingestion._tesseract_lang("kk") == "kaz"
-    assert ingestion._tesseract_lang(None) == "rus+kaz"
-    assert ingestion._tesseract_lang("") == "rus+kaz"
+    assert ingestion._tesseract_lang("en") == "eng"
+    assert ingestion._tesseract_lang(None) == "rus+kaz+eng"
+    assert ingestion._tesseract_lang("") == "rus+kaz+eng"
 
 
 # ── EPUB image-member resolution (no image decoding involved) ─────────────────

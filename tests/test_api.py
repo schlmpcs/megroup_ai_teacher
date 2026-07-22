@@ -15,6 +15,7 @@ def fake_answer(monkeypatch):
         max_tokens=None,
         scenario_state=None,
         lab=None,
+        answer_language=None,
     ):
         _gen.calls.append(
             {
@@ -23,6 +24,7 @@ def fake_answer(monkeypatch):
                 "chat_history": chat_history,
                 "scenario_state": scenario_state,
                 "lab": lab,
+                "answer_language": answer_language,
             }
         )
         # The scenario context should be threaded through when a scenario_id is given.
@@ -35,6 +37,7 @@ def fake_answer(monkeypatch):
             answer=f"Ответ на: {query}{suffix}",
             citations=[{"filename": "physics_8.pdf", "file_id": "f1"}],
             usage={"total_tokens": 10},
+            language=answer_language or "ru",
         )
 
     _gen.calls = []
@@ -58,7 +61,9 @@ def test_bad_auth_rejected(client):
 
 
 def test_health_no_auth(client):
-    assert client.get("/health").status_code == 200
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["supported_languages"] == ["ru", "kk", "en"]
 
 
 # ── /ask ──────────────────────────────────────────────────────────────────
@@ -72,6 +77,7 @@ def test_ask_returns_answer_and_citations(client, auth, fake_answer):
     assert body["primary_source"]["filename"] == "physics_8.pdf"
     assert body["conversation_id"]
     assert body["scenario_id"] is None
+    assert body["language"] == "ru"
 
 
 def test_ask_reuses_conversation_history_for_followup(client, auth, fake_answer):
@@ -100,6 +106,40 @@ def test_ask_reuses_conversation_history_for_followup(client, auth, fake_answer)
         {"role": "assistant", "content": "Ответ на: Что такое кипение?"},
         {"role": "user", "content": "Почему оно начинается?"},
     ]
+
+
+def test_ask_ambiguous_followup_keeps_english_conversation_language(
+    client, auth, monkeypatch
+):
+    calls = []
+
+    async def _generate(query, **kwargs):
+        calls.append(kwargs["answer_language"])
+        return AnswerResult(
+            answer="Gravity attracts masses.",
+            language=kwargs["answer_language"],
+        )
+
+    monkeypatch.setattr(routes, "generate_answer", _generate)
+    conversation_id = "english-followup"
+    first = client.post(
+        "/ask",
+        json={
+            "query": "What is gravity?",
+            "language": "en",
+            "conversation_id": conversation_id,
+        },
+        headers=auth,
+    )
+    second = client.post(
+        "/ask",
+        json={"query": "Continue", "conversation_id": conversation_id},
+        headers=auth,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert calls == ["en", "en"]
+    assert second.json()["language"] == "en"
 
 
 def test_ask_rejects_invalid_conversation_id(client, auth):
@@ -225,6 +265,57 @@ def test_ask_blank_query_422(client, auth):
     assert r.status_code == 422
 
 
+def test_ask_english_language_is_explicit_and_independent_from_lab_lang(
+    client, auth, fake_answer
+):
+    r = client.post(
+        "/ask",
+        json={
+            "query": "H2O?",
+            "language": "en",
+            "lab": {
+                "subject": "physics",
+                "grade": 10,
+                "lang": "ru",
+                "lab_number": 2,
+            },
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "en"
+    call = fake_answer.calls[-1]
+    assert call["answer_language"] == "en"
+    assert call["lab"]["lab_id"] == "physics-10-ru-02"
+
+
+def test_ask_detects_natural_english(client, auth, fake_answer):
+    r = client.post(
+        "/ask", json={"query": "What is the purpose of this lab?"}, headers=auth
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "en"
+    assert fake_answer.calls[-1]["answer_language"] == "en"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/ask", {"query": "hello", "language": "fr"}),
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hello"}], "language": "fr"},
+        ),
+        ("/hint", {"hint_text": "hello", "hint_level": 1, "language": "fr"}),
+        ("/tts", {"text": "hello", "language": "fr"}),
+    ],
+)
+def test_json_endpoints_reject_invalid_languages(client, auth, path, payload):
+    assert client.post(path, json=payload, headers=auth).status_code == 422
+
+
 def _sse_events(text):
     """Parse SSE body into a list of decoded JSON events (excluding [DONE])."""
     events = []
@@ -246,6 +337,7 @@ def test_ask_stream(client, auth, monkeypatch):
         max_tokens=None,
         scenario_state=None,
         lab=None,
+        answer_language=None,
     ):
         yield {"type": "delta", "text": "Кипение — "}
         yield {"type": "delta", "text": "это парообразование."}
@@ -279,6 +371,7 @@ def test_ask_stream_remembers_answer_for_followup(
         max_tokens=None,
         scenario_state=None,
         lab=None,
+        answer_language=None,
     ):
         yield {"type": "delta", "text": "Первый "}
         yield {"type": "delta", "text": "ответ."}
@@ -360,6 +453,27 @@ def test_chat_completions_nonstream(client, auth, fake_answer):
     assert "Разрешённые действия сейчас: открыть журнал" in state
 
 
+def test_chat_completions_ambiguous_followup_keeps_english_history_language(
+    client, auth, fake_answer
+):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "What is gravity?"},
+                {"role": "assistant", "content": "Gravity attracts masses."},
+                {"role": "user", "content": "Continue"},
+            ],
+        },
+        headers=auth,
+    )
+
+    assert response.status_code == 200
+    assert fake_answer.calls[-1]["answer_language"] == "en"
+    assert response.json()["metadata"]["language"] == "en"
+
+
 def test_chat_completions_latest_must_be_user(client, auth):
     r = client.post(
         "/v1/chat/completions",
@@ -377,6 +491,7 @@ def test_chat_completions_stream(client, auth, monkeypatch):
         max_tokens=None,
         scenario_state=None,
         lab=None,
+        answer_language=None,
     ):
         yield {"type": "delta", "text": "Ответ "}
         yield {"type": "delta", "text": "готов"}
@@ -405,14 +520,57 @@ def test_chat_completions_stream(client, auth, monkeypatch):
     assert "a.pdf" in text
 
 
+def test_chat_completions_english_nonstream(client, auth, fake_answer):
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "language": "en",
+            "messages": [{"role": "user", "content": "H2O?"}],
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["metadata"]["language"] == "en"
+    assert fake_answer.calls[-1]["answer_language"] == "en"
+
+
+def test_chat_completions_english_stream(client, auth, monkeypatch):
+    async def _stream(*args, **kwargs):
+        assert kwargs["answer_language"] == "en"
+        yield {"type": "delta", "text": "Water boils."}
+        yield {"type": "done", "citations": [], "usage": {}, "language": "en"}
+
+    monkeypatch.setattr(routes, "stream_answer", _stream)
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "language": "en",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Explain boiling."}],
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert '"language": "en"' in r.text
+
+
 # ── /hint ────────────────────────────────────────────────────────────────────
 
 
 def test_hint_rephrases(client, auth, monkeypatch):
     seen = {}
 
-    async def _hint(hint_text, hint_level, scenario_context=None, scenario_state=None):
+    async def _hint(
+        hint_text,
+        hint_level,
+        scenario_context=None,
+        scenario_state=None,
+        answer_language=None,
+    ):
         seen["scenario_state"] = scenario_state
+        seen["answer_language"] = answer_language
         return f"L{hint_level}: {hint_text}"
 
     monkeypatch.setattr(routes, "rephrase_hint", _hint)
@@ -431,6 +589,7 @@ def test_hint_rephrases(client, auth, monkeypatch):
     )
     assert r.status_code == 200
     assert r.json()["hint"] == "L2: Подойди к трубке"
+    assert r.json()["language"] == "ru"
     assert "ID текущего шага: connect-tube" in seen["scenario_state"]
     assert "Предметы, видимые ученику: трубка" in seen["scenario_state"]
     assert (
@@ -441,6 +600,25 @@ def test_hint_rephrases(client, auth, monkeypatch):
 def test_hint_level_out_of_range_422(client, auth):
     r = client.post("/hint", json={"hint_text": "x", "hint_level": 9}, headers=auth)
     assert r.status_code == 422
+
+
+def test_hint_detects_and_preserves_english(client, auth, monkeypatch):
+    captured = {}
+
+    async def _hint(*args, **kwargs):
+        captured.update(kwargs)
+        return "Put on your safety glasses first."
+
+    monkeypatch.setattr(routes, "rephrase_hint", _hint)
+    r = client.post(
+        "/hint",
+        json={"hint_text": "Wear the safety glasses first.", "hint_level": 1},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "en"
+    assert captured["answer_language"] == "en"
 
 
 # ── Voice ────────────────────────────────────────────────────────────────────
@@ -469,6 +647,40 @@ def test_stt(client, auth, monkeypatch):
 def test_stt_empty_file_400(client, auth):
     r = client.post("/stt", files={"file": ("q.webm", b"", "audio/webm")}, headers=auth)
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("requested", ["en", "auto"])
+def test_stt_returns_english_for_explicit_and_auto(
+    client, auth, monkeypatch, requested
+):
+    async def _transcribe(*args, **kwargs):
+        assert kwargs["language"] == requested
+        return "What is the current step?", "en"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe)
+    r = client.post(
+        "/stt",
+        files={"file": ("q.wav", b"RIFF", "audio/wav")},
+        data={"language": requested},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "en"
+
+
+def test_stt_invalid_language_is_422_before_sidecar(client, auth, monkeypatch):
+    async def _unexpected(*args, **kwargs):
+        raise AssertionError("sidecar must not be called")
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _unexpected)
+    r = client.post(
+        "/stt",
+        files={"file": ("q.wav", b"RIFF", "audio/wav")},
+        data={"language": "fr"},
+        headers=auth,
+    )
+    assert r.status_code == 422
 
 
 def test_tts(client, auth, monkeypatch):
@@ -514,6 +726,47 @@ def test_tts_selects_qwen(client, auth, monkeypatch):
     assert r.status_code == 200
     assert r.headers["x-tts-backend"] == "qwen"
     assert calls == [{"backend": "qwen", "voice": "Aiden"}]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_backend"),
+    [
+        ({"text": "Heat the water.", "language": "en"}, "supertonic"),
+        (
+            {"text": "Heat the water.", "language": "en", "backend": "qwen"},
+            "qwen",
+        ),
+    ],
+)
+def test_tts_english_backends(client, auth, monkeypatch, payload, expected_backend):
+    calls = []
+
+    async def _synth(*args, **kwargs):
+        calls.append(kwargs)
+        return b"ENGLISH-WAV", "audio/wav"
+
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    r = client.post("/tts", json=payload, headers=auth)
+
+    assert r.status_code == 200
+    assert r.headers["x-tts-backend"] == expected_backend
+    assert r.headers["content-language"] == "en"
+    assert calls[0]["language"] == "en"
+    assert calls[0]["backend"] == expected_backend
+
+
+def test_tts_rejects_english_omnivoice(client, auth):
+    r = client.post(
+        "/tts",
+        json={
+            "text": "Heat the water.",
+            "language": "en",
+            "backend": "omnivoice",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 422
+    assert "incompatible" in r.json()["detail"]
 
 
 def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
@@ -671,6 +924,104 @@ def test_voice_ask_rejects_oversized_scene_field(client, auth):
     assert r.status_code == 422
 
 
+def test_voice_ask_english_end_to_end(client, auth, monkeypatch, fake_answer):
+    synthesis_calls = []
+
+    async def _transcribe(*args, **kwargs):
+        assert kwargs["language"] == "auto"
+        return "What should I do next?", "en"
+
+    async def _synth(*args, **kwargs):
+        synthesis_calls.append(kwargs)
+        return b"EN-WAV", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.wav", b"RIFF", "audio/wav")},
+        data={"subject": "physics", "grade": "10", "lab_number": "2"},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["language"] == body["stt_language"] == "en"
+    assert body["tts_backend"] == "supertonic"
+    assert synthesis_calls[0]["language"] == "en"
+    assert synthesis_calls[0]["backend"] == "supertonic"
+    call = fake_answer.calls[-1]
+    assert call["answer_language"] == "en"
+    assert call["lab"]["lab_id"] == "physics-10-en-02"
+
+
+def test_voice_ask_response_language_override_does_not_change_lab_lang(
+    client, auth, monkeypatch, fake_answer
+):
+    synth_calls = []
+
+    async def _transcribe(*args, **kwargs):
+        return "Что дальше?", "ru"
+
+    async def _synth(*args, **kwargs):
+        synth_calls.append(kwargs)
+        return b"WAV", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.wav", b"RIFF", "audio/wav")},
+        data={
+            "response_language": "en",
+            "subject": "physics",
+            "grade": "10",
+            "lang": "ru",
+            "lab_number": "2",
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    assert r.json()["language"] == "en"
+    assert r.json()["stt_language"] == "ru"
+    assert synth_calls[0]["language"] == "en"
+    call = fake_answer.calls[-1]
+    assert call["answer_language"] == "en"
+    assert call["lab"]["lab_id"] == "physics-10-ru-02"
+
+
+def test_voice_ask_english_stream_events_include_language(client, auth, monkeypatch):
+    async def _transcribe(*args, **kwargs):
+        return "What is visible?", "en"
+
+    async def _stream(*args, **kwargs):
+        yield {"type": "delta", "text": "A thermometer is visible."}
+        yield {"type": "done", "citations": [], "usage": {}, "language": "en"}
+
+    async def _synth(*args, **kwargs):
+        return b"WAV", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe)
+    monkeypatch.setattr(routes, "stream_answer", _stream)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+    r = client.post(
+        "/voice_ask",
+        files={"file": ("q.wav", b"RIFF", "audio/wav")},
+        data={"stream": "true"},
+        headers=auth,
+    )
+
+    assert r.status_code == 200
+    events = _sse_events(r.text)
+    question = events[0]
+    audio = next(event for event in events if event["type"] == "audio")
+    done = next(event for event in events if event["type"] == "done")
+    assert question["language"] == question["response_language"] == "en"
+    assert audio["language"] == "en"
+    assert done["language"] == done["stt_language"] == "en"
+
+
 def test_voice_ask_stream(client, auth, monkeypatch):
     async def _transcribe_with_language(
         audio_bytes, filename="audio.webm", language=None, prompt=None
@@ -684,6 +1035,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
         max_tokens=None,
         scenario_state=None,
         lab=None,
+        answer_language=None,
     ):
         yield {"type": "delta", "text": "Нагрев ускоряет реакцию. "}
         yield {"type": "delta", "text": "Молекулы движутся быстрее."}
@@ -721,6 +1073,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
         "type": "question",
         "text": "Зачем нагревать пробирку?",
         "language": "ru",
+        "response_language": "ru",
         "conversation_id": "voice-stream-session",
     }
     deltas = [e["text"] for e in events if e["type"] == "delta"]
@@ -761,6 +1114,12 @@ def test_list_scenarios_endpoint(client, auth):
     assert r.status_code == 200
     ids = [s["scenario_id"] for s in r.json()["scenarios"]]
     assert "physics_lab_02_heating" in ids
+    english = next(
+        scenario
+        for scenario in r.json()["scenarios"]
+        if scenario["scenario_id"] == "physics_lab_02_heating_en"
+    )
+    assert english["language"] == "en"
 
 
 def test_upload_general_document_remains_compatible(client, auth, monkeypatch):
@@ -879,7 +1238,40 @@ def test_upload_lab_instruction_builds_lab_id(client, auth, monkeypatch):
         "admin_uploads/lab_instruction/chemistry/10/kk/02/Lab 2.docx"
     )
     assert call["metadata"] == metadata
-    assert call["doc_key"] == metadata["source"]
+    assert call["doc_key"] == "admin_uploads/lab_instruction/chemistry-10-kk-02"
+
+
+def test_upload_english_lab_instruction_builds_english_path(
+    client, auth, monkeypatch
+):
+    captured = {}
+
+    async def _upload(filename, raw, metadata=None, doc_key=None, **kwargs):
+        captured.update(metadata=metadata, doc_key=doc_key)
+        return {
+            "file_id": "english-lab",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(routes.ingestion, "upload_document", _upload)
+    r = client.post(
+        "/admin/documents",
+        files={"file": ("Lab work No. 2.docx", b"docx", "application/octet-stream")},
+        data={
+            "doc_type": "lab_instruction",
+            "subject": "physics",
+            "grade": "10",
+            "lang": "en",
+            "lab_number": "2",
+        },
+        headers=auth,
+    )
+
+    assert r.status_code == 201
+    assert captured["metadata"]["lab_id"] == "physics-10-en-02"
+    assert captured["doc_key"] == "admin_uploads/lab_instruction/physics-10-en-02"
 
 
 def test_upload_forwards_ocr_flag(client, auth, monkeypatch):
@@ -942,7 +1334,7 @@ def test_upload_invalid_metadata_combination_400(client, auth, metadata):
         {"doc_type": "notes"},
         {"doc_type": "textbook", "subject": "math"},
         {"doc_type": "textbook", "grade": "6"},
-        {"doc_type": "textbook", "lang": "en"},
+        {"doc_type": "textbook", "lang": "de"},
         {"doc_type": "lab_instruction", "lab_number": "100"},
     ],
 )

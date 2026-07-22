@@ -103,6 +103,7 @@
       <label class="field">Query</label>
       <textarea id="askQuery">Почему вода закипает при нагревании?</textarea>
       <div class="row">
+        <div><label class="field">Response language</label><select id="askResponseLang"><option value="">detect / fallback</option><option>ru</option><option>kk</option><option>en</option></select></div>
         <div>
           <label class="field">Scenario ID (optional)</label>
           <input type="text" id="askScenario" list="scenarioList" placeholder="e.g. physics_lab_02_heating" />
@@ -118,7 +119,7 @@
           <div><label class="field">Subject</label>
             <select id="askSubject"><option value="">none</option><option>physics</option><option>chemistry</option><option>biology</option></select></div>
           <div><label class="field">Grade (7–11)</label><input type="number" id="askGrade" min="7" max="11" placeholder="optional" /></div>
-          <div><label class="field">Lang</label><select id="askLang"><option>ru</option><option>kk</option></select></div>
+          <div><label class="field">Corpus lang</label><select id="askLang"><option>ru</option><option>kk</option><option>en</option></select></div>
           <div><label class="field">Lab #</label><input type="number" id="askLabNum" min="1" max="20" placeholder="optional" /></div>
         </div>
       </fieldset>
@@ -135,6 +136,7 @@
   {"role": "user", "content": "Что такое теплопроводность?"}
 ]</textarea>
       <div class="row">
+        <div><label class="field">Response language</label><select id="chatLanguage"><option value="">detect / fallback</option><option>ru</option><option>kk</option><option>en</option></select></div>
         <div><label class="field">Scenario ID (optional)</label><input type="text" id="chatScenario" list="scenarioList" /></div>
         <div><label class="field">Max tokens</label><input type="number" id="chatMaxTokens" min="64" max="4096" placeholder="default" /></div>
         <div><label class="field">Stream</label><select id="chatStream"><option value="true">true (SSE)</option><option value="false">false</option></select></div>
@@ -151,6 +153,7 @@
       <textarea id="hintText">Нагрейте воду до 100 градусов.</textarea>
       <div class="row">
         <div><label class="field">Hint level</label><select id="hintLevel"><option>1</option><option>2</option><option>3</option></select></div>
+        <div><label class="field">Language</label><select id="hintLanguage"><option value="">detect</option><option>ru</option><option>kk</option><option>en</option></select></div>
         <div><label class="field">Scenario ID (optional)</label><input type="text" id="hintScenario" list="scenarioList" /></div>
       </div>
       <button class="go" onclick="doHint()">Send</button>
@@ -162,7 +165,7 @@
       <h2>/stt: Speech → Text</h2>
       <p class="hint">Record from mic or upload an audio file.</p>
       <div class="row">
-        <div><label class="field">Language</label><select id="sttLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option></select></div>
+        <div><label class="field">Language</label><select id="sttLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option><option>en</option></select></div>
       </div>
       <label class="field">Record from microphone</label>
       <div class="row">
@@ -179,12 +182,12 @@
     <!-- TTS -->
     <section class="panel" data-panel="tts">
       <h2>/tts: Text → Speech</h2>
-      <p class="hint">Kazakh defaults to the fixed young-male OmniVoice profile; Russian defaults to Supertonic.</p>
+      <p class="hint">Russian and English default to shared Supertonic; Qwen is selectable. Kazakh defaults to OmniVoice.</p>
       <label class="field">Text</label>
       <textarea id="ttsText">Сәлеметсіз бе! Бүгін біз зертханалық жұмысты бастаймыз.</textarea>
       <div class="row">
-        <div><label class="field">Language</label><select id="ttsLang"><option value="">default</option><option>ru</option><option selected>kk</option></select></div>
-        <div><label class="field">Backend</label><select id="ttsBackend"><option value="">default</option><option value="omnivoice" selected>OmniVoice young male (Kazakh)</option><option value="mms">MMS (Kazakh fallback)</option><option value="supertonic">Supertonic (Russian)</option><option value="qwen">Qwen3-TTS 0.6B (Russian)</option></select></div>
+        <div><label class="field">Language</label><select id="ttsLang"><option value="">default</option><option>ru</option><option selected>kk</option><option>en</option></select></div>
+        <div><label class="field">Backend</label><select id="ttsBackend"><option value="">default</option><option value="omnivoice" selected>OmniVoice young male (Kazakh)</option><option value="mms">MMS (RU/KK)</option><option value="supertonic">Supertonic (RU/EN)</option><option value="qwen">Qwen3-TTS 0.6B (RU/EN)</option></select></div>
         <div><label class="field">Voice (optional)</label><input type="text" id="ttsVoice" placeholder="fixed for OmniVoice" /></div>
         <div><label class="field">Format (optional)</label><input type="text" id="ttsFormat" placeholder="wav" /></div>
       </div>
@@ -197,7 +200,9 @@
       <h2>/voice_ask: Full Voice Pipeline</h2>
       <p class="hint">Audio question → STT → grounded answer → TTS. Reports per-stage latency (≤5s target).</p>
       <div class="row">
-        <div><label class="field">Language</label><select id="vaLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option></select></div>
+        <div><label class="field">STT language</label><select id="vaLang"><option value="">auto detect (default)</option><option>ru</option><option>kk</option><option>en</option></select></div>
+        <div><label class="field">Response language</label><select id="vaResponseLang"><option value="">follow STT</option><option>ru</option><option>kk</option><option>en</option></select></div>
+        <div><label class="field">TTS backend</label><select id="vaBackend"><option value="">default</option><option>supertonic</option><option>qwen</option><option>omnivoice</option><option>mms</option></select></div>
         <div><label class="field">Scenario ID (optional)</label><input type="text" id="vaScenario" list="scenarioList" /></div>
         <div><label class="field">Voice (optional)</label><input type="text" id="vaVoice" placeholder="default" /></div>
       </div>
@@ -207,6 +212,7 @@
           <div><label class="field">Subject</label>
             <select id="vaSubject"><option value="">none</option><option>physics</option><option>chemistry</option><option>biology</option></select></div>
           <div><label class="field">Grade</label><input type="number" id="vaGrade" min="7" max="11" placeholder="optional" /></div>
+          <div><label class="field">Corpus lang</label><select id="vaLabLang"><option value="">follow STT</option><option>ru</option><option>kk</option><option>en</option></select></div>
           <div><label class="field">Lab #</label><input type="number" id="vaLabNum" min="1" max="20" placeholder="optional" /></div>
         </div>
       </fieldset>
@@ -220,6 +226,23 @@
       <div id="vaPreview"></div>
       <button class="go" onclick="doVoiceAsk()">Run pipeline</button>
       <div class="out" id="vaOut"></div>
+    </section>
+
+    <!-- DOCUMENT UPLOAD -->
+    <section class="panel" data-panel="documents">
+      <h2>/admin/documents: Structured Upload</h2>
+      <p class="hint">Upload a textbook or exact lab instruction with ru, kk, or en metadata.</p>
+      <input type="file" id="docFile" accept=".pdf,.docx,.epub,.txt,.md" />
+      <div class="row">
+        <div><label class="field">Document type</label><select id="docType"><option>textbook</option><option>lab_instruction</option></select></div>
+        <div><label class="field">Subject</label><select id="docSubject"><option>physics</option><option>chemistry</option><option>biology</option></select></div>
+        <div><label class="field">Grade</label><input type="number" id="docGrade" min="7" max="11" value="10" /></div>
+        <div><label class="field">Language</label><select id="docLang"><option>ru</option><option>kk</option><option selected>en</option></select></div>
+        <div><label class="field">Lab #</label><input type="number" id="docLabNum" min="1" max="99" value="2" /></div>
+        <div><label class="field">OCR</label><select id="docOcr"><option>false</option><option>true</option></select></div>
+      </div>
+      <button class="go" onclick="doDocumentUpload()">Upload</button>
+      <div class="out" id="docOut"></div>
     </section>
   </main>
 </div>
@@ -245,6 +268,7 @@ $('apiKey').addEventListener('change', () => {
 const tabs = [
   ['health', 'Health'], ['ask', 'Ask'], ['chat', 'Chat / Stream'],
   ['hint', 'Hint'], ['stt', 'STT'], ['tts', 'TTS'], ['voice', 'Voice Ask'],
+  ['documents', 'Documents'],
 ];
 const nav = $('nav');
 tabs.forEach(([id, label], i) => {
@@ -336,6 +360,7 @@ function labObj(subjId, gradeId, langId, labNumId) {
 async function doAsk() {
   const el = $('askOut'); el.innerHTML = '<p class="hint">…thinking</p>';
   const body = { query: $('askQuery').value };
+  if ($('askResponseLang').value) body.language = $('askResponseLang').value;
   if ($('askScenario').value) body.scenario_id = $('askScenario').value;
   if ($('askMaxTokens').value) body.max_tokens = Number($('askMaxTokens').value);
   const lab = labObj('askSubject', 'askGrade', 'askLang', 'askLabNum');
@@ -359,6 +384,7 @@ async function doChat() {
   catch (e) { return renderError(el, 'Invalid messages JSON: ' + e.message); }
   const stream = $('chatStream').value === 'true';
   const body = { messages, stream };
+  if ($('chatLanguage').value) body.language = $('chatLanguage').value;
   if ($('chatScenario').value) body.scenario_id = $('chatScenario').value;
   if ($('chatMaxTokens').value) body.max_tokens = Number($('chatMaxTokens').value);
 
@@ -418,6 +444,7 @@ async function doChat() {
 async function doHint() {
   const el = $('hintOut'); el.innerHTML = '<p class="hint">…</p>';
   const body = { hint_text: $('hintText').value, hint_level: Number($('hintLevel').value) };
+  if ($('hintLanguage').value) body.language = $('hintLanguage').value;
   if ($('hintScenario').value) body.scenario_id = $('hintScenario').value;
   try {
     const { res, ms } = await apiFetch('/hint', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
@@ -523,12 +550,14 @@ async function doVoiceAsk() {
   const fd = new FormData();
   fd.append('file', audio.blob, audio.name);
   if ($('vaLang').value) fd.append('language', $('vaLang').value);
+  if ($('vaResponseLang').value) fd.append('response_language', $('vaResponseLang').value);
+  if ($('vaBackend').value) fd.append('tts_backend', $('vaBackend').value);
   if ($('vaScenario').value) fd.append('scenario_id', $('vaScenario').value);
   if ($('vaVoice').value) fd.append('voice', $('vaVoice').value);
   if ($('vaSubject').value) fd.append('subject', $('vaSubject').value);
   if ($('vaGrade').value) fd.append('grade', $('vaGrade').value);
   if ($('vaLabNum').value) fd.append('lab_number', $('vaLabNum').value);
-  if ($('vaLang').value) fd.append('lang', $('vaLang').value);
+  if ($('vaLabLang').value) fd.append('lang', $('vaLabLang').value);
   el.innerHTML = '<p class="hint">…running STT → LLM → TTS</p>';
   try {
     const { res, ms } = await apiFetch('/voice_ask', { method: 'POST', headers: authHeaders(), body: fd });
@@ -546,6 +575,30 @@ async function doVoiceAsk() {
     html += citationsHtml(data.citations, data.primary_source);
     html += `<details><summary>raw JSON (audio truncated)</summary><pre>${escapeHtml(JSON.stringify({...data, audio_base64: (data.audio_base64||'').slice(0,40)+'…'}, null, 2))}</pre></details>`;
     el.innerHTML = html;
+  } catch (e) { renderError(el, e); }
+}
+
+async function doDocumentUpload() {
+  const el = $('docOut'); el.innerHTML = '';
+  const file = $('docFile').files[0];
+  if (!file) return renderError(el, 'Choose a document first.');
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  fd.append('doc_type', $('docType').value);
+  fd.append('subject', $('docSubject').value);
+  fd.append('grade', $('docGrade').value);
+  fd.append('lang', $('docLang').value);
+  if ($('docType').value === 'lab_instruction' && $('docLabNum').value) {
+    fd.append('lab_number', $('docLabNum').value);
+  }
+  fd.append('ocr', $('docOcr').value);
+  try {
+    const { res, ms } = await apiFetch('/admin/documents', {
+      method: 'POST', headers: authHeaders(), body: fd,
+    });
+    const data = await res.json();
+    if (!res.ok) return renderError(el, JSON.stringify(data, null, 2), res.status);
+    el.innerHTML = metaBar(res.status, ms) + `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
   } catch (e) { renderError(el, e); }
 }
 

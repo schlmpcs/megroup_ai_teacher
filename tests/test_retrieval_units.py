@@ -257,6 +257,32 @@ def test_chunk_records_carry_latest_chapter_and_section(monkeypatch):
     assert records[-1]["section"] == "§ 14. Кипение"
 
 
+def test_chunk_records_recognize_english_headings(monkeypatch):
+    monkeypatch.setattr(ingestion.settings, "CHUNK_SIZE", 60, raising=False)
+    monkeypatch.setattr(ingestion.settings, "CHUNK_OVERLAP", 0, raising=False)
+    text = (
+        "# Chapter 3. Thermal phenomena\n"
+        "Heating changes the temperature of water.\n"
+        "Section 2. Boiling\n"
+        "Boiling occurs throughout the liquid."
+    )
+
+    records = ingestion._chunk_records(text)
+
+    assert records[0]["chapter"] == "Chapter 3. Thermal phenomena"
+    assert records[-1]["section"] == "Section 2. Boiling"
+
+
+def test_section_markers_recognize_unit_and_lesson():
+    markers = ingestion._section_markers(
+        "Unit 4. Cells\nLesson 2. The cell membrane\nContent"
+    )
+    assert [(kind, title) for _, kind, title in markers] == [
+        ("chapter", "Unit 4. Cells"),
+        ("section", "Lesson 2. The cell membrane"),
+    ]
+
+
 async def test_upload_document_unsupported_extension_raises(monkeypatch):
     vs = _RecordingVectorstore()
     _patch_ingestion(monkeypatch, vs)

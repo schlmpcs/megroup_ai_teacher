@@ -27,6 +27,7 @@ embedding/vector-store failure surfaces as an ``LLMError`` subclass and is left
 to propagate so routes can map it to 504/502.
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -63,12 +64,10 @@ _TAG_RE = re.compile(r"<[^>]+>")
 # Drop <script>/<style> bodies before stripping tags so their contents never
 # leak into the extracted text.
 _SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style)\b[^>]*>.*?</\1>")
-# A "word" for the image-only heuristic: a run of 2+ Cyrillic letters (the whole
-# block, so both Russian and Kazakh). The school corpus is entirely Cyrillic, so
-# a multi-MB EPUB that yields ~no Cyrillic words is a scanned/image-only book —
-# its only "text" is stray Latin ids / page numbers left over from the markup,
-# which would otherwise be indexed as a handful of useless noise chunks.
-_WORD_RE = re.compile(r"[Ѐ-ӿ]{2,}")
+# A word for image-only and extraction-quality heuristics: two or more Unicode
+# letters, excluding digits and underscores. This recognizes English, Russian,
+# and Kazakh prose while still ignoring page numbers and markup identifiers.
+_WORD_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
 
 # Tokens and known artifacts used to assess PDF text-layer quality. Some
 # chemistry PDFs have a broken text layer made almost entirely of the OKULYK
@@ -90,10 +89,10 @@ _KNOWN_BOILERPLATE_PREFIXES = (
 
 # Headings worth carrying into citation metadata. Markdown headings are kept
 # verbatim by markitdown; the plain-text alternatives cover the most common
-# chapter/section labels in the Russian and Kazakh school corpus.
+# chapter/section labels in the Russian, Kazakh, and English school corpus.
 _HEADING_RE = re.compile(
     r"(?im)^\s*(?:(?P<markdown>#{1,6})\s+)?"
-    r"(?P<title>(?:(?:глава|раздел|параграф|тарау|бөлім)\b|\xa7)"
+    r"(?P<title>(?:(?:глава|раздел|параграф|тарау|бөлім|chapter|section|unit|lesson)\b|\xa7)"
     r"[^\r\n]{0,150})\s*$"
 )
 
@@ -115,7 +114,9 @@ _IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp")
 
 def _tesseract_lang(lang: str | None) -> str:
     """Map the corpus ``lang`` code to Tesseract model name(s)."""
-    return {"ru": "rus", "kk": "kaz"}.get(lang or "", "rus+kaz")
+    return {"ru": "rus", "kk": "kaz", "en": "eng"}.get(
+        lang or "", "rus+kaz+eng"
+    )
 
 
 def _ocr_image(image, lang: str) -> str:
@@ -322,8 +323,8 @@ def _clean_pdf_extraction(text: str) -> str:
 
 def _is_low_quality_pdf_extraction(raw_text: str, cleaned_text: str) -> bool:
     """Detect thin or overwhelmingly repetitive PDF text-layer extraction."""
-    clean_cyrillic_words = _count_words(cleaned_text)
-    if clean_cyrillic_words < _EPUB_MIN_WORDS:
+    clean_words = _count_words(cleaned_text)
+    if clean_words < _EPUB_MIN_WORDS:
         return True
 
     raw_tokens = _information_tokens(raw_text)
@@ -527,6 +528,11 @@ def to_markdown(
             f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
+    if suffix == ".pdf" and b"%PDF-" not in content[:1024]:
+        raise ValueError("Invalid PDF file")
+    if suffix in {".docx", ".epub"} and not zipfile.is_zipfile(io.BytesIO(content)):
+        raise ValueError(f"Invalid {suffix.removeprefix('.').upper()} file")
+
     # EPUB has its own markitdown-first-then-spine-fallback path (markitdown
     # silently under-reads the spine on these textbooks), so handle it before the
     # generic markitdown attempt below.
@@ -628,7 +634,11 @@ def _section_markers(text: str) -> list[tuple[int, str, str]]:
             continue
         prefix = _normalize_text(text[: match.start()])
         offset = len(prefix) + (1 if prefix else 0)
-        kind = "chapter" if title.casefold().startswith(("глава", "тарау")) else "section"
+        kind = (
+            "chapter"
+            if title.casefold().startswith(("глава", "тарау", "chapter", "unit"))
+            else "section"
+        )
         markers.append((offset, kind, title))
     return markers
 
@@ -722,7 +732,7 @@ async def upload_document(
     content: bytes,
     metadata: dict | None = None,
     doc_key: str | None = None,
-    ocr: bool = False,
+    ocr: bool | None = None,
     **_,
 ) -> dict:
     """Convert to Markdown, chunk, embed and upsert one document into Qdrant.
@@ -745,32 +755,30 @@ async def upload_document(
             f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
         )
 
-    await vectorstore.ensure_collection()
-
     key = doc_key or filename
     doc_id = _doc_id(key)
     lang = (metadata or {}).get("lang")
-    text = to_markdown(filename, content, ocr=ocr, lang=lang)
-    page_spans = _pdf_page_spans(content, text) if suffix == ".pdf" else []
+    ocr_enabled = settings.OCR_ENABLED if ocr is None else ocr
+    text = await asyncio.to_thread(
+        to_markdown, filename, content, ocr=ocr_enabled, lang=lang
+    )
+    page_spans = (
+        await asyncio.to_thread(_pdf_page_spans, content, text)
+        if suffix == ".pdf"
+        else []
+    )
     chunk_records = _chunk_records(text, page_spans=page_spans)
     chunks = [record["text"] for record in chunk_records]
     if not chunk_records:
-        # No usable text (e.g. an image-only/scanned EPUB we now skip). Drop any
-        # chunks a previous ingest stored for this document so stale noise does
-        # not linger in the index — re-ingest must leave it genuinely empty.
-        removed = await vectorstore.delete_document(doc_id)
         logger.info(
-            "Ingested '%s' -> doc_id=%s status=empty (no text%s)",
-            key, doc_id, "; removed stale chunks" if removed else "",
+            "Ingested '%s' -> doc_id=%s status=empty (existing chunks preserved)",
+            key,
+            doc_id,
         )
         return {"file_id": doc_id, "filename": filename, "status": "empty", "chunks": 0}
 
     embeddings_list = await embeddings.embed_texts(chunks)
-
-    # Replace semantics: drop any existing chunks for this document first. This
-    # runs only after a successful embed, so a transient embedder failure leaves
-    # the previously-indexed chunks intact rather than wiping the document.
-    await vectorstore.delete_document(doc_id)
+    await vectorstore.ensure_collection()
 
     base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}
     base_payload.setdefault("source_path", base_payload.get("source") or key)
@@ -808,6 +816,8 @@ async def upload_document(
 def iter_corpus_files(root: str) -> list[Path]:
     """All supported files under ``root`` (recursive), sorted for determinism."""
     base = Path(root)
+    if not base.is_dir():
+        raise ValueError(f"Corpus root is not a directory: {root}")
     return sorted(
         p
         for p in base.rglob("*")
@@ -815,8 +825,15 @@ def iter_corpus_files(root: str) -> list[Path]:
     )
 
 
+def _missing_metadata(meta: dict) -> list[str]:
+    required = ["subject", "grade", "lang"]
+    if meta.get("doc_type") == "lab_instruction":
+        required.extend(("lab_number", "lab_id"))
+    return [field for field in required if meta.get(field) is None]
+
+
 async def bulk_ingest_tree(
-    root: str, *, ocr: bool = False, only: str | None = None
+    root: str, *, ocr: bool | None = None, only: str | None = None
 ) -> dict:
     """Walk ``root``, derive metadata from each path and ingest every file.
 
@@ -830,6 +847,7 @@ async def bulk_ingest_tree(
     are collected rather than aborting the whole run.
     """
     files = iter_corpus_files(root)
+    ocr_enabled = settings.OCR_ENABLED if ocr is None else ocr
     summary = {
         "root": root,
         "total": len(files),
@@ -839,7 +857,10 @@ async def bulk_ingest_tree(
         "filtered": 0,
         "errors": [],
         "documents": [],
+        "documents_by_language": {},
+        "pruned": 0,
     }
+    candidates: list[tuple[Path, dict]] = []
     for path in files:
         if only and only not in str(path):
             summary["filtered"] += 1
@@ -849,9 +870,44 @@ async def bulk_ingest_tree(
             summary["skipped"] += 1
             logger.info("Skip (unrecognised path): %s", path)
             continue
+        missing = _missing_metadata(meta)
+        if missing:
+            summary["skipped"] += 1
+            summary["errors"].append(
+                {
+                    "source": meta["source"],
+                    "error": f"Incomplete metadata: {', '.join(missing)}",
+                }
+            )
+            continue
+        candidates.append((path, meta))
+
+    lab_counts = Counter(
+        meta["lab_id"]
+        for _, meta in candidates
+        if meta["doc_type"] == "lab_instruction"
+    )
+    duplicate_lab_ids = {lab_id for lab_id, count in lab_counts.items() if count > 1}
+    expected_doc_ids: set[str] = set()
+
+    for path, meta in candidates:
+        if meta.get("lab_id") in duplicate_lab_ids:
+            summary["skipped"] += 1
+            summary["errors"].append(
+                {
+                    "source": meta["source"],
+                    "error": f"Duplicate lab_id: {meta['lab_id']}",
+                }
+            )
+            continue
+        expected_doc_ids.add(_doc_id(meta["source"]))
         try:
             result = await upload_document(
-                path.name, path.read_bytes(), metadata=meta, doc_key=meta["source"], ocr=ocr
+                path.name,
+                path.read_bytes(),
+                metadata=meta,
+                doc_key=meta["source"],
+                ocr=ocr_enabled,
             )
         except Exception as exc:  # noqa: BLE001 - keep going, record the failure
             summary["errors"].append({"source": meta["source"], "error": str(exc)})
@@ -859,10 +915,35 @@ async def bulk_ingest_tree(
             continue
         summary["ready" if result["status"] == "ready" else "empty"] += 1
         summary["documents"].append({**meta, **result})
+        language = meta.get("lang")
+        if language and result["status"] == "ready":
+            summary["documents_by_language"][language] = (
+                summary["documents_by_language"].get(language, 0) + 1
+            )
+
+    if only is None:
+        try:
+            for document in await vectorstore.list_documents():
+                source = document.get("source_path")
+                file_id = document.get("file_id")
+                if (
+                    source
+                    and file_id
+                    and corpus_meta.parse_path(source) is not None
+                    and file_id not in expected_doc_ids
+                    and await vectorstore.delete_document(file_id)
+                ):
+                    summary["pruned"] += 1
+        except Exception as exc:  # noqa: BLE001 - report prune failure with the run
+            summary["errors"].append({"source": "<prune>", "error": str(exc)})
     logger.info(
         "Bulk ingest of %s: %d ready, %d empty, %d skipped, %d filtered, %d errors",
-        root, summary["ready"], summary["empty"], summary["skipped"],
-        summary["filtered"], len(summary["errors"]),
+        root,
+        summary["ready"],
+        summary["empty"],
+        summary["skipped"],
+        summary["filtered"],
+        len(summary["errors"]),
     )
     return summary
 
@@ -877,20 +958,40 @@ def build_manifest(root: str) -> dict:
     report; the request path treats "no instruction in Qdrant" as incomplete.
     """
     labs: dict[str, dict] = {}
+    duplicate_lab_ids: set[str] = set()
     missing_metadata: list[str] = []
     textbooks = 0
+    textbooks_by_language: dict[str, int] = {}
+    labs_by_language: dict[str, int] = {}
 
     for path in iter_corpus_files(root):
         meta = corpus_meta.parse_path(str(path), corpus_root=root)
         if meta is None:
             missing_metadata.append(str(path))
             continue
+        missing = _missing_metadata(meta)
+        if missing:
+            missing_metadata.append(meta["source"])
+            continue
         if meta["doc_type"] == "textbook":
             textbooks += 1
+            language = meta.get("lang")
+            if language:
+                textbooks_by_language[language] = (
+                    textbooks_by_language.get(language, 0) + 1
+                )
             continue
         lab_id = meta.get("lab_id")
         if not lab_id:
             missing_metadata.append(meta["source"])
+            continue
+        if lab_id in duplicate_lab_ids:
+            missing_metadata.append(meta["source"])
+            continue
+        if lab_id in labs:
+            previous = labs.pop(lab_id)
+            duplicate_lab_ids.add(lab_id)
+            missing_metadata.extend((previous["source"], meta["source"]))
             continue
         try:
             text = to_markdown(path.name, path.read_bytes())
@@ -907,11 +1008,17 @@ def build_manifest(root: str) -> dict:
             "chars": chars,
             "status": "complete" if chars >= _STUB_CHARS else "stub",
         }
+    for lab in labs.values():
+        language = lab.get("lang")
+        if language:
+            labs_by_language[language] = labs_by_language.get(language, 0) + 1
 
     return {
         "labs": dict(sorted(labs.items())),
         "missing_metadata": sorted(missing_metadata),
         "textbooks": textbooks,
+        "textbooks_by_language": dict(sorted(textbooks_by_language.items())),
+        "labs_by_language": dict(sorted(labs_by_language.items())),
     }
 
 
