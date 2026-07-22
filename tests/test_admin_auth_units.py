@@ -1,4 +1,7 @@
-from app.core.config import settings
+import pytest
+from pydantic import ValidationError
+
+from app.core.config import Settings, settings
 
 
 def test_internal_key_cannot_access_admin_routes(client, auth):
@@ -24,3 +27,13 @@ def test_admin_key_cannot_access_consumer_routes(client, admin_auth):
 
 def test_admin_key_is_required_configuration():
     assert settings.ADMIN_API_KEY == "test-admin-key-1234567890"
+
+
+def test_internal_and_admin_keys_cannot_match():
+    shared = "same-strong-secret-value-1234567890"
+    with pytest.raises(ValidationError):
+        Settings(
+            INTERNAL_API_KEY=shared,
+            ADMIN_API_KEY=shared,
+            OPENAI_API_KEY="test-openai-key-1234567890",
+        )

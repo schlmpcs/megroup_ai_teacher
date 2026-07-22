@@ -1,6 +1,6 @@
 from typing import List
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.languages import normalize_language_code
@@ -34,6 +34,12 @@ class Settings(BaseSettings):
                 '(generate with: python -c "import secrets; print(secrets.token_urlsafe(32))")'
             )
         return v
+
+    @model_validator(mode="after")
+    def _admin_key_must_differ(self):
+        if self.INTERNAL_API_KEY == self.ADMIN_API_KEY:
+            raise ValueError("ADMIN_API_KEY must differ from INTERNAL_API_KEY")
+        return self
 
     # ── OpenAI (key required) ────────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
