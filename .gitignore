@@ -18,6 +18,7 @@ labs.json
 
 # Local agent/session state
 /.claude/
+/.worktrees/
 
 # Generated accuracy-evaluation artifacts
 /chart_data.json
