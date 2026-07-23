@@ -142,6 +142,15 @@ def test_static_javascript_renders_operator_state_in_russian(monkeypatch):
         assert text in response.text
 
 
+def test_documents_table_shows_lab_number(monkeypatch):
+    _configure(monkeypatch)
+    with TestClient(app) as client:
+        index = client.get("/")
+        script = client.get("/static/app.js")
+    assert "<th>Класс</th><th>№ лабораторной</th><th>Язык</th>" in index.text
+    assert 'cell(item.lab_number ?? ""),' in script.text
+
+
 def test_static_javascript_never_uses_browser_storage(monkeypatch):
     _configure(monkeypatch)
     with TestClient(app) as client:

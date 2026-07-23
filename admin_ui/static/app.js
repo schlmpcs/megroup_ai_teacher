@@ -699,6 +699,7 @@ function renderDocuments() {
       cell(label("kind", item.doc_type || item.source_type || "general")),
       cell(label("subject", item.subject)),
       cell(item.grade || ""),
+      cell(item.lab_number ?? ""),
       cell(label("language", item.lang)),
       cell(item.chunks || 0),
       cell(remove),
