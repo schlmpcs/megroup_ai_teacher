@@ -23,14 +23,14 @@ async def test_replacement_does_not_delete_old_document_before_failed_upsert(
 ):
     calls = []
 
-    async def ensure_collection():
+    async def ensure_collection(collection_name=None):
         calls.append("ensure")
 
-    async def delete_document(_doc_id):
+    async def delete_document(_doc_id, collection_name=None):
         calls.append("delete")
         return True
 
-    async def upsert_points(_points):
+    async def upsert_points(_points, collection_name=None):
         calls.append("upsert")
         raise RuntimeError("qdrant write failed")
 
@@ -46,7 +46,7 @@ async def test_replacement_does_not_delete_old_document_before_failed_upsert(
 
 
 async def test_invalid_document_is_rejected_before_qdrant(monkeypatch):
-    async def unexpected_ensure():
+    async def unexpected_ensure(collection_name=None):
         raise AssertionError("Qdrant must not be contacted for invalid input")
 
     monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", unexpected_ensure)
@@ -56,7 +56,7 @@ async def test_invalid_document_is_rejected_before_qdrant(monkeypatch):
 
 
 async def test_fake_pdf_magic_is_parsed_before_qdrant(monkeypatch):
-    async def unexpected_ensure():
+    async def unexpected_ensure(collection_name=None):
         raise AssertionError("Qdrant must not be contacted for invalid input")
 
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: "text")
@@ -74,10 +74,10 @@ async def test_extraction_runs_off_the_event_loop(monkeypatch):
         calls.append(function)
         return await real_to_thread(function, *args, **kwargs)
 
-    async def ensure_collection():
+    async def ensure_collection(collection_name=None):
         return None
 
-    async def upsert_points(points):
+    async def upsert_points(points, collection_name=None):
         return len(points)
 
     monkeypatch.setattr(asyncio, "to_thread", tracked_to_thread)
@@ -88,6 +88,33 @@ async def test_extraction_runs_off_the_event_loop(monkeypatch):
     await ingestion.upload_document("notes.md", b"threaded extraction")
 
     assert ingestion.to_markdown in calls
+
+
+async def test_upload_document_forwards_collection_name_to_vectorstore(monkeypatch):
+    seen = []
+
+    async def ensure_collection(collection_name=None):
+        seen.append(("ensure_collection", collection_name))
+
+    async def upsert_points(points, collection_name=None):
+        seen.append(("upsert_points", collection_name, len(points)))
+        return len(points)
+
+    monkeypatch.setattr(ingestion.vectorstore, "ensure_collection", ensure_collection)
+    monkeypatch.setattr(ingestion.vectorstore, "upsert_points", upsert_points)
+    monkeypatch.setattr(ingestion.embeddings, "embed_texts", _embeddings)
+
+    result = await ingestion.upload_document(
+        "notes.md",
+        b"collection aware upload",
+        collection_name="assistant-b",
+    )
+
+    assert result["status"] == "ready"
+    assert seen == [
+        ("ensure_collection", "assistant-b"),
+        ("upsert_points", "assistant-b", 1),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -146,7 +173,7 @@ async def test_malformed_office_container_is_value_error_before_qdrant(
             )
             archive.writestr("content.opf", "not xml")
 
-    async def unexpected_ensure():
+    async def unexpected_ensure(collection_name=None):
         raise AssertionError("Qdrant must not be contacted for invalid input")
 
     monkeypatch.setattr(ingestion, "_markitdown", lambda suffix, content: None)
@@ -177,10 +204,10 @@ def test_epub_rejects_wrong_xml_roots(container_root, opf_root):
 async def test_reingest_uses_distinct_complete_generations(monkeypatch):
     writes = []
 
-    async def ensure_collection():
+    async def ensure_collection(collection_name=None):
         return None
 
-    async def upsert_points(points):
+    async def upsert_points(points, collection_name=None):
         writes.append(points)
         return len(points)
 
@@ -349,7 +376,7 @@ async def test_full_bulk_ingest_does_not_prune_without_valid_candidates(
     if with_unrecognised_file:
         (tmp_path / "misc.md").write_text("not a corpus path", encoding="utf-8")
 
-    async def unexpected_list():
+    async def unexpected_list(collection_name=None):
         raise AssertionError("invalid corpus snapshots must not trigger pruning")
 
     monkeypatch.setattr(ingestion.vectorstore, "list_documents", unexpected_list)
@@ -368,7 +395,7 @@ async def test_bulk_ingest_skips_incomplete_metadata(tmp_path, monkeypatch):
         uploads.append((args, kwargs))
         return {"status": "ready", "chunks": 1, "file_id": "unexpected"}
 
-    async def list_documents():
+    async def list_documents(collection_name=None):
         return []
 
     monkeypatch.setattr(ingestion, "upload_document", upload)
@@ -399,11 +426,11 @@ async def test_bulk_ingest_rejects_duplicate_lab_ids(tmp_path, monkeypatch):
         uploads.append((args, kwargs))
         return {"status": "ready", "chunks": 1, "file_id": "unexpected"}
 
-    async def delete_document(doc_id):
+    async def delete_document(doc_id, collection_name=None):
         deleted.append(doc_id)
         return True
 
-    async def list_documents():
+    async def list_documents(collection_name=None):
         return [
             {
                 "file_id": ingestion._doc_id(meta["source"]),
@@ -434,7 +461,7 @@ async def test_full_bulk_ingest_does_not_prune_skipped_existing_files(
     meta = corpus_meta.parse_path(str(path), corpus_root=str(tmp_path))
     deleted = []
 
-    async def list_documents():
+    async def list_documents(collection_name=None):
         return [
             {
                 "file_id": ingestion._doc_id(meta["source"]),
@@ -442,7 +469,7 @@ async def test_full_bulk_ingest_does_not_prune_skipped_existing_files(
             }
         ]
 
-    async def delete_document(doc_id):
+    async def delete_document(doc_id, collection_name=None):
         deleted.append(doc_id)
         return True
 
@@ -462,7 +489,14 @@ async def test_full_bulk_ingest_prunes_removed_documents_only_when_requested(
     current.write_text("cell theory", encoding="utf-8")
     deleted = []
 
-    async def upload_document(filename, content, metadata=None, doc_key=None, **kwargs):
+    async def upload_document(
+        filename,
+        content,
+        metadata=None,
+        doc_key=None,
+        collection_name=None,
+        **kwargs,
+    ):
         return {
             "status": "ready",
             "chunks": 1,
@@ -470,7 +504,7 @@ async def test_full_bulk_ingest_prunes_removed_documents_only_when_requested(
             "filename": filename,
         }
 
-    async def list_documents():
+    async def list_documents(collection_name=None):
         return [
             {
                 "file_id": "stale-corpus-id",
@@ -482,7 +516,7 @@ async def test_full_bulk_ingest_prunes_removed_documents_only_when_requested(
             },
         ]
 
-    async def delete_document(doc_id):
+    async def delete_document(doc_id, collection_name=None):
         deleted.append(doc_id)
         return True
 
@@ -511,7 +545,14 @@ async def test_bulk_ingest_uses_ocr_setting_when_unspecified(tmp_path, monkeypat
     book.write_text("cell theory", encoding="utf-8")
     seen = []
 
-    async def upload_document(filename, content, metadata=None, doc_key=None, ocr=False):
+    async def upload_document(
+        filename,
+        content,
+        metadata=None,
+        doc_key=None,
+        ocr=False,
+        collection_name=None,
+    ):
         seen.append(ocr)
         return {
             "status": "ready",
@@ -520,7 +561,7 @@ async def test_bulk_ingest_uses_ocr_setting_when_unspecified(tmp_path, monkeypat
             "filename": filename,
         }
 
-    async def list_documents():
+    async def list_documents(collection_name=None):
         return []
 
     monkeypatch.setattr(ingestion.settings, "OCR_ENABLED", True)
@@ -530,6 +571,115 @@ async def test_bulk_ingest_uses_ocr_setting_when_unspecified(tmp_path, monkeypat
     await ingestion.bulk_ingest_tree(str(tmp_path), ocr=None)
 
     assert seen == [True]
+
+
+async def test_prune_missing_corpus_documents_forwards_collection_name(monkeypatch):
+    seen = []
+
+    async def list_documents(collection_name=None):
+        seen.append(("list_documents", collection_name))
+        return [
+            {
+                "file_id": "stale-id",
+                "source_path": "School materials/Biology/en/Old Biology Grade 9.md",
+            }
+        ]
+
+    async def delete_document(doc_id, collection_name=None):
+        seen.append(("delete_document", doc_id, collection_name))
+        return True
+
+    monkeypatch.setattr(ingestion.vectorstore, "list_documents", list_documents)
+    monkeypatch.setattr(ingestion.vectorstore, "delete_document", delete_document)
+
+    assert (
+        await ingestion.prune_missing_corpus_documents(
+            set(), collection_name="assistant-b"
+        )
+        == 1
+    )
+    assert seen == [
+        ("list_documents", "assistant-b"),
+        ("delete_document", "stale-id", "assistant-b"),
+    ]
+
+
+async def test_bulk_ingest_and_wrappers_forward_collection_name(tmp_path, monkeypatch):
+    book = _book_dir(tmp_path) / "Biology Grade 9.md"
+    book.write_text("cell theory", encoding="utf-8")
+    seen = []
+
+    async def upload_document(
+        filename,
+        content,
+        metadata=None,
+        doc_key=None,
+        ocr=False,
+        collection_name=None,
+        **kwargs,
+    ):
+        seen.append(("upload_document", filename, collection_name))
+        return {
+            "status": "ready",
+            "chunks": 1,
+            "file_id": ingestion._doc_id(doc_key),
+            "filename": filename,
+        }
+
+    async def prune_missing_corpus_documents(present_doc_ids, collection_name=None):
+        seen.append(("prune_missing_corpus_documents", collection_name, present_doc_ids))
+        return 2
+
+    async def list_documents(collection_name=None):
+        seen.append(("list_documents", collection_name))
+        return [{"file_id": "doc-1"}]
+
+    async def delete_document(doc_id, collection_name=None):
+        seen.append(("delete_document", doc_id, collection_name))
+        return True
+
+    async def collection_status(collection_name=None):
+        seen.append(("collection_status", collection_name))
+        return {"status": "ready", "collection": collection_name}
+
+    monkeypatch.setattr(ingestion, "upload_document", upload_document)
+    monkeypatch.setattr(
+        ingestion,
+        "prune_missing_corpus_documents",
+        prune_missing_corpus_documents,
+    )
+    monkeypatch.setattr(ingestion.vectorstore, "list_documents", list_documents)
+    monkeypatch.setattr(ingestion.vectorstore, "delete_document", delete_document)
+    monkeypatch.setattr(ingestion.vectorstore, "collection_status", collection_status)
+
+    summary = await ingestion.bulk_ingest_tree(
+        str(tmp_path),
+        prune=True,
+        collection_name="assistant-b",
+    )
+
+    assert summary["pruned"] == 2
+    assert await ingestion.list_documents(collection_name="assistant-b") == [
+        {"file_id": "doc-1"}
+    ]
+    assert await ingestion.delete_document("manual-id", collection_name="assistant-b") is True
+    assert await ingestion.corpus_status(collection_name="assistant-b") == {
+        "status": "ready",
+        "collection": "assistant-b",
+    }
+    assert seen == [
+        ("upload_document", "Biology Grade 9.md", "assistant-b"),
+        (
+            "prune_missing_corpus_documents",
+            "assistant-b",
+            {
+                ingestion._doc_id("School materials/Biology/en/Biology Grade 9.md")
+            },
+        ),
+        ("list_documents", "assistant-b"),
+        ("delete_document", "manual-id", "assistant-b"),
+        ("collection_status", "assistant-b"),
+    ]
 
 
 def test_manifest_omits_ambiguous_duplicate_lab_ids(tmp_path):

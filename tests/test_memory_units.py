@@ -54,6 +54,25 @@ def test_conversation_memory_clear():
     ]
 
 
+def test_conversation_memory_isolated_by_assistant_type():
+    store = _store()
+    history = store.history_for(
+        "shared-session", "Default question", namespace="vr_lab_teacher"
+    )
+    store.remember(
+        "shared-session",
+        history,
+        "Default answer",
+        namespace="vr_lab_teacher",
+    )
+
+    other_history = store.history_for(
+        "shared-session", "Other question", namespace="other_assistant"
+    )
+
+    assert other_history == [{"role": "user", "content": "Other question"}]
+
+
 def test_build_retrieval_query_adds_previous_exchange_for_followup():
     history = [
         {"role": "user", "content": "Что такое кипение?"},

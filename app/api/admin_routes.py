@@ -7,11 +7,12 @@ from typing import Annotated, Literal, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field, TypeAdapter
 
-from app.api.routes import _handle_llm_error
+from app.api.routes import _assistant_profile_or_422, _handle_llm_error
 from app.api.upload_utils import read_upload, stream_upload
 from app.core.config import settings
 from app.core.languages import LanguageCode
 from app.core.security import verify_admin_api_key
+from app.services.assistant_profiles import DEFAULT_ASSISTANT_TYPE
 from app.services import corpus_meta, ingestion, ingestion_jobs
 from app.services.corpus_meta import build_upload_metadata
 from app.services.errors import LLMError
@@ -27,6 +28,9 @@ PreviewPath = Annotated[str, Field(min_length=1, max_length=1024)]
 
 
 class UploadPreviewRequest(BaseModel):
+    assistant_type: str = Field(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    )
     paths: list[PreviewPath] = Field(
         min_length=1,
         max_length=settings.INGESTION_BATCH_MAX_FILES,
@@ -55,6 +59,9 @@ class UploadManifestItem(BaseModel):
 
 
 class CorpusJobRequest(BaseModel):
+    assistant_type: str = Field(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    )
     subtree: str = Field(default="", max_length=1024)
     ocr: bool | None = None
     prune: bool = False
@@ -139,9 +146,16 @@ def _prunable_documents(documents: list[dict], present_doc_ids: set[str]) -> lis
 
 
 @admin_router.get("/corpus_status")
-async def corpus_status_endpoint():
+async def corpus_status_endpoint(
+    assistant_type: str = Query(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
+):
+    profile = _assistant_profile_or_422(assistant_type)
     try:
-        return await ingestion.corpus_status()
+        return await ingestion.corpus_status(
+            collection_name=profile.qdrant_collection
+        )
     except LLMError as exc:
         _handle_llm_error(exc)
 
@@ -149,6 +163,9 @@ async def corpus_status_endpoint():
 @admin_router.post("/documents", status_code=status.HTTP_201_CREATED)
 async def upload_document_endpoint(
     file: UploadFile = File(...),
+    assistant_type: str = Form(
+        DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
     doc_type: Optional[Literal["textbook", "lab_instruction"]] = Form(None),
     subject: Optional[Literal["physics", "chemistry", "biology"]] = Form(None),
     grade: Optional[int] = Form(None, ge=7, le=11),
@@ -156,6 +173,7 @@ async def upload_document_endpoint(
     lab_number: Optional[int] = Form(None, ge=1, le=99),
     ocr: Optional[bool] = Form(None),
 ):
+    profile = _assistant_profile_or_422(assistant_type)
     filename = Path((file.filename or "").replace("\\", "/")).name
     suffix = Path(filename).suffix.lower()
     if suffix not in ingestion.SUPPORTED_EXTENSIONS:
@@ -188,6 +206,7 @@ async def upload_document_endpoint(
             metadata=metadata,
             doc_key=doc_key,
             ocr=settings.OCR_ENABLED if ocr is None else ocr,
+            collection_name=profile.qdrant_collection,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -200,6 +219,7 @@ async def upload_document_endpoint(
 
 @admin_router.post("/ingestion/preview")
 async def preview_upload_metadata(request: UploadPreviewRequest):
+    _assistant_profile_or_422(request.assistant_type)
     return {"items": _preview_paths(request.paths)}
 
 
@@ -207,7 +227,11 @@ async def preview_upload_metadata(request: UploadPreviewRequest):
 async def create_upload_job(
     files: list[UploadFile] = File(...),
     manifest: str = Form(...),
+    assistant_type: str = Form(
+        DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
 ):
+    profile = _assistant_profile_or_422(assistant_type)
     try:
         items = _manifest_adapter.validate_json(manifest)
     except Exception as exc:
@@ -272,7 +296,11 @@ async def create_upload_job(
             )
         temp_dir.rename(final_dir)
         try:
-            return ingestion_jobs.enqueue_upload_job(job_id, validated)
+            return ingestion_jobs.enqueue_upload_job(
+                job_id,
+                validated,
+                options={"assistant_type": profile.assistant_type},
+            )
         except Exception:
             shutil.rmtree(final_dir, ignore_errors=True)
             raise
@@ -283,6 +311,7 @@ async def create_upload_job(
 
 @admin_router.post("/ingestion/corpus/preview")
 async def preview_corpus(request: CorpusJobRequest):
+    profile = _assistant_profile_or_422(request.assistant_type)
     subtree = request.subtree.strip()
     if request.prune and subtree:
         raise HTTPException(
@@ -291,12 +320,14 @@ async def preview_corpus(request: CorpusJobRequest):
         )
     try:
         scan = ingestion.scan_corpus_tree(
-            settings.CORPUS_ROOT,
+            profile.corpus_root,
             subtree=subtree,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    documents = await ingestion.list_documents()
+    documents = await ingestion.list_documents(
+        collection_name=profile.qdrant_collection
+    )
     prunable = _prunable_documents(documents, scan["present_doc_ids"])
     return {
         "root": scan["root"],
@@ -314,6 +345,7 @@ async def preview_corpus(request: CorpusJobRequest):
 
 @admin_router.post("/ingestion/jobs/corpus", status_code=status.HTTP_202_ACCEPTED)
 async def create_corpus_job(request: CorpusJobRequest):
+    profile = _assistant_profile_or_422(request.assistant_type)
     subtree = request.subtree.strip()
     if request.prune and subtree:
         raise HTTPException(
@@ -321,11 +353,12 @@ async def create_corpus_job(request: CorpusJobRequest):
             detail="prune is allowed only for the full CORPUS_ROOT",
         )
     try:
-        ingestion.resolve_corpus_scope(settings.CORPUS_ROOT, subtree)
+        ingestion.resolve_corpus_scope(profile.corpus_root, subtree)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ingestion_jobs.enqueue_corpus_job(
         {
+            "assistant_type": profile.assistant_type,
             "subtree": subtree,
             "ocr": settings.OCR_ENABLED if request.ocr is None else request.ocr,
             "prune": request.prune,
@@ -407,17 +440,33 @@ async def delete_ingestion_job(job_id: str):
 
 
 @admin_router.get("/documents")
-async def list_documents_endpoint():
+async def list_documents_endpoint(
+    assistant_type: str = Query(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
+):
+    profile = _assistant_profile_or_422(assistant_type)
     try:
-        return {"documents": await ingestion.list_documents()}
+        documents = await ingestion.list_documents(
+            collection_name=profile.qdrant_collection
+        )
+        return {"documents": documents}
     except LLMError as exc:
         _handle_llm_error(exc)
 
 
 @admin_router.delete("/documents/{file_id}")
-async def delete_document_endpoint(file_id: str):
+async def delete_document_endpoint(
+    file_id: str,
+    assistant_type: str = Query(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
+):
+    profile = _assistant_profile_or_422(assistant_type)
     try:
-        deleted = await ingestion.delete_document(file_id)
+        deleted = await ingestion.delete_document(
+            file_id, collection_name=profile.qdrant_collection
+        )
     except LLMError as exc:
         _handle_llm_error(exc)
     if not deleted:

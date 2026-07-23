@@ -256,18 +256,18 @@ class _RecordingVS:
         self.upserted = []
         self.deleted = []
 
-    async def ensure_collection(self):
+    async def ensure_collection(self, collection_name=None):
         pass
 
-    async def delete_document(self, doc_id):
+    async def delete_document(self, doc_id, collection_name=None):
         self.deleted.append(doc_id)
         return False
 
-    async def upsert_points(self, points):
+    async def upsert_points(self, points, collection_name=None):
         self.upserted.extend(points)
         return len(points)
 
-    async def list_documents(self):
+    async def list_documents(self, collection_name=None):
         return []
 
 
@@ -487,7 +487,7 @@ async def test_collection_status_reports_per_language_documents(monkeypatch):
         async def count(self, **kwargs):
             return SimpleNamespace(count=7)
 
-    async def _documents():
+    async def _documents(collection_name=None):
         return [{"lang": "ru"}, {"lang": "en"}, {"lang": "en"}, {"lang": None}]
 
     monkeypatch.setattr(vectorstore, "get_client", lambda: _Client())
@@ -508,8 +508,15 @@ async def test_generate_answer_injects_lab_instruction(monkeypatch):
     async def _embed_query(text):
         return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
 
-    async def _hybrid_search(dense, sparse_indices, sparse_values, top_k, candidates,
-                             query_filter=None):
+    async def _hybrid_search(
+        dense,
+        sparse_indices,
+        sparse_values,
+        top_k,
+        candidates,
+        query_filter=None,
+        collection_name=None,
+    ):
         captured["filter"] = query_filter
         return [
             {
@@ -527,7 +534,7 @@ async def test_generate_answer_injects_lab_instruction(monkeypatch):
             }
         ]
 
-    async def _fetch_lab_instruction_record(lab_id):
+    async def _fetch_lab_instruction_record(lab_id, collection_name=None):
         captured["lab_id"] = lab_id
         return {
             "text": "Тема: Кипение. Ход работы: нагрей воду.",
@@ -589,11 +596,18 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
     async def _embed_query(text):
         return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
 
-    async def _hybrid_search(dense, sparse_indices, sparse_values, top_k, candidates,
-                             query_filter=None):
+    async def _hybrid_search(
+        dense,
+        sparse_indices,
+        sparse_values,
+        top_k,
+        candidates,
+        query_filter=None,
+        collection_name=None,
+    ):
         return []
 
-    async def _fetch_lab_instruction_record(lab_id):
+    async def _fetch_lab_instruction_record(lab_id, collection_name=None):
         return None  # missing instruction -> incomplete lab
 
     async def _create(**kwargs):
@@ -626,7 +640,13 @@ async def test_generate_answer_incomplete_lab_warns(monkeypatch):
 async def test_prepare_grounding_infers_subject_and_language_without_lab(monkeypatch):
     captured = {}
 
-    async def _retrieve(query, query_filter=None, lang=None, fallback_filter=None):
+    async def _retrieve(
+        query,
+        query_filter=None,
+        lang=None,
+        fallback_filter=None,
+        collection_name=None,
+    ):
         captured["query_filter"] = query_filter
         captured["lang"] = lang
         captured["fallback_filter"] = fallback_filter

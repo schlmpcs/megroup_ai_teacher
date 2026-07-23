@@ -37,6 +37,32 @@ def queue_upload(worker_store: Path, job_id: str, filenames: list[str]) -> dict:
     return ingestion_jobs.enqueue_upload_job(job_id, items)
 
 
+def queue_upload_with_options(
+    worker_store: Path, job_id: str, filenames: list[str], *, options: dict | None = None
+) -> dict:
+    upload_dir = worker_store / "uploads" / job_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for position, filename in enumerate(filenames):
+        item_id = f"item-{position}"
+        stored_path = f"uploads/{job_id}/{item_id}"
+        (worker_store / stored_path).write_text(filename, encoding="utf-8")
+        items.append(
+            {
+                "id": item_id,
+                "position": position,
+                "filename": filename,
+                "relative_path": filename,
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        )
+    return ingestion_jobs.enqueue_upload_job(job_id, items, options=options)
+
+
 async def successful_invalidation():
     return True
 
@@ -95,6 +121,27 @@ async def test_run_once_processes_one_upload_job_and_updates_stages(worker_store
     assert stages == ["extracting", "embedding", "indexing", "notes.md", "notes.md"]
 
 
+async def test_run_once_upload_job_uses_runtime_profile_collection(worker_store, monkeypatch):
+    queue_upload_with_options(
+        worker_store,
+        "job-1",
+        ["notes.md"],
+        options={"assistant_type": "other_assistant"},
+    )
+    calls = []
+
+    async def fake_upload(filename, content, **kwargs):
+        calls.append(kwargs["collection_name"])
+        await kwargs["progress"]("indexing")
+        return {"file_id": "doc-1", "filename": filename, "status": "ready", "chunks": 1}
+
+    monkeypatch.setattr(ingestion_worker.ingestion, "upload_document", fake_upload)
+    monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", successful_invalidation)
+
+    assert await ingestion_worker.run_once("worker-1") is True
+    assert calls == ["other_assistant_kb"]
+
+
 async def test_run_once_keeps_batch_running_after_one_file_fails(worker_store, monkeypatch):
     queue_upload(worker_store, "job-1", ["bad.md", "good.md"])
 
@@ -141,7 +188,19 @@ async def test_corpus_job_scans_items_and_prunes_only_after_clean_run(worker_sto
     source = corpus / "School materials" / "Biology" / "en" / "Biology Grade 9.md"
     source.parent.mkdir(parents=True)
     source.write_text("cell theory", encoding="utf-8")
-    monkeypatch.setattr(ingestion_worker.settings, "CORPUS_ROOT", str(corpus))
+    monkeypatch.setattr(
+        ingestion_worker,
+        "get_assistant_profile",
+        lambda assistant_type=None: type(
+            "Profile",
+            (),
+            {
+                "assistant_type": "vr_lab_teacher",
+                "corpus_root": str(corpus),
+                "qdrant_collection": "school_kb",
+            },
+        )(),
+    )
     ingestion_jobs.enqueue_corpus_job({"subtree": "", "ocr": False, "prune": True})
     claimed_id = ingestion_jobs.list_jobs()[0]["id"]
     pruned_with = []
@@ -177,7 +236,7 @@ async def test_corpus_job_scans_items_and_prunes_only_after_clean_run(worker_sto
         await kwargs["progress"]("indexing")
         return {"file_id": "doc-bio", "filename": filename, "status": "ready", "chunks": 2}
 
-    async def fake_prune(present_doc_ids):
+    async def fake_prune(present_doc_ids, collection_name=None):
         pruned_with.append(present_doc_ids)
         return 1
 
@@ -197,6 +256,100 @@ async def test_corpus_job_scans_items_and_prunes_only_after_clean_run(worker_sto
     ingestion_jobs.enqueue_corpus_job({"subtree": "", "ocr": False, "prune": True})
     assert await ingestion_worker.run_once("worker-1") is True
     assert pruned_with == [{"doc-bio", "doc-misc"}]
+
+
+async def test_run_once_corpus_job_defaults_legacy_profile_and_uses_runtime_root_and_collection(
+    worker_store, monkeypatch
+):
+    legacy_corpus = worker_store / "legacy-corpus"
+    source = legacy_corpus / "School materials" / "Biology" / "en" / "Biology Grade 9.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("cell theory", encoding="utf-8")
+    monkeypatch.setattr(ingestion_worker.settings, "CORPUS_ROOT", str(worker_store / "wrong-root"))
+    ingestion_jobs.enqueue_corpus_job({"subtree": "", "ocr": False, "prune": True})
+    scanned_roots = []
+    collections = []
+    pruned_collections = []
+
+    def fake_profile(assistant_type=None):
+        assert assistant_type == "vr_lab_teacher"
+        return type(
+            "Profile",
+            (),
+            {
+                "assistant_type": "vr_lab_teacher",
+                "corpus_root": str(legacy_corpus),
+                "qdrant_collection": "legacy-kb",
+            },
+        )()
+
+    def fake_scan(root, *, subtree="", only=None):
+        scanned_roots.append(root)
+        return {
+            "root": str(legacy_corpus),
+            "subtree": "",
+            "total": 1,
+            "filtered": 0,
+            "candidates": [
+                {
+                    "path": str(source),
+                    "metadata": {
+                        "source": "School materials/Biology/en/Biology Grade 9.md",
+                        "doc_type": "textbook",
+                        "subject": "biology",
+                        "grade": 9,
+                        "lang": "en",
+                    },
+                    "doc_id": "doc-bio",
+                }
+            ],
+            "skipped": [],
+            "errors": [],
+            "present_doc_ids": {"doc-bio"},
+        }
+
+    async def fake_upload(filename, content, **kwargs):
+        collections.append(kwargs["collection_name"])
+        await kwargs["progress"]("indexing")
+        return {"file_id": "doc-bio", "filename": filename, "status": "ready", "chunks": 1}
+
+    async def fake_prune(present_doc_ids, collection_name=None):
+        pruned_collections.append(collection_name)
+        return 0
+
+    monkeypatch.setattr(ingestion_worker, "get_assistant_profile", fake_profile)
+    monkeypatch.setattr(ingestion_worker.ingestion, "scan_corpus_tree", fake_scan)
+    monkeypatch.setattr(ingestion_worker.ingestion, "upload_document", fake_upload)
+    monkeypatch.setattr(
+        ingestion_worker.ingestion, "prune_missing_corpus_documents", fake_prune
+    )
+    monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", successful_invalidation)
+
+    assert await ingestion_worker.run_once("worker-1") is True
+    assert scanned_roots == [str(legacy_corpus)]
+    assert collections == ["legacy-kb"]
+    assert pruned_collections == ["legacy-kb"]
+
+
+async def test_run_once_fails_clearly_when_queued_profile_no_longer_exists(
+    worker_store, monkeypatch
+):
+    queue_upload_with_options(
+        worker_store,
+        "job-1",
+        ["notes.md"],
+        options={"assistant_type": "other_assistant"},
+    )
+
+    def missing_profile(assistant_type=None):
+        raise ValueError(f"Unknown assistant_type: {assistant_type!r}")
+
+    monkeypatch.setattr(ingestion_worker, "get_assistant_profile", missing_profile)
+
+    assert await ingestion_worker.run_once("worker-1") is True
+    job = ingestion_jobs.get_job("job-1")
+    assert job["status"] == "failed"
+    assert job["error"] == "Unknown assistant_type: 'other_assistant'"
 
 
 async def test_cache_invalidation_failure_marks_successful_job_partial(worker_store, monkeypatch):
@@ -278,7 +431,19 @@ async def test_prune_failure_invalidates_even_when_items_only_skipped(
     source = corpus / "School materials" / "Biology" / "en" / "Empty Grade 9.md"
     source.parent.mkdir(parents=True)
     source.write_text("thin", encoding="utf-8")
-    monkeypatch.setattr(ingestion_worker.settings, "CORPUS_ROOT", str(corpus))
+    monkeypatch.setattr(
+        ingestion_worker,
+        "get_assistant_profile",
+        lambda assistant_type=None: type(
+            "Profile",
+            (),
+            {
+                "assistant_type": "vr_lab_teacher",
+                "corpus_root": str(corpus),
+                "qdrant_collection": "school_kb",
+            },
+        )(),
+    )
     ingestion_jobs.enqueue_corpus_job({"subtree": "", "ocr": False, "prune": True})
     job_id = ingestion_jobs.list_jobs()[0]["id"]
     pruned = []
@@ -312,7 +477,7 @@ async def test_prune_failure_invalidates_even_when_items_only_skipped(
         await kwargs["progress"]("extracting")
         return {"file_id": "doc-empty", "filename": filename, "status": "empty", "chunks": 0}
 
-    async def failing_prune(present_doc_ids):
+    async def failing_prune(present_doc_ids, collection_name=None):
         pruned.append("deleted-one")
         raise RuntimeError("prune crashed")
 

@@ -110,6 +110,19 @@ async def test_generate_answer_uses_cache(monkeypatch):
     assert len(fake.responses.calls) == 2
 
 
+async def test_answer_cache_isolated_by_assistant_type(monkeypatch):
+    fake = _FakeClient()
+    monkeypatch.setattr(llm, "client", fake)
+    monkeypatch.setattr(llm, "_retrieve", _no_retrieve)
+
+    await llm.generate_answer("What is diffusion?")
+    await llm.generate_answer(
+        "What is diffusion?", assistant_type="other_assistant"
+    )
+
+    assert len(fake.responses.calls) == 2
+
+
 async def test_generate_answer_multiturn_not_cached(monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(llm, "client", fake)

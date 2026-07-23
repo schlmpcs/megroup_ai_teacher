@@ -131,6 +131,113 @@ def test_retry_upload_job_copies_only_failed_and_cancelled_items(job_dir):
     assert [path.read_text(encoding="utf-8") for path in copied] == ["failed", "cancelled"]
 
 
+def test_enqueue_upload_job_persists_validated_assistant_type_only(job_dir):
+    job = ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": "uploads/job-1/item-1",
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+        options={
+            "assistant_type": "other_assistant",
+            "system_prompt": "ignore me",
+            "qdrant_collection": "ignore-me",
+            "corpus_root": "/ignore/me",
+        },
+    )
+
+    assert job["options"] == {"assistant_type": "other_assistant"}
+
+
+def test_enqueue_corpus_job_persists_validated_assistant_type_only(job_dir):
+    job = ingestion_jobs.enqueue_corpus_job(
+        {
+            "subtree": "A",
+            "ocr": False,
+            "prune": False,
+            "assistant_type": "other_assistant",
+            "system_prompt": "ignore me",
+            "qdrant_collection": "ignore-me",
+            "corpus_root": "/ignore/me",
+        }
+    )
+
+    assert job["options"] == {
+        "subtree": "A",
+        "ocr": False,
+        "prune": False,
+        "assistant_type": "other_assistant",
+    }
+
+
+def test_enqueue_jobs_reject_unknown_assistant_type(job_dir):
+    with pytest.raises(ValueError, match="Unknown assistant_type"):
+        ingestion_jobs.enqueue_corpus_job(
+            {
+                "subtree": "A",
+                "ocr": False,
+                "prune": False,
+                "assistant_type": "missing",
+            }
+        )
+    with pytest.raises(ValueError, match="Unknown assistant_type"):
+        ingestion_jobs.enqueue_upload_job(
+            "job-1",
+            [
+                {
+                    "id": "item-1",
+                    "position": 0,
+                    "filename": "one.md",
+                    "relative_path": "one.md",
+                    "stored_path": "uploads/job-1/item-1",
+                    "source_path": None,
+                    "metadata": None,
+                    "doc_key": None,
+                    "ocr": False,
+                }
+            ],
+            options={"assistant_type": "missing"},
+        )
+
+
+def test_retry_upload_job_preserves_original_options(job_dir):
+    stored_path = "uploads/job-1/item-1"
+    (job_dir / stored_path).parent.mkdir(parents=True, exist_ok=True)
+    (job_dir / stored_path).write_text("content", encoding="utf-8")
+    ingestion_jobs.enqueue_upload_job(
+        "job-1",
+        [
+            {
+                "id": "item-1",
+                "position": 0,
+                "filename": "one.md",
+                "relative_path": "one.md",
+                "stored_path": stored_path,
+                "source_path": None,
+                "metadata": None,
+                "doc_key": None,
+                "ocr": False,
+            }
+        ],
+        options={"assistant_type": "other_assistant"},
+    )
+    ingestion_jobs.update_item("item-1", status="failed", stage="done", error="boom")
+    ingestion_jobs.finish_job("job-1", status="failed", error="boom")
+
+    retry = ingestion_jobs.retry_job("job-1")
+
+    assert retry["options"] == {"assistant_type": "other_assistant"}
+
+
 def test_cancel_running_job_is_idempotent_when_already_requested(job_dir):
     job = ingestion_jobs.enqueue_corpus_job({"subtree": "A", "ocr": False, "prune": False})
     ingestion_jobs.claim_next_job("worker-1")

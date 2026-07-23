@@ -21,56 +21,71 @@ import sys
 from pathlib import Path
 
 from app.core.config import settings
+from app.services.assistant_profiles import (
+    DEFAULT_ASSISTANT_TYPE,
+    get_assistant_profile,
+)
 from app.services import ingestion, vectorstore
 
 
-async def _create_collection() -> None:
-    await vectorstore.ensure_collection()
+async def _create_collection(collection_name: str) -> None:
+    await vectorstore.ensure_collection(collection_name=collection_name)
     print(
-        f"Collection ready: {settings.QDRANT_COLLECTION}  "
+        f"Collection ready: {collection_name}  "
         f"(QDRANT_URL={settings.QDRANT_URL})"
     )
 
 
-async def _upload(paths: list[str]) -> None:
+async def _upload(paths: list[str], collection_name: str) -> None:
     for p in paths:
         path = Path(p)
         if not path.is_file():
             print(f"  SKIP (not a file): {p}", file=sys.stderr)
             continue
         # ensure_collection() is called inside upload_document, so no need here.
-        result = await ingestion.upload_document(path.name, path.read_bytes())
+        result = await ingestion.upload_document(
+            path.name,
+            path.read_bytes(),
+            collection_name=collection_name,
+        )
         print(
             f"  {result['status']:>10}  chunks={result['chunks']:<4}  "
             f"{result['file_id']}  {result['filename']}"
         )
 
 
-async def _list() -> None:
-    for f in await ingestion.list_documents():
+async def _list(collection_name: str) -> None:
+    documents = await ingestion.list_documents(collection_name=collection_name)
+    for f in documents:
         print(
             f"  {f['status']:>10}  {f['file_id']}  chunks={f.get('chunks', 0):<4}  "
             f"lang={f.get('lang') or '-':<2}  {f.get('filename') or ''}"
         )
 
 
-async def _status() -> None:
-    print(await ingestion.corpus_status())
+async def _status(collection_name: str) -> None:
+    status = await ingestion.corpus_status(collection_name=collection_name)
+    print(status)
 
 
-async def _delete(doc_id: str) -> None:
-    ok = await ingestion.delete_document(doc_id)
+async def _delete(doc_id: str, collection_name: str) -> None:
+    ok = await ingestion.delete_document(doc_id, collection_name=collection_name)
     print("deleted" if ok else "not found", doc_id)
 
 
 async def _bulk_ingest(
     root: str,
+    collection_name: str,
     ocr: bool | None = None,
     only: str | None = None,
     prune: bool = False,
 ) -> dict:
     summary = await ingestion.bulk_ingest_tree(
-        root, ocr=ocr, only=only, prune=prune
+        root,
+        ocr=ocr,
+        only=only,
+        prune=prune,
+        collection_name=collection_name,
     )
     print(
         f"Bulk ingest of {summary['root']}: "
@@ -100,13 +115,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Manage the local Qdrant knowledge base")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("create-collection")
+    def add_assistant_type_argument(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--assistant-type",
+            default=DEFAULT_ASSISTANT_TYPE,
+            help="Trusted assistant profile to use",
+        )
+
+    p_create = sub.add_parser("create-collection")
+    add_assistant_type_argument(p_create)
 
     p_upload = sub.add_parser("upload")
     p_upload.add_argument("paths", nargs="+")
+    add_assistant_type_argument(p_upload)
 
     p_bulk = sub.add_parser("bulk-ingest", help="Walk a corpus tree and ingest all files")
-    p_bulk.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
+    p_bulk.add_argument("root", nargs="?", default=None)
     p_bulk.add_argument(
         "--ocr",
         action=argparse.BooleanOptionalAction,
@@ -124,29 +148,41 @@ def main() -> None:
         action="store_true",
         help="Delete stored corpus documents absent from this complete snapshot",
     )
+    add_assistant_type_argument(p_bulk)
 
     p_manifest = sub.add_parser("gen-manifest", help="Report lab completeness (no embedding)")
-    p_manifest.add_argument("root", nargs="?", default=settings.CORPUS_ROOT)
+    p_manifest.add_argument("root", nargs="?", default=None)
     p_manifest.add_argument("--out", default=settings.LABS_MANIFEST)
+    add_assistant_type_argument(p_manifest)
 
-    sub.add_parser("list")
-    sub.add_parser("status")
+    p_list = sub.add_parser("list")
+    add_assistant_type_argument(p_list)
+
+    p_status = sub.add_parser("status")
+    add_assistant_type_argument(p_status)
 
     p_delete = sub.add_parser("delete")
     p_delete.add_argument("doc_id")
+    add_assistant_type_argument(p_delete)
 
     args = parser.parse_args()
+    try:
+        profile = get_assistant_profile(args.assistant_type)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.cmd == "create-collection":
-        asyncio.run(_create_collection())
+        asyncio.run(_create_collection(profile.qdrant_collection))
     elif args.cmd == "upload":
-        asyncio.run(_upload(args.paths))
+        asyncio.run(_upload(args.paths, profile.qdrant_collection))
     elif args.cmd == "bulk-ingest":
         if args.prune and args.only is not None:
             parser.error("--prune cannot be combined with --only")
+        root = profile.corpus_root if args.root is None else args.root
         summary = asyncio.run(
             _bulk_ingest(
-                args.root,
+                root,
+                profile.qdrant_collection,
                 ocr=settings.OCR_ENABLED if args.ocr is None else args.ocr,
                 only=args.only,
                 prune=args.prune,
@@ -155,13 +191,14 @@ def main() -> None:
         if summary.get("errors"):
             raise SystemExit(1)
     elif args.cmd == "gen-manifest":
-        _gen_manifest(args.root, args.out)
+        root = profile.corpus_root if args.root is None else args.root
+        _gen_manifest(root, args.out)
     elif args.cmd == "list":
-        asyncio.run(_list())
+        asyncio.run(_list(profile.qdrant_collection))
     elif args.cmd == "status":
-        asyncio.run(_status())
+        asyncio.run(_status(profile.qdrant_collection))
     elif args.cmd == "delete":
-        asyncio.run(_delete(args.doc_id))
+        asyncio.run(_delete(args.doc_id, profile.qdrant_collection))
 
 
 if __name__ == "__main__":

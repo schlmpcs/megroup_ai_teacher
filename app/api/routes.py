@@ -12,6 +12,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -26,6 +27,12 @@ from app.api.upload_utils import read_upload
 from app.core.config import settings
 from app.core.languages import LanguageCode, SpeechRecognitionLanguage
 from app.core.security import verify_api_key
+from app.services.assistant_profiles import (
+    AssistantProfile,
+    DEFAULT_ASSISTANT_TYPE,
+    available_assistant_types,
+    get_assistant_profile,
+)
 from app.services.corpus_meta import compose_lab_id
 from app.services.llm import (
     LLMError,
@@ -146,6 +153,9 @@ class Lab(BaseModel):
 
 
 class AskRequest(BaseModel):
+    assistant_type: str = Field(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    )
     query: str = Field(min_length=1, max_length=settings.MAX_INPUT_CHARS)
     conversation_id: Optional[ConversationId] = None
     scenario_id: Optional[str] = None
@@ -168,6 +178,9 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    assistant_type: str = Field(
+        default=DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    )
     model: str = settings.OPENAI_MODEL
     messages: List[ChatMessage] = Field(min_length=1, max_length=50)
     stream: bool = False
@@ -216,6 +229,17 @@ def _scenario_context_or_404(scenario_id: Optional[str]) -> Optional[str]:
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+
+def _assistant_profile_or_422(assistant_type: str | None) -> AssistantProfile:
+    try:
+        return get_assistant_profile(assistant_type)
+    except ValueError as exc:
+        allowed = ", ".join(available_assistant_types())
+        raise HTTPException(
+            status_code=422,
+            detail=f"{exc}. Available assistant types: {allowed}",
         ) from exc
 
 
@@ -317,10 +341,13 @@ async def ask_endpoint(req: AskRequest, request: Request):
     then ``data: [DONE]``. Errors after the stream starts arrive as
     ``{"type":"error","message":...}`` frames.
     """
+    profile = _assistant_profile_or_422(req.assistant_type)
     scenario_context = _scenario_context_or_404(req.scenario_id)
     lab = _lab_dict(req.lab)
     conversation_id = req.conversation_id or str(uuid.uuid4())
-    chat_history = conversation_memory.history_for(conversation_id, req.query)
+    chat_history = conversation_memory.history_for(
+        conversation_id, req.query, namespace=profile.assistant_type
+    )
     response_language = resolve_answer_language(
         req.query,
         explicit_language=req.language,
@@ -342,6 +369,7 @@ async def ask_endpoint(req: AskRequest, request: Request):
                     scenario_state=scenario_state,
                     lab=lab,
                     answer_language=response_language,
+                    assistant_type=profile.assistant_type,
                 ):
                     if event["type"] == "delta":
                         answer_parts.append(event["text"])
@@ -350,7 +378,10 @@ async def ask_endpoint(req: AskRequest, request: Request):
                         answer = "".join(answer_parts).strip()
                         if answer:
                             conversation_memory.remember(
-                                conversation_id, chat_history, answer
+                                conversation_id,
+                                chat_history,
+                                answer,
+                                namespace=profile.assistant_type,
                             )
                         citations = event["citations"]
                         yield _sse(
@@ -381,11 +412,17 @@ async def ask_endpoint(req: AskRequest, request: Request):
             scenario_state=scenario_state,
             lab=lab,
             answer_language=response_language,
+            assistant_type=profile.assistant_type,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
     llm_ms = (time.time() - start) * 1000
-    conversation_memory.remember(conversation_id, chat_history, result.answer)
+    conversation_memory.remember(
+        conversation_id,
+        chat_history,
+        result.answer,
+        namespace=profile.assistant_type,
+    )
 
     return {
         "answer": result.answer,
@@ -416,6 +453,7 @@ def _sse_chat_chunk(
 @limiter.limit(_consumer_limit)
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     """OpenAI-compatible chat endpoint with scenario + file-search grounding."""
+    profile = _assistant_profile_or_422(req.assistant_type)
     scenario_context = _scenario_context_or_404(req.scenario_id)
     history = build_input_messages([m.model_dump() for m in req.messages])
     user_query = latest_user_message(history) or ""
@@ -441,6 +479,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     scenario_state=scenario_state,
                     lab=lab,
                     answer_language=response_language,
+                    assistant_type=profile.assistant_type,
                 ):
                     if event["type"] == "delta":
                         yield _sse_chat_chunk(req.model, {"content": event["text"]})
@@ -477,6 +516,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             scenario_state=scenario_state,
             lab=lab,
             answer_language=response_language,
+            assistant_type=profile.assistant_type,
         )
     except LLMError as exc:
         _handle_llm_error(exc)
@@ -587,6 +627,9 @@ async def tts_endpoint(req: TTSRequest, request: Request):
 async def voice_ask_endpoint(
     request: Request,
     file: UploadFile = File(...),
+    assistant_type: str = Form(
+        DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
     conversation_id: Optional[str] = Form(
         None,
         min_length=1,
@@ -631,6 +674,7 @@ async def voice_ask_endpoint(
     ``{"type":"done",...}`` frame with citations, then ``data: [DONE]``. The
     client plays audio frames back-to-back in ``seq`` order.
     """
+    profile = _assistant_profile_or_422(assistant_type)
     conversation_id = conversation_id or str(uuid.uuid4())
     scenario_context = _scenario_context_or_404(scenario_id)
     scenario_state_model = _scenario_state_from_form(
@@ -664,7 +708,9 @@ async def voice_ask_endpoint(
     answer_language = response_language or resolved_language
     tts_language = answer_language
     scenario_state = _scenario_state_text(scenario_state_model, answer_language)
-    chat_history = conversation_memory.history_for(conversation_id, question)
+    chat_history = conversation_memory.history_for(
+        conversation_id, question, namespace=profile.assistant_type
+    )
     lab = _lab_dict(
         Lab(
             subject=subject,
@@ -728,6 +774,7 @@ async def voice_ask_endpoint(
                     scenario_state=scenario_state,
                     lab=lab,
                     answer_language=answer_language,
+                    assistant_type=profile.assistant_type,
                 ):
                     if event["type"] == "delta":
                         yield _sse({"type": "delta", "text": event["text"]})
@@ -740,7 +787,10 @@ async def voice_ask_endpoint(
                         answer = "".join(answer_parts).strip()
                         if answer:
                             conversation_memory.remember(
-                                conversation_id, chat_history, answer
+                                conversation_id,
+                                chat_history,
+                                answer,
+                                namespace=profile.assistant_type,
                             )
                         if buf.strip():
                             yield await tts_frame(buf.strip())
@@ -776,6 +826,7 @@ async def voice_ask_endpoint(
             scenario_state=scenario_state,
             lab=lab,
             answer_language=answer_language,
+            assistant_type=profile.assistant_type,
         )
         timings["llm"] = (time.time() - t0) * 1000
 
@@ -787,7 +838,12 @@ async def voice_ask_endpoint(
             backend=selected_tts_backend,
         )
         timings["tts"] = (time.time() - t0) * 1000
-        conversation_memory.remember(conversation_id, chat_history, result.answer)
+        conversation_memory.remember(
+            conversation_id,
+            chat_history,
+            result.answer,
+            namespace=profile.assistant_type,
+        )
     except LLMError as exc:
         _handle_llm_error(exc)
 
@@ -813,9 +869,15 @@ async def voice_ask_endpoint(
 async def clear_conversation(
     conversation_id: ConversationId,
     request: Request,
+    assistant_type: str = Query(
+        DEFAULT_ASSISTANT_TYPE, min_length=1, max_length=64
+    ),
 ):
     """Forget one ephemeral VR conversation immediately."""
+    profile = _assistant_profile_or_422(assistant_type)
     return {
         "conversation_id": conversation_id,
-        "cleared": conversation_memory.clear(conversation_id),
+        "cleared": conversation_memory.clear(
+            conversation_id, namespace=profile.assistant_type
+        ),
     }

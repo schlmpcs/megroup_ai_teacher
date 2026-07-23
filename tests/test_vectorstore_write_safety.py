@@ -513,3 +513,138 @@ async def test_ensure_collection_accepts_cross_process_create_race(monkeypatch):
     monkeypatch.setattr(vectorstore, "get_client", lambda: _CollectionClient())
 
     await vectorstore.ensure_collection()
+
+
+async def test_explicit_collection_name_is_used_for_qdrant_client_calls(monkeypatch):
+    collection = "assistant-b"
+    seen = []
+    lab_payload = {
+        "doc_id": "lab-doc",
+        "lab_id": "physics-8-ru-02",
+        "chunk_index": 0,
+        "text": "Шаг.",
+        "status": "ready",
+    }
+    document_payload = {
+        "doc_id": "doc-1",
+        "filename": "notes.md",
+        "text": "Document chunk",
+        "status": "ready",
+    }
+
+    class _Client:
+        def __init__(self):
+            self.exists_checks = 0
+
+        async def collection_exists(self, collection_name):
+            seen.append(("collection_exists", collection_name))
+            self.exists_checks += 1
+            return self.exists_checks > 1
+
+        async def create_collection(self, **kwargs):
+            seen.append(("create_collection", kwargs["collection_name"]))
+
+        async def scroll(self, **kwargs):
+            seen.append(("scroll", kwargs["collection_name"]))
+            flt = kwargs.get("scroll_filter")
+            must = list(getattr(flt, "must", None) or [])
+            if any(getattr(condition, "key", None) == "lab_id" for condition in must):
+                return [SimpleNamespace(payload=lab_payload)], None
+            if any(getattr(condition, "key", None) == "doc_id" for condition in must):
+                return [], None
+            return [SimpleNamespace(payload=document_payload)], None
+
+        async def upsert(self, **kwargs):
+            seen.append(("upsert", kwargs["collection_name"]))
+            return SimpleNamespace(status=models.UpdateStatus.COMPLETED)
+
+        async def query_points(self, **kwargs):
+            seen.append(("query_points", kwargs["collection_name"]))
+            return SimpleNamespace(
+                points=[SimpleNamespace(score=1.0, payload=document_payload)]
+            )
+
+        async def count(self, **kwargs):
+            seen.append(("count", kwargs["collection_name"]))
+            return SimpleNamespace(count=1)
+
+        async def delete(self, **kwargs):
+            seen.append(("delete", kwargs["collection_name"]))
+            return SimpleNamespace(status=models.UpdateStatus.COMPLETED)
+
+    client = _Client()
+    monkeypatch.setattr(vectorstore, "get_client", lambda: client)
+
+    await vectorstore.ensure_collection(collection_name=collection)
+    assert await vectorstore.upsert_points([_point("new")], collection_name=collection) == 1
+    assert await vectorstore.hybrid_search(
+        [0.1], [], [], 1, 1, collection_name=collection
+    ) == [{"score": 1.0, "payload": document_payload}]
+    assert await vectorstore.fetch_lab_instruction_record(
+        "physics-8-ru-02", collection_name=collection
+    ) == {"text": "Шаг.", "payloads": [lab_payload]}
+    assert await vectorstore.list_documents(collection_name=collection) == [
+        {
+            "file_id": "doc-1",
+            "filename": "notes.md",
+            "chunks": 1,
+            "status": "ready",
+            "doc_type": None,
+            "source_type": None,
+            "source_path": None,
+            "subject": None,
+            "grade": None,
+            "lang": None,
+            "lab_id": None,
+            "lab_number": None,
+            "file_type": None,
+        }
+    ]
+    assert await vectorstore.delete_document("doc-1", collection_name=collection) is True
+
+    assert {used for _, used in seen} == {collection}
+
+
+async def test_helper_calls_forward_explicit_collection_name(monkeypatch):
+    seen = {}
+
+    async def fake_fetch(lab_id, collection_name=None):
+        seen["fetch"] = (lab_id, collection_name)
+        return {"text": "procedure", "payloads": []}
+
+    async def fake_list_documents(collection_name=None):
+        seen["list_documents"] = collection_name
+        return [{"lang": "ru"}]
+
+    class _Client:
+        async def collection_exists(self, name):
+            seen["collection_exists"] = name
+            return True
+
+        async def count(self, **kwargs):
+            seen["count"] = kwargs["collection_name"]
+            return SimpleNamespace(count=3)
+
+    monkeypatch.setattr(vectorstore, "fetch_lab_instruction_record", fake_fetch)
+    monkeypatch.setattr(vectorstore, "list_documents", fake_list_documents)
+    monkeypatch.setattr(vectorstore, "get_client", lambda: _Client())
+
+    assert await vectorstore.fetch_lab_instruction(
+        "physics-8-ru-02", collection_name="assistant-b"
+    ) == "procedure"
+
+    status = await vectorstore.collection_status(collection_name="assistant-b")
+
+    assert seen == {
+        "fetch": ("physics-8-ru-02", "assistant-b"),
+        "collection_exists": "assistant-b",
+        "count": "assistant-b",
+        "list_documents": "assistant-b",
+    }
+    assert status["collection"] == "assistant-b"
+
+
+def test_explicit_empty_collection_does_not_fall_back_to_default(monkeypatch):
+    monkeypatch.setattr(vectorstore.settings, "QDRANT_COLLECTION", "school_kb")
+
+    assert vectorstore._resolve_collection_name("") == ""

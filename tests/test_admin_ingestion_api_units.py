@@ -31,6 +31,17 @@ def test_preview_suggests_folder_metadata(client, admin_auth):
     assert item["errors"] == []
 
 
+def test_preview_rejects_unknown_assistant_type(client, admin_auth):
+    response = client.post(
+        "/admin/ingestion/preview",
+        headers=admin_auth,
+        json={"paths": ["notes.md"], "assistant_type": "missing"},
+    )
+
+    assert response.status_code == 422
+    assert "Unknown assistant_type" in response.json()["detail"]
+
+
 def test_preview_marks_duplicate_suggested_identity(client, admin_auth):
     path = "Laboratory works/Physics/Physics Grade 10/en/Lab work 2.docx"
     response = client.post(
@@ -98,9 +109,89 @@ def test_upload_job_streams_files_and_returns_202(client, admin_auth):
     job = response.json()
     assert job["kind"] == "upload"
     assert job["status"] == "queued"
+    assert job["options"] == {"assistant_type": "vr_lab_teacher"}
     assert job["items"][0]["doc_key"] == "admin_uploads/textbook/physics/8/ru/Physics 8.md"
     stored = Path(ingestion_jobs.settings.INGESTION_DATA_DIR) / job["items"][0]["stored_path"]
     assert stored.read_bytes() == b"theory"
+
+
+def test_upload_job_persists_selected_assistant_type_only_in_options(
+    client, admin_auth
+):
+    manifest = [{"filename": "notes.md", "relative_path": "notes.md", "ocr": False}]
+
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={
+            "manifest": json.dumps(manifest),
+            "assistant_type": "other_assistant",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["options"] == {"assistant_type": "other_assistant"}
+
+
+def test_upload_job_enqueues_assistant_type_atomically(
+    client, admin_auth, monkeypatch
+):
+    manifest = [{"filename": "notes.md", "relative_path": "notes.md", "ocr": False}]
+    captured = {}
+
+    def _enqueue(job_id, items, *, options=None, retry_of=None):
+        captured["options"] = options
+        return {
+            "id": job_id,
+            "kind": "upload",
+            "status": "queued",
+            "options": options,
+            "items": items,
+        }
+
+    def _unexpected_update(*args, **kwargs):
+        raise AssertionError("job options must be written during enqueue")
+
+    monkeypatch.setattr(ingestion_jobs, "enqueue_upload_job", _enqueue)
+    monkeypatch.setattr(ingestion_jobs, "update_job", _unexpected_update)
+
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={
+            "manifest": json.dumps(manifest),
+            "assistant_type": "other_assistant",
+        },
+    )
+
+    assert response.status_code == 202
+    assert captured["options"] == {"assistant_type": "other_assistant"}
+
+
+def test_upload_job_rejects_unknown_assistant_type_before_filesystem(
+    client, admin_auth, tmp_path, monkeypatch
+):
+    manifest = [{"filename": "notes.md", "relative_path": "notes.md", "ocr": False}]
+    monkeypatch.setattr(admin_routes.settings, "INGESTION_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(ingestion_jobs.settings, "INGESTION_DATA_DIR", str(tmp_path))
+    ingestion_jobs.initialize()
+
+    response = client.post(
+        "/admin/ingestion/jobs/upload",
+        headers=admin_auth,
+        files=[("files", ("notes.md", b"notes", "text/markdown"))],
+        data={
+            "manifest": json.dumps(manifest),
+            "assistant_type": "missing",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Unknown assistant_type" in response.json()["detail"]
+    assert list((tmp_path / "tmp").iterdir()) == []
+    assert list((tmp_path / "uploads").iterdir()) == []
 
 
 def test_upload_job_preserves_legacy_identity_for_root_level_general_upload(client, admin_auth):
@@ -208,6 +299,47 @@ def test_corpus_preview_rejects_escape(client, admin_auth, tmp_path, monkeypatch
     assert response.status_code == 400
 
 
+def test_corpus_preview_uses_selected_profile_root_and_collection(
+    client, admin_auth, monkeypatch
+):
+    captured = {}
+
+    def _scan(root, subtree=""):
+        captured["root"] = root
+        captured["subtree"] = subtree
+        return {
+            "root": root,
+            "subtree": subtree,
+            "total": 0,
+            "candidates": [],
+            "skipped": [],
+            "present_doc_ids": set(),
+            "duplicate_lab_ids": [],
+            "counts_by_type": {},
+            "counts_by_language": {},
+        }
+
+    async def _list_documents(*, collection_name=None, **_):
+        captured["collection_name"] = collection_name
+        return []
+
+    monkeypatch.setattr(admin_routes.ingestion, "scan_corpus_tree", _scan)
+    monkeypatch.setattr(admin_routes.ingestion, "list_documents", _list_documents)
+
+    response = client.post(
+        "/admin/ingestion/corpus/preview",
+        headers=admin_auth,
+        json={"assistant_type": "other_assistant", "subtree": "", "ocr": False, "prune": False},
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "root": "/data/other-corpus",
+        "subtree": "",
+        "collection_name": "other_assistant_kb",
+    }
+
+
 def test_corpus_preview_returns_scan_summaries(client, admin_auth, monkeypatch):
     monkeypatch.setattr(
         admin_routes.ingestion,
@@ -225,7 +357,7 @@ def test_corpus_preview_returns_scan_summaries(client, admin_auth, monkeypatch):
         },
     )
 
-    async def no_documents():
+    async def no_documents(**_):
         return []
 
     monkeypatch.setattr(admin_routes.ingestion, "list_documents", no_documents)
@@ -247,6 +379,56 @@ def test_prune_is_rejected_with_subtree(client, admin_auth):
         json={"subtree": "Biology", "ocr": False, "prune": True},
     )
     assert response.status_code == 400
+
+
+def test_corpus_job_uses_selected_profile_root_and_persists_assistant_type(
+    client, admin_auth, monkeypatch
+):
+    captured = {}
+
+    def _resolve(root, subtree):
+        captured["root"] = root
+        captured["subtree"] = subtree
+        return root, subtree
+
+    monkeypatch.setattr(admin_routes.ingestion, "resolve_corpus_scope", _resolve)
+
+    response = client.post(
+        "/admin/ingestion/jobs/corpus",
+        headers=admin_auth,
+        json={"assistant_type": "other_assistant", "subtree": "", "ocr": False, "prune": False},
+    )
+
+    assert response.status_code == 202
+    assert captured == {"root": "/data/other-corpus", "subtree": ""}
+    assert response.json()["options"] == {
+        "assistant_type": "other_assistant",
+        "subtree": "",
+        "ocr": False,
+        "prune": False,
+    }
+
+
+def test_corpus_job_rejects_unknown_assistant_type_before_validation(
+    client, admin_auth, monkeypatch
+):
+    called = []
+
+    def _resolve(*args, **kwargs):
+        called.append((args, kwargs))
+        return args
+
+    monkeypatch.setattr(admin_routes.ingestion, "resolve_corpus_scope", _resolve)
+
+    response = client.post(
+        "/admin/ingestion/jobs/corpus",
+        headers=admin_auth,
+        json={"assistant_type": "missing", "subtree": "", "ocr": False, "prune": False},
+    )
+
+    assert response.status_code == 422
+    assert "Unknown assistant_type" in response.json()["detail"]
+    assert called == []
 
 
 def test_job_lifecycle_endpoints(client, admin_auth):

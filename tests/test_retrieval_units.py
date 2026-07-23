@@ -116,14 +116,14 @@ class _RecordingVectorstore:
         self.ensured = False
         self.deleted = []
 
-    async def ensure_collection(self):
+    async def ensure_collection(self, collection_name=None):
         self.ensured = True
 
-    async def delete_document(self, doc_id):
+    async def delete_document(self, doc_id, collection_name=None):
         self.deleted.append(doc_id)
         return False
 
-    async def upsert_points(self, points):
+    async def upsert_points(self, points, collection_name=None):
         self.upserted = points
         return len(points)
 
@@ -318,7 +318,14 @@ async def test_generate_answer_uses_retrieved_citations(monkeypatch):
     async def _embed_query(text):
         return Embedding(dense=[0.0], sparse_indices=[], sparse_values=[])
 
-    async def _hybrid_search(dense, sparse_indices, sparse_values, top_k, candidates):
+    async def _hybrid_search(
+        dense,
+        sparse_indices,
+        sparse_values,
+        top_k,
+        candidates,
+        collection_name=None,
+    ):
         return [
             {
                 "score": 0.9,
@@ -367,7 +374,7 @@ def _filter_conditions(flt) -> dict:
 async def test_lab_grounding_scopes_theory_to_grade(monkeypatch):
     """A grade-7 lab must build a grade-scoped primary filter + subject fallback."""
 
-    async def _fetch_lab_instruction_record(lab_id):
+    async def _fetch_lab_instruction_record(lab_id, collection_name=None):
         return None  # incomplete lab - exercises the no-instruction branch too
 
     monkeypatch.setattr(
@@ -402,6 +409,36 @@ async def test_lab_grounding_scopes_theory_to_grade(monkeypatch):
     assert _filter_conditions(fallback_filter) == {
         "doc_type": "textbook",
         "subject": "physics",
+    }
+
+
+async def test_lab_grounding_uses_selected_collection(monkeypatch):
+    captured = {}
+
+    async def _fetch_lab_instruction_record(lab_id, collection_name=None):
+        captured["lab_id"] = lab_id
+        captured["collection_name"] = collection_name
+        return None
+
+    monkeypatch.setattr(
+        llm.vectorstore,
+        "fetch_lab_instruction_record",
+        _fetch_lab_instruction_record,
+    )
+
+    await llm._lab_grounding(
+        {
+            "subject": "physics",
+            "grade": 7,
+            "lang": "ru",
+            "lab_id": "physics-7-ru-02",
+        },
+        collection_name="other_assistant_kb",
+    )
+
+    assert captured == {
+        "lab_id": "physics-7-ru-02",
+        "collection_name": "other_assistant_kb",
     }
 
 

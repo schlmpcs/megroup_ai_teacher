@@ -15,6 +15,7 @@ is written to disk.
 from typing import Optional
 
 from app.core.config import settings
+from app.services.assistant_profiles import DEFAULT_ASSISTANT_TYPE
 from app.services.ttl_cache import TTLCache
 
 
@@ -109,16 +110,29 @@ class ConversationMemory:
     def enabled(self) -> bool:
         return self._cache.enabled
 
-    def history_for(self, conversation_id: str, query: str) -> list[dict]:
+    def history_for(
+        self,
+        conversation_id: str,
+        query: str,
+        *,
+        namespace: str = DEFAULT_ASSISTANT_TYPE,
+    ) -> list[dict]:
         """Return stored history plus the current user turn, already trimmed."""
-        stored = self._cache.get(conversation_id) or []
+        stored = self._cache.get((namespace, conversation_id)) or []
         return trim_history(
             [*stored, {"role": "user", "content": query}],
             max_messages=self.max_messages,
             max_chars=self.max_chars,
         )
 
-    def remember(self, conversation_id: str, history: list[dict], answer: str) -> None:
+    def remember(
+        self,
+        conversation_id: str,
+        history: list[dict],
+        answer: str,
+        *,
+        namespace: str = DEFAULT_ASSISTANT_TYPE,
+    ) -> None:
         """Commit a successful assistant answer to a conversation."""
         if not answer or not self.enabled:
             return
@@ -127,10 +141,15 @@ class ConversationMemory:
             max_messages=self.max_messages,
             max_chars=self.max_chars,
         )
-        self._cache.put(conversation_id, updated)
+        self._cache.put((namespace, conversation_id), updated)
 
-    def clear(self, conversation_id: str) -> bool:
-        return self._cache.delete(conversation_id)
+    def clear(
+        self,
+        conversation_id: str,
+        *,
+        namespace: str = DEFAULT_ASSISTANT_TYPE,
+    ) -> bool:
+        return self._cache.delete((namespace, conversation_id))
 
     def clear_all(self) -> None:
         self._cache.clear()

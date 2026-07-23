@@ -36,6 +36,11 @@ from app.core.languages import (
     normalize_language_code,
 )
 from app.services import embeddings, vectorstore
+from app.services.assistant_profiles import (
+    AssistantProfile,
+    DEFAULT_ASSISTANT_TYPE,
+    get_assistant_profile,
+)
 from app.services.openai_client import client
 from app.services.memory import (
     build_input_messages,
@@ -252,10 +257,10 @@ _LAB_PROCEDURE_QUERY_RE = re.compile(
 
 # ── Prompt construction ──────────────────────────────────────────────────────
 
-_BASE_SYSTEM_PROMPT = (
-    "You are a friendly teaching assistant inside a school VR laboratory for "
-    "physics, chemistry, and biology. Help the student understand the current "
-    "activity, its safe next actions, and the theory directly related to it.\n\n"
+_SHARED_SYSTEM_PROMPT = (
+    "This service operates inside a school VR laboratory for physics, chemistry, "
+    "and biology. Help the student understand the current activity, its safe next "
+    "actions, and the theory directly related to it.\n\n"
     "Rules:\n"
     "1. The requested answer language is stated explicitly below and must be "
     "followed. Supported answer languages are Russian, Kazakh, and English.\n"
@@ -283,6 +288,7 @@ def build_system_prompt(
     answer_language: Optional[LanguageCode] = None,
     allow_general_knowledge: bool = False,
     strict_lab_scope: bool = False,
+    assistant_prompt: Optional[str] = None,
 ) -> str:
     """Assemble the system prompt, appending the grounding blocks if present.
 
@@ -300,7 +306,8 @@ def build_system_prompt(
     language = answer_language or normalize_language_code(
         settings.DEFAULT_LANGUAGE, field="DEFAULT_LANGUAGE"
     )
-    prompt = _BASE_SYSTEM_PROMPT
+    profile_prompt = assistant_prompt or get_assistant_profile().system_prompt
+    prompt = f"{profile_prompt.strip()}\n\n{_SHARED_SYSTEM_PROMPT}"
     language_rules = {
         "ru": "Write the entire answer in Russian. Do not switch languages.",
         "kk": "Write the entire answer in Kazakh. Do not switch languages.",
@@ -520,11 +527,19 @@ def _usable_theory_chunks(chunks: list[dict]) -> list[dict]:
     ]
 
 
-async def _search(query_filter: Any, dense, sparse_indices, sparse_values) -> list[dict]:
+async def _search(
+    query_filter: Any,
+    dense,
+    sparse_indices,
+    sparse_values,
+    collection_name: Optional[str] = None,
+) -> list[dict]:
     """One hybrid search + score-threshold filter for a given ``query_filter``."""
     kwargs = {}
     if query_filter is not None:
         kwargs["query_filter"] = query_filter
+    if collection_name is not None:
+        kwargs["collection_name"] = collection_name
     chunks = await vectorstore.hybrid_search(
         dense,
         sparse_indices,
@@ -554,6 +569,7 @@ async def _retrieve(
     query_filter: Any = None,
     lang: Optional[str] = None,
     fallback_filter: Any = None,
+    collection_name: Optional[str] = None,
 ) -> list[dict]:
     """Embed the query and hybrid-search the local Qdrant knowledge base.
 
@@ -595,7 +611,13 @@ async def _retrieve(
     merged: list[dict] = []
     seen: set = set()
     for tier in tiers:
-        chunks = await _search(tier, emb.dense, emb.sparse_indices, emb.sparse_values)
+        chunks = await _search(
+            tier,
+            emb.dense,
+            emb.sparse_indices,
+            emb.sparse_values,
+            collection_name=collection_name,
+        )
         for chunk in chunks:
             key = _dedup_key(chunk)
             if key in seen:
@@ -609,6 +631,7 @@ async def _retrieve(
 
 async def _lab_grounding(
     lab: Optional[dict],
+    collection_name: Optional[str] = None,
 ) -> tuple[Optional[str], bool, Any, Optional[str], Any, list[dict]]:
     """Resolve per-lab grounding from the structured ``lab`` context.
 
@@ -650,7 +673,9 @@ async def _lab_grounding(
     if not lab_id:
         return None, False, query_filter, lang, fallback_filter, []
 
-    record = await vectorstore.fetch_lab_instruction_record(lab_id)
+    record = await vectorstore.fetch_lab_instruction_record(
+        lab_id, collection_name=collection_name
+    )
     instruction = record["text"] if record else ""
     source_chunks = [
         {"payload": payload} for payload in (record or {}).get("payloads", [])
@@ -1044,6 +1069,7 @@ def _answer_cache_key(
     lab: Optional[dict],
     max_tokens: Optional[int],
     answer_language: LanguageCode = "ru",
+    assistant_type: str = DEFAULT_ASSISTANT_TYPE,
 ) -> tuple:
     """Everything that changes the generated answer, minus chat history.
 
@@ -1051,6 +1077,7 @@ def _answer_cache_key(
     dialogue); the caller passes a key only in that case.
     """
     return (
+        assistant_type,
         _WS_RE.sub(" ", query).strip().casefold(),
         scenario_context or "",
         scenario_state or "",
@@ -1083,8 +1110,10 @@ async def _prepare_answer_grounding(
     lab: Optional[dict],
     retrieval_query: Optional[str] = None,
     answer_language: Optional[LanguageCode] = None,
+    assistant_profile: Optional[AssistantProfile] = None,
 ) -> _AnswerGrounding:
     """Build identical retrieval and fallback state for both generation paths."""
+    profile = assistant_profile or get_assistant_profile()
     effective_retrieval_query = retrieval_query or query
     resolved_answer_language = answer_language or resolve_answer_language(
         query, lab_language=(lab or {}).get("lang")
@@ -1099,7 +1128,7 @@ async def _prepare_answer_grounding(
         retrieval_lang,
         fallback_filter,
         lab_source_chunks,
-    ) = await _lab_grounding(lab)
+    ) = await _lab_grounding(lab, collection_name=profile.qdrant_collection)
 
     if not lab and inferred_subject:
         query_filter = vectorstore.meta_filter(
@@ -1119,6 +1148,7 @@ async def _prepare_answer_grounding(
         query_filter=query_filter,
         lang=retrieval_lang,
         fallback_filter=fallback_filter,
+        collection_name=profile.qdrant_collection,
     )
     theory_chunks = _usable_theory_chunks(retrieved)
     lab_active = bool(lab)
@@ -1151,6 +1181,7 @@ async def _prepare_answer_grounding(
         answer_language=resolved_answer_language,
         allow_general_knowledge=allow_general_knowledge,
         strict_lab_scope=lab_active,
+        assistant_prompt=profile.system_prompt,
     )
     return _AnswerGrounding(
         system_prompt=system_prompt,
@@ -1264,6 +1295,7 @@ async def generate_answer(
     scenario_state: Optional[str] = None,
     lab: Optional[dict] = None,
     answer_language: Optional[LanguageCode] = None,
+    assistant_type: str = DEFAULT_ASSISTANT_TYPE,
 ) -> AnswerResult:
     """Generate a grounded answer (non-streaming).
 
@@ -1274,6 +1306,7 @@ async def generate_answer(
     from the in-process answer cache when an identical question (same scenario/
     state/lab) was answered within ``ANSWER_CACHE_TTL_S``.
     """
+    profile = get_assistant_profile(assistant_type)
     resolved_answer_language = resolve_answer_language(
         query,
         explicit_language=answer_language,
@@ -1288,6 +1321,7 @@ async def generate_answer(
             lab,
             max_tokens,
             resolved_answer_language,
+            profile.assistant_type,
         )
         if chat_history is None or len(chat_history) <= 1
         else None
@@ -1320,6 +1354,7 @@ async def generate_answer(
         lab,
         retrieval_query=retrieval_query,
         answer_language=resolved_answer_language,
+        assistant_profile=profile,
     )
     input_messages = build_input_messages(history)
 
@@ -1338,6 +1373,7 @@ async def stream_answer(
     scenario_state: Optional[str] = None,
     lab: Optional[dict] = None,
     answer_language: Optional[LanguageCode] = None,
+    assistant_type: str = DEFAULT_ASSISTANT_TYPE,
 ) -> AsyncIterator[dict]:
     """Stream a grounded answer as a sequence of events:
 
@@ -1349,6 +1385,7 @@ async def stream_answer(
     structured lab context as :func:`generate_answer`. Shares the answer cache
     with :func:`generate_answer` — a hit yields the whole answer as one delta.
     """
+    profile = get_assistant_profile(assistant_type)
     resolved_answer_language = resolve_answer_language(
         query,
         explicit_language=answer_language,
@@ -1363,6 +1400,7 @@ async def stream_answer(
             lab,
             max_tokens,
             resolved_answer_language,
+            profile.assistant_type,
         )
         if chat_history is None or len(chat_history) <= 1
         else None
@@ -1402,6 +1440,7 @@ async def stream_answer(
         lab,
         retrieval_query=retrieval_query,
         answer_language=resolved_answer_language,
+        assistant_profile=profile,
     )
     input_messages = build_input_messages(history)
 

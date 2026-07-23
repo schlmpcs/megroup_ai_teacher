@@ -106,6 +106,91 @@ def test_admin_documents_uses_configured_ocr_when_omitted(
     assert captured["ocr"] is True
 
 
+def test_admin_documents_uses_default_profile_collection(
+    client, admin_auth, monkeypatch
+):
+    captured = {}
+
+    async def _upload(
+        filename, raw, metadata=None, doc_key=None, ocr=False, collection_name=None, **_
+    ):
+        captured["collection_name"] = collection_name
+        return {
+            "file_id": "doc-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+
+    response = client.post(
+        "/admin/documents",
+        files={"file": ("notes.md", b"notes", "text/markdown")},
+        headers=admin_auth,
+    )
+
+    assert response.status_code == 201
+    assert captured["collection_name"] == admin_routes.settings.QDRANT_COLLECTION
+
+
+def test_admin_documents_uses_selected_profile_collection(
+    client, admin_auth, monkeypatch
+):
+    captured = {}
+
+    async def _upload(
+        filename, raw, metadata=None, doc_key=None, ocr=False, collection_name=None, **_
+    ):
+        captured["collection_name"] = collection_name
+        return {
+            "file_id": "doc-id",
+            "filename": filename,
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+
+    response = client.post(
+        "/admin/documents",
+        files={"file": ("notes.md", b"notes", "text/markdown")},
+        data={"assistant_type": "other_assistant"},
+        headers=admin_auth,
+    )
+
+    assert response.status_code == 201
+    assert captured["collection_name"] == "other_assistant_kb"
+
+
+def test_admin_documents_rejects_unknown_assistant_type_before_upload(
+    client, admin_auth, monkeypatch
+):
+    called = []
+
+    async def _upload(*args, **kwargs):
+        called.append((args, kwargs))
+        return {
+            "file_id": "doc-id",
+            "filename": "notes.md",
+            "status": "ready",
+            "chunks": 1,
+        }
+
+    monkeypatch.setattr(admin_routes.ingestion, "upload_document", _upload)
+
+    response = client.post(
+        "/admin/documents",
+        files={"file": ("notes.md", b"notes", "text/markdown")},
+        data={"assistant_type": "missing"},
+        headers=admin_auth,
+    )
+
+    assert response.status_code == 422
+    assert "Unknown assistant_type" in response.json()["detail"]
+    assert called == []
+
+
 @pytest.mark.parametrize(
     ("configured", "requested", "expected"),
     [(True, "false", False), (False, "true", True)],

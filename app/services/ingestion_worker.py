@@ -9,6 +9,10 @@ from pathlib import Path
 import httpx
 
 from app.core.config import settings
+from app.services.assistant_profiles import (
+    DEFAULT_ASSISTANT_TYPE,
+    get_assistant_profile,
+)
 from app.services import ingestion, ingestion_jobs
 
 logger = logging.getLogger("assistant.ingestion_worker")
@@ -53,9 +57,16 @@ async def invalidate_answer_cache() -> bool:
     return False
 
 
-def _item_file(item: dict) -> Path:
+def _job_profile(job: dict):
+    assistant_type = job.get("options", {}).get("assistant_type", DEFAULT_ASSISTANT_TYPE)
+    return get_assistant_profile(assistant_type)
+
+
+def _item_file(item: dict, *, corpus_root: str | None = None) -> Path:
     if item.get("source_path"):
-        root = Path(settings.CORPUS_ROOT).resolve(strict=True)
+        root = Path(
+            settings.CORPUS_ROOT if corpus_root is None else corpus_root
+        ).resolve(strict=True)
         path = Path(item["source_path"]).resolve(strict=True)
         if not path.is_relative_to(root) or not path.is_file():
             raise ValueError("Corpus source file is missing or outside CORPUS_ROOT")
@@ -67,7 +78,7 @@ def _item_file(item: dict) -> Path:
     return path
 
 
-async def _run_item(job: dict, item: dict) -> tuple[bool, bool]:
+async def _run_item(job: dict, item: dict, *, corpus_root: str, collection_name: str) -> tuple[bool, bool]:
     ingestion_jobs.update_item(
         item["id"],
         status="running",
@@ -94,13 +105,16 @@ async def _run_item(job: dict, item: dict) -> tuple[bool, bool]:
             reached_indexing = reached_indexing or stage == "indexing"
             await progress(stage)
 
-        content = await asyncio.to_thread(_item_file(item).read_bytes)
+        content = await asyncio.to_thread(
+            _item_file(item, corpus_root=corpus_root).read_bytes
+        )
         result = await ingestion.upload_document(
             item["filename"],
             content,
             metadata=item["metadata"],
             doc_key=item["doc_key"],
             ocr=item["ocr"],
+            collection_name=collection_name,
             progress=tracked_progress,
             should_cancel=should_cancel,
         )
@@ -185,23 +199,30 @@ def _fail_active_items(job: dict, error: str) -> None:
 
 
 async def _run_upload_job(job: dict) -> tuple[bool, bool]:
+    profile = _job_profile(job)
     mutated = False
     ambiguous = False
     for item in job["items"]:
         if ingestion_jobs.cancellation_requested(job["id"]):
             ingestion_jobs.cancel_pending_items(job["id"])
             break
-        item_mutated, item_ambiguous = await _run_item(job, item)
+        item_mutated, item_ambiguous = await _run_item(
+            job,
+            item,
+            corpus_root=profile.corpus_root,
+            collection_name=profile.qdrant_collection,
+        )
         mutated = mutated or item_mutated
         ambiguous = ambiguous or item_ambiguous
     return mutated, ambiguous
 
 
 async def _run_corpus_job(job: dict) -> tuple[bool, bool]:
+    profile = _job_profile(job)
     options = job["options"]
     scan = await asyncio.to_thread(
         ingestion.scan_corpus_tree,
-        settings.CORPUS_ROOT,
+        profile.corpus_root,
         subtree=options["subtree"],
     )
     items = []
@@ -246,7 +267,12 @@ async def _run_corpus_job(job: dict) -> tuple[bool, bool]:
         if ingestion_jobs.cancellation_requested(job["id"]):
             ingestion_jobs.cancel_pending_items(job["id"])
             break
-        item_mutated, item_ambiguous = await _run_item(job, item)
+        item_mutated, item_ambiguous = await _run_item(
+            job,
+            item,
+            corpus_root=profile.corpus_root,
+            collection_name=profile.qdrant_collection,
+        )
         mutated = mutated or item_mutated
         ambiguous = ambiguous or item_ambiguous
     if (
@@ -259,7 +285,8 @@ async def _run_corpus_job(job: dict) -> tuple[bool, bool]:
         if current["failed_items"] == 0:
             try:
                 pruned = await ingestion.prune_missing_corpus_documents(
-                    scan["present_doc_ids"]
+                    scan["present_doc_ids"],
+                    collection_name=profile.qdrant_collection,
                 )
             except Exception:
                 if not await invalidate_answer_cache():

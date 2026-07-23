@@ -87,6 +87,10 @@ def _doc_filter(doc_id: str) -> models.Filter:
     )
 
 
+def _resolve_collection_name(collection_name: str | None) -> str:
+    return settings.QDRANT_COLLECTION if collection_name is None else collection_name
+
+
 def meta_filter(**fields) -> models.Filter | None:
     """Build a Qdrant ``must``-filter from non-None payload fields.
 
@@ -163,16 +167,17 @@ def _with_generation_exclusions(
     return base.model_copy(update={"must_not": must_not})
 
 
-async def ensure_collection() -> None:
+async def ensure_collection(collection_name: str | None = None) -> None:
     """Create the dense+sparse collection if it does not already exist."""
+    collection = _resolve_collection_name(collection_name)
     try:
         async with _collection_lock:
             client = get_client()
-            if await client.collection_exists(settings.QDRANT_COLLECTION):
+            if await client.collection_exists(collection):
                 return
             try:
                 await client.create_collection(
-                    collection_name=settings.QDRANT_COLLECTION,
+                    collection_name=collection,
                     vectors_config={
                         DENSE: models.VectorParams(
                             size=settings.EMBEDDING_DIM,
@@ -183,20 +188,20 @@ async def ensure_collection() -> None:
                 )
             except Exception:  # noqa: BLE001 - another process may have won
                 try:
-                    exists = await client.collection_exists(
-                        settings.QDRANT_COLLECTION
-                    )
+                    exists = await client.collection_exists(collection)
                 except Exception:  # noqa: BLE001 - preserve the create failure
                     exists = False
                 if not exists:
                     raise
                 return
-            logger.info("Created Qdrant collection '%s'", settings.QDRANT_COLLECTION)
+            logger.info("Created Qdrant collection '%s'", collection)
     except Exception as exc:  # noqa: BLE001 - normalise to service-layer errors
         raise _map_qdrant_error(exc) from exc
 
 
-async def upsert_points(points: list[dict]) -> int:
+async def upsert_points(
+    points: list[dict], collection_name: str | None = None
+) -> int:
     """Upsert hybrid points and return how many were written.
 
     Each point dict carries ``id``, a ``dense`` vector, ``sparse_indices`` /
@@ -205,6 +210,7 @@ async def upsert_points(points: list[dict]) -> int:
     """
     if not points:
         return 0
+    collection = _resolve_collection_name(collection_name)
     doc_ids = {point["payload"].get("doc_id") for point in points}
     replace_doc_id = doc_ids.pop() if len(doc_ids) == 1 else None
     generations = {
@@ -242,7 +248,7 @@ async def upsert_points(points: list[dict]) -> int:
                 offset = None
                 while True:
                     records, offset = await client.scroll(
-                        collection_name=settings.QDRANT_COLLECTION,
+                        collection_name=collection,
                         scroll_filter=_doc_filter(replace_doc_id),
                         limit=_SCROLL_PAGE,
                         offset=offset,
@@ -258,14 +264,14 @@ async def upsert_points(points: list[dict]) -> int:
                         break
 
             upsert_result = await client.upsert(
-                collection_name=settings.QDRANT_COLLECTION,
+                collection_name=collection,
                 points=structs,
             )
             _require_completed(upsert_result, "upsert")
 
             if activate_generation and replace_doc_id:
                 activation_result = await client.set_payload(
-                    collection_name=settings.QDRANT_COLLECTION,
+                    collection_name=collection,
                     payload={
                         "active_generation": activate_generation,
                         "status": "ready",
@@ -275,7 +281,7 @@ async def upsert_points(points: list[dict]) -> int:
                 _require_completed(activation_result, "generation activation")
 
                 supersede_result = await client.set_payload(
-                    collection_name=settings.QDRANT_COLLECTION,
+                    collection_name=collection,
                     payload={"status": "superseded"},
                     points=models.Filter(
                         must=[
@@ -341,7 +347,7 @@ async def upsert_points(points: list[dict]) -> int:
                         else models.PointIdsList(points=stale_ids)
                     )
                     delete_result = await client.delete(
-                        collection_name=settings.QDRANT_COLLECTION,
+                        collection_name=collection,
                         points_selector=selector,
                     )
                     _require_completed(delete_result, "stale cleanup")
@@ -367,12 +373,14 @@ async def hybrid_search(
     top_k: int,
     candidates: int,
     query_filter: "models.Filter | None" = None,
+    collection_name: str | None = None,
 ) -> list[dict]:
     """Dense+sparse retrieval fused with RRF; returns scored payloads.
 
     ``query_filter`` (optional) scopes both prefetch branches to a metadata
     subset — e.g. only physics textbook chunks for a physics lab.
     """
+    collection = _resolve_collection_name(collection_name)
     client = get_client()
     base_filter = _without_inactive(query_filter)
     visible_filter = base_filter
@@ -383,7 +391,7 @@ async def hybrid_search(
     try:
         while True:
             result = await client.query_points(
-                collection_name=settings.QDRANT_COLLECTION,
+                collection_name=collection,
                 prefetch=[
                     models.Prefetch(
                         query=dense,
@@ -549,7 +557,9 @@ def _reconstruct_lab_text(payloads: list[dict]) -> str:
     return "".join(char or " " for char in canvas).strip()
 
 
-async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
+async def fetch_lab_instruction_record(
+    lab_id: str, collection_name: str | None = None
+) -> dict | None:
     """Return procedure text plus its stored chunk payloads for ``lab_id``.
 
     Scrolls all chunks tagged with this ``lab_id`` and concatenates them by
@@ -557,6 +567,7 @@ async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
     document instead of only unrelated theory retrieval. Returns ``None`` when
     the lab has no instruction in the store.
     """
+    collection = _resolve_collection_name(collection_name)
     client = get_client()
     flt = _without_inactive(
         models.Filter(
@@ -568,13 +579,13 @@ async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
         )
     )
     try:
-        if not await client.collection_exists(settings.QDRANT_COLLECTION):
+        if not await client.collection_exists(collection):
             return None
         rows: list[dict] = []
         offset = None
         while True:
             records, offset = await client.scroll(
-                collection_name=settings.QDRANT_COLLECTION,
+                collection_name=collection,
                 scroll_filter=flt,
                 limit=_SCROLL_PAGE,
                 offset=offset,
@@ -605,25 +616,29 @@ async def fetch_lab_instruction_record(lab_id: str) -> dict | None:
     return {"text": text, "payloads": ordered} if text else None
 
 
-async def fetch_lab_instruction(lab_id: str) -> str:
+async def fetch_lab_instruction(
+    lab_id: str, collection_name: str | None = None
+) -> str:
     """Return only the full procedure text for ``lab_id``.
 
     This preserves the original public behavior for callers that do not need
     source metadata. New citation-aware callers should use
     :func:`fetch_lab_instruction_record`.
     """
-    record = await fetch_lab_instruction_record(lab_id)
+    collection = _resolve_collection_name(collection_name)
+    record = await fetch_lab_instruction_record(lab_id, collection_name=collection)
     return record["text"] if record else ""
 
 
-async def list_documents() -> list[dict]:
+async def list_documents(collection_name: str | None = None) -> list[dict]:
     """Group all chunks by ``payload["doc_id"]`` into one entry per document.
 
     Returns ``[]`` if the collection does not exist yet.
     """
+    collection = _resolve_collection_name(collection_name)
     client = get_client()
     try:
-        if not await client.collection_exists(settings.QDRANT_COLLECTION):
+        if not await client.collection_exists(collection):
             return []
         docs: dict[str, dict] = {}
         metadata_fields = (
@@ -640,7 +655,7 @@ async def list_documents() -> list[dict]:
         offset = None
         while True:
             records, offset = await client.scroll(
-                collection_name=settings.QDRANT_COLLECTION,
+                collection_name=collection,
                 limit=_SCROLL_PAGE,
                 offset=offset,
                 with_payload=True,
@@ -685,14 +700,17 @@ async def list_documents() -> list[dict]:
     return list(docs.values())
 
 
-async def delete_document(doc_id: str) -> bool:
+async def delete_document(
+    doc_id: str, collection_name: str | None = None
+) -> bool:
     """Delete every chunk for ``doc_id``; return False if there were none."""
+    collection = _resolve_collection_name(collection_name)
     client = get_client()
     flt = _doc_filter(doc_id)
     try:
         count = (
             await client.count(
-                collection_name=settings.QDRANT_COLLECTION,
+                collection_name=collection,
                 count_filter=flt,
                 exact=True,
             )
@@ -700,7 +718,7 @@ async def delete_document(doc_id: str) -> bool:
         if count == 0:
             return False
         result = await client.delete(
-            collection_name=settings.QDRANT_COLLECTION,
+            collection_name=collection,
             points_selector=models.FilterSelector(filter=flt),
         )
         _require_completed(result, "delete")
@@ -712,14 +730,15 @@ async def delete_document(doc_id: str) -> bool:
     return True
 
 
-async def collection_status() -> dict:
+async def collection_status(collection_name: str | None = None) -> dict:
     """Summarise the collection: status, point count and distinct documents."""
+    collection = _resolve_collection_name(collection_name)
     client = get_client()
     try:
-        if not await client.collection_exists(settings.QDRANT_COLLECTION):
+        if not await client.collection_exists(collection):
             return {
                 "status": "unconfigured",
-                "collection": settings.QDRANT_COLLECTION,
+                "collection": collection,
                 "points": 0,
                 "documents": 0,
                 "file_counts": {"total": 0},
@@ -729,12 +748,12 @@ async def collection_status() -> dict:
                 "supported_languages": list(SUPPORTED_LANGUAGES),
             }
         points = (
-            await client.count(collection_name=settings.QDRANT_COLLECTION, exact=True)
+            await client.count(collection_name=collection, exact=True)
         ).count
     except Exception as exc:  # noqa: BLE001
         raise _map_qdrant_error(exc) from exc
 
-    document_rows = await list_documents()
+    document_rows = await list_documents(collection_name=collection)
     documents = len(document_rows)
     documents_by_language = {
         language: sum(1 for row in document_rows if row.get("lang") == language)
@@ -742,7 +761,7 @@ async def collection_status() -> dict:
     }
     return {
         "status": "ready" if points else "empty",
-        "collection": settings.QDRANT_COLLECTION,
+        "collection": collection,
         "points": points,
         "documents": documents,
         "file_counts": {"total": documents},

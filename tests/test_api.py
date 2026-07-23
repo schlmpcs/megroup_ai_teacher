@@ -17,6 +17,7 @@ def fake_answer(monkeypatch):
         scenario_state=None,
         lab=None,
         answer_language=None,
+        assistant_type=None,
     ):
         _gen.calls.append(
             {
@@ -26,6 +27,7 @@ def fake_answer(monkeypatch):
                 "scenario_state": scenario_state,
                 "lab": lab,
                 "answer_language": answer_language,
+                "assistant_type": assistant_type,
             }
         )
         # The scenario context should be threaded through when a scenario_id is given.
@@ -104,6 +106,28 @@ def test_ask_returns_answer_and_citations(client, auth, fake_answer):
     assert body["language"] == "ru"
 
 
+def test_ask_selects_assistant_profile(client, auth, fake_answer):
+    response = client.post(
+        "/ask",
+        json={"query": "Explain this", "assistant_type": "other_assistant"},
+        headers=auth,
+    )
+
+    assert response.status_code == 200
+    assert fake_answer.calls[-1]["assistant_type"] == "other_assistant"
+
+
+def test_ask_rejects_unknown_assistant_before_generation(client, auth, fake_answer):
+    response = client.post(
+        "/ask",
+        json={"query": "Explain this", "assistant_type": "missing"},
+        headers=auth,
+    )
+
+    assert response.status_code == 422
+    assert fake_answer.calls == []
+
+
 def test_ask_reuses_conversation_history_for_followup(client, auth, fake_answer):
     conversation_id = "vr-session-physics-1"
     first = client.post(
@@ -129,6 +153,34 @@ def test_ask_reuses_conversation_history_for_followup(client, auth, fake_answer)
         {"role": "user", "content": "Что такое кипение?"},
         {"role": "assistant", "content": "Ответ на: Что такое кипение?"},
         {"role": "user", "content": "Почему оно начинается?"},
+    ]
+
+
+def test_ask_conversation_history_isolated_by_assistant_type(
+    client, auth, fake_answer
+):
+    conversation_id = "shared-profile-session"
+    first = client.post(
+        "/ask",
+        json={
+            "query": "Default question",
+            "conversation_id": conversation_id,
+        },
+        headers=auth,
+    )
+    second = client.post(
+        "/ask",
+        json={
+            "query": "Other question",
+            "conversation_id": conversation_id,
+            "assistant_type": "other_assistant",
+        },
+        headers=auth,
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert fake_answer.calls[-1]["chat_history"] == [
+        {"role": "user", "content": "Other question"}
     ]
 
 
@@ -362,6 +414,7 @@ def test_ask_stream(client, auth, monkeypatch):
         scenario_state=None,
         lab=None,
         answer_language=None,
+        assistant_type=None,
     ):
         yield {"type": "delta", "text": "Кипение — "}
         yield {"type": "delta", "text": "это парообразование."}
@@ -396,6 +449,7 @@ def test_ask_stream_remembers_answer_for_followup(
         scenario_state=None,
         lab=None,
         answer_language=None,
+        assistant_type=None,
     ):
         yield {"type": "delta", "text": "Первый "}
         yield {"type": "delta", "text": "ответ."}
@@ -477,6 +531,36 @@ def test_chat_completions_nonstream(client, auth, fake_answer):
     assert "Разрешённые действия сейчас: открыть журнал" in state
 
 
+def test_chat_completions_selects_assistant_profile(client, auth, fake_answer):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "assistant_type": "other_assistant",
+            "messages": [{"role": "user", "content": "Explain this"}],
+        },
+        headers=auth,
+    )
+
+    assert response.status_code == 200
+    assert fake_answer.calls[-1]["assistant_type"] == "other_assistant"
+
+
+def test_chat_completions_rejects_unknown_assistant_profile(
+    client, auth, fake_answer
+):
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "assistant_type": "missing",
+            "messages": [{"role": "user", "content": "Explain this"}],
+        },
+        headers=auth,
+    )
+
+    assert response.status_code == 422
+    assert fake_answer.calls == []
+
+
 def test_chat_completions_ambiguous_followup_keeps_english_history_language(
     client, auth, fake_answer
 ):
@@ -516,6 +600,7 @@ def test_chat_completions_stream(client, auth, monkeypatch):
         scenario_state=None,
         lab=None,
         answer_language=None,
+        assistant_type=None,
     ):
         yield {"type": "delta", "text": "Ответ "}
         yield {"type": "delta", "text": "готов"}
@@ -858,6 +943,47 @@ def test_voice_ask_full_pipeline(client, auth, monkeypatch, fake_answer):
     assert "tts" in body["observability"]["latency_ms"]
 
 
+def test_voice_ask_selects_assistant_profile(
+    client, auth, monkeypatch, fake_answer
+):
+    async def _transcribe(*args, **kwargs):
+        return "Explain this", "en"
+
+    async def _synth(*args, **kwargs):
+        return b"SPOKEN", "audio/wav"
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _transcribe)
+    monkeypatch.setattr(routes, "synthesize", _synth)
+
+    response = client.post(
+        "/voice_ask",
+        files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        data={"assistant_type": "other_assistant"},
+        headers=auth,
+    )
+
+    assert response.status_code == 200
+    assert fake_answer.calls[-1]["assistant_type"] == "other_assistant"
+
+
+def test_voice_ask_rejects_unknown_assistant_before_stt(
+    client, auth, monkeypatch
+):
+    async def _unexpected_stt(*args, **kwargs):
+        raise AssertionError("STT must not run for an unknown assistant")
+
+    monkeypatch.setattr(routes, "transcribe_with_language", _unexpected_stt)
+
+    response = client.post(
+        "/voice_ask",
+        files={"file": ("q.webm", b"RIFFfake", "audio/webm")},
+        data={"assistant_type": "missing"},
+        headers=auth,
+    )
+
+    assert response.status_code == 422
+
+
 def test_voice_ask_reuses_conversation_history(client, auth, monkeypatch, fake_answer):
     questions = iter(["Что такое кипение?", "Почему оно начинается?"])
 
@@ -1060,6 +1186,7 @@ def test_voice_ask_stream(client, auth, monkeypatch):
         scenario_state=None,
         lab=None,
         answer_language=None,
+        assistant_type=None,
     ):
         yield {"type": "delta", "text": "Нагрев ускоряет реакцию. "}
         yield {"type": "delta", "text": "Молекулы движутся быстрее."}
@@ -1124,7 +1251,8 @@ def test_voice_ask_stream(client, auth, monkeypatch):
 
 
 def test_corpus_status(client, admin_auth, monkeypatch):
-    async def _status():
+    async def _status(collection_name=None):
+        assert collection_name == "school_kb"
         return {"status": "ready", "file_counts": {"total": 3}}
 
     monkeypatch.setattr(admin_routes.ingestion, "corpus_status", _status)
@@ -1386,8 +1514,9 @@ def test_upload_unsupported_type_400(client, admin_auth):
 def test_delete_document_clears_answer_cache(client, admin_auth, monkeypatch):
     cache_clears = []
 
-    async def _delete(file_id):
+    async def _delete(file_id, collection_name=None):
         assert file_id == "chemistry-book"
+        assert collection_name == "school_kb"
         return True
 
     monkeypatch.setattr(admin_routes.ingestion, "delete_document", _delete)
@@ -1407,7 +1536,8 @@ def test_delete_missing_document_does_not_clear_answer_cache(
 ):
     cache_clears = []
 
-    async def _delete(file_id):
+    async def _delete(file_id, collection_name=None):
+        assert collection_name == "school_kb"
         return False
 
     monkeypatch.setattr(admin_routes.ingestion, "delete_document", _delete)

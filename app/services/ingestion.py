@@ -805,6 +805,7 @@ async def upload_document(
     metadata: dict | None = None,
     doc_key: str | None = None,
     ocr: bool | None = None,
+    collection_name: str | None = None,
     progress: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
     **_,
@@ -822,6 +823,7 @@ async def upload_document(
     ``ValueError`` for unsupported extensions; embedding / vector-store failures
     propagate as ``LLMError`` subclasses.
     """
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise ValueError(
@@ -855,7 +857,7 @@ async def upload_document(
     await _stage("embedding", progress, should_cancel)
     embeddings_list = await embeddings.embed_texts(chunks)
     await _stage("indexing", progress, should_cancel)
-    await vectorstore.ensure_collection()
+    await vectorstore.ensure_collection(collection_name=collection)
 
     base_payload = {k: v for k, v in (metadata or {}).items() if v is not None}
     base_payload.setdefault("source_path", base_payload.get("source") or key)
@@ -884,7 +886,7 @@ async def upload_document(
         for i, (record, emb) in enumerate(zip(chunk_records, embeddings_list))
     ]
 
-    n = await vectorstore.upsert_points(points)
+    n = await vectorstore.upsert_points(points, collection_name=collection)
     logger.info("Ingested '%s' -> doc_id=%s status=ready chunks=%d", key, doc_id, n)
     return {"file_id": doc_id, "filename": filename, "status": "ready", "chunks": n}
 
@@ -1019,9 +1021,12 @@ def scan_corpus_tree(
     }
 
 
-async def prune_missing_corpus_documents(present_doc_ids: set[str]) -> int:
+async def prune_missing_corpus_documents(
+    present_doc_ids: set[str], collection_name: str | None = None
+) -> int:
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
     pruned = 0
-    for document in await vectorstore.list_documents():
+    for document in await vectorstore.list_documents(collection_name=collection):
         source = document.get("source_path")
         file_id = document.get("file_id")
         if (
@@ -1030,7 +1035,9 @@ async def prune_missing_corpus_documents(present_doc_ids: set[str]) -> int:
             and not source.startswith("admin_uploads/")
             and corpus_meta.parse_path(source) is not None
             and file_id not in present_doc_ids
-            and await vectorstore.delete_document(file_id)
+            and await vectorstore.delete_document(
+                file_id, collection_name=collection
+            )
         ):
             pruned += 1
     return pruned
@@ -1042,6 +1049,7 @@ async def bulk_ingest_tree(
     ocr: bool | None = None,
     only: str | None = None,
     prune: bool = False,
+    collection_name: str | None = None,
 ) -> dict:
     """Walk ``root``, derive metadata from each path and ingest every file.
 
@@ -1056,6 +1064,7 @@ async def bulk_ingest_tree(
     stored corpus documents missing from this complete snapshot and cannot be
     combined with ``only``.
     """
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
     if prune and only is not None:
         raise ValueError("prune cannot be combined with a filtered bulk ingest")
     scan = scan_corpus_tree(root, only=only)
@@ -1086,6 +1095,7 @@ async def bulk_ingest_tree(
                 metadata=meta,
                 doc_key=meta["source"],
                 ocr=ocr_enabled,
+                collection_name=collection,
             )
         except Exception as exc:  # noqa: BLE001 - keep going, record the failure
             summary["errors"].append({"source": meta["source"], "error": str(exc)})
@@ -1102,7 +1112,7 @@ async def bulk_ingest_tree(
     if prune and scan["candidates"] and not summary["errors"]:
         try:
             summary["pruned"] = await prune_missing_corpus_documents(
-                scan["present_doc_ids"]
+                scan["present_doc_ids"], collection_name=collection
             )
         except Exception as exc:  # noqa: BLE001 - report prune failure with the run
             summary["errors"].append({"source": "<prune>", "error": str(exc)})
@@ -1201,16 +1211,21 @@ def write_manifest(root: str, out_path: str) -> dict:
     return manifest
 
 
-async def list_documents(**_) -> list[dict]:
+async def list_documents(collection_name: str | None = None, **_) -> list[dict]:
     """List ingested documents (one entry per ``doc_id``)."""
-    return await vectorstore.list_documents()
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
+    return await vectorstore.list_documents(collection_name=collection)
 
 
-async def delete_document(file_id: str, **_) -> bool:
+async def delete_document(
+    file_id: str, collection_name: str | None = None, **_
+) -> bool:
     """Delete a document's chunks; return False if it did not exist."""
-    return await vectorstore.delete_document(file_id)
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
+    return await vectorstore.delete_document(file_id, collection_name=collection)
 
 
-async def corpus_status(**_) -> dict:
+async def corpus_status(collection_name: str | None = None, **_) -> dict:
     """Return the Qdrant collection's status, point count and document count."""
-    return await vectorstore.collection_status()
+    collection = settings.QDRANT_COLLECTION if collection_name is None else collection_name
+    return await vectorstore.collection_status(collection_name=collection)

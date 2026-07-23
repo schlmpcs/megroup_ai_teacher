@@ -8,6 +8,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 
 from app.core.config import settings
+from app.services.assistant_profiles import get_assistant_profile
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -121,6 +122,22 @@ def _json_load(value):
 
 def _path_value(value):
     return None if value is None else str(value)
+
+
+def _validated_job_options(options: dict | None) -> dict:
+    if not options:
+        return {}
+    validated = dict(options)
+    validated.pop("system_prompt", None)
+    validated.pop("qdrant_collection", None)
+    validated.pop("corpus_root", None)
+    assistant_type = validated.get("assistant_type")
+    if assistant_type is None:
+        validated.pop("assistant_type", None)
+        return validated
+    profile = get_assistant_profile(assistant_type)
+    validated["assistant_type"] = profile.assistant_type
+    return validated
 
 
 def _validated_upload_stored_path(stored_path: str | None, *, job_id: str, item_id: str) -> str | None:
@@ -409,8 +426,15 @@ def _refresh_job_counts(connection: sqlite3.Connection, job_id: str) -> None:
     )
 
 
-def enqueue_upload_job(job_id: str, items: list[dict], *, retry_of: str | None = None) -> dict:
+def enqueue_upload_job(
+    job_id: str,
+    items: list[dict],
+    *,
+    options: dict | None = None,
+    retry_of: str | None = None,
+) -> dict:
     created_at = _now()
+    validated_options = _validated_job_options(options)
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
@@ -419,9 +443,9 @@ def enqueue_upload_job(job_id: str, items: list[dict], *, retry_of: str | None =
                 id, kind, status, options_json, retry_of, cancel_requested,
                 total_items, completed_items, failed_items, skipped_items,
                 current_item, current_stage, error, warning, created_at, started_at, finished_at
-            ) VALUES (?, 'upload', 'queued', '{}', ?, 0, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, NULL, NULL)
+            ) VALUES (?, 'upload', 'queued', ?, ?, 0, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, NULL, NULL)
             """,
-            (job_id, retry_of, len(items), created_at),
+            (job_id, _json_dump(validated_options), retry_of, len(items), created_at),
         )
         _insert_items(connection, job_id, items)
         _refresh_job_counts(connection, job_id)
@@ -431,6 +455,7 @@ def enqueue_upload_job(job_id: str, items: list[dict], *, retry_of: str | None =
 def enqueue_corpus_job(options: dict, *, retry_of: str | None = None) -> dict:
     job_id = new_id()
     created_at = _now()
+    validated_options = _validated_job_options(options)
     with connect() as connection:
         connection.execute(
             """
@@ -440,7 +465,7 @@ def enqueue_corpus_job(options: dict, *, retry_of: str | None = None) -> dict:
                 current_item, current_stage, error, warning, created_at, started_at, finished_at
             ) VALUES (?, 'corpus', 'queued', ?, ?, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, ?, NULL, NULL)
             """,
-            (job_id, _json_dump(options or {}), retry_of, created_at),
+            (job_id, _json_dump(validated_options), retry_of, created_at),
         )
         return _get_job(connection, job_id)
 
@@ -777,7 +802,12 @@ def retry_job(job_id: str) -> dict:
                 }
             )
         try:
-            return enqueue_upload_job(retry_id, retry_items, retry_of=original["id"])
+            return enqueue_upload_job(
+                retry_id,
+                retry_items,
+                options=original["options"],
+                retry_of=original["id"],
+            )
         except Exception:
             for copied_path in reversed(copied_paths):
                 copied_path.unlink(missing_ok=True)

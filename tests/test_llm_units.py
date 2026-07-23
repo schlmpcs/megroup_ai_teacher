@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from app.services import llm
+from app.services.assistant_profiles import get_assistant_profile
 from app.services.memory import (
     build_input_messages,
     latest_user_message,
@@ -43,6 +44,29 @@ def test_build_system_prompt_allows_current_subject_or_lab():
 def test_build_system_prompt_state_omitted_when_blank():
     prompt = llm.build_system_prompt("Сценарий: тест", "   ")
     assert "LIVE SCENE STATE" not in prompt
+
+
+async def test_generate_answer_uses_selected_profile_prompt_and_collection(
+    monkeypatch,
+):
+    profile = get_assistant_profile("other_assistant")
+    captured = {}
+
+    async def _retrieve(query, **kwargs):
+        captured["collection_name"] = kwargs.get("collection_name")
+        return []
+
+    async def _create(**kwargs):
+        captured["instructions"] = kwargs["instructions"]
+        return SimpleNamespace(output_text="Configured answer.", usage=None)
+
+    monkeypatch.setattr(llm, "_retrieve", _retrieve)
+    monkeypatch.setattr(llm.client.responses, "create", _create)
+
+    await llm.generate_answer("Explain this.", assistant_type="other_assistant")
+
+    assert captured["collection_name"] == profile.qdrant_collection
+    assert profile.system_prompt in captured["instructions"]
 
 
 # ── Citations from retrieved chunks (local hybrid RAG) ───────────────────────
@@ -489,7 +513,13 @@ async def test_generate_answer_general_fallback_is_kazakh_and_uncited(monkeypatc
         return SimpleNamespace(dense=[0.0], sparse_indices=[], sparse_values=[])
 
     async def _hybrid_search(
-        dense, sparse_indices, sparse_values, top_k, candidates, query_filter=None
+        dense,
+        sparse_indices,
+        sparse_values,
+        top_k,
+        candidates,
+        query_filter=None,
+        collection_name=None,
     ):
         captured["filters"].append(query_filter)
         return [
@@ -591,7 +621,7 @@ async def test_cross_language_evidence_is_translated_to_english_with_citation(
 async def test_english_answer_can_use_exact_russian_lab_instruction(monkeypatch):
     captured = {}
 
-    async def _fetch(lab_id):
+    async def _fetch(lab_id, collection_name=None):
         assert lab_id == "physics-10-ru-02"
         return {
             "text": "Наденьте очки и закрепите пробирку.",
@@ -737,7 +767,7 @@ async def test_generate_answer_allows_same_subject_question_outside_exact_lab(
 ):
     captured = {}
 
-    async def _lab_grounding(lab):
+    async def _lab_grounding(lab, collection_name=None):
         return (
             "Нагреть воду и записать температуру кипения.",
             False,
@@ -781,7 +811,7 @@ async def test_generate_answer_allows_same_subject_question_outside_exact_lab(
 async def test_stream_answer_rejects_question_from_different_subject_without_openai(
     monkeypatch,
 ):
-    async def _lab_grounding(lab):
+    async def _lab_grounding(lab, collection_name=None):
         return (
             "Нагреть воду и записать температуру кипения.",
             False,
