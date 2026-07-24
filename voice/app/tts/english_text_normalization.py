@@ -143,6 +143,22 @@ _DECIMAL_RE = re.compile(
     r"(?<![\w.,])(?P<number>[−-]?\d+[.,]\d+)(?!\w|[.,]\d)"
 )
 _INTEGER_RE = re.compile(r"(?<![\w.,])(?P<number>[−-]?\d+)(?!\w|[.,]\d)")
+_ROMAN_RE = re.compile(
+    r"(?<![A-Za-z])(?P<roman>(?=[IVXLCDM])M{0,3}(?:CM|CD|D?C{0,3})"
+    r"(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))(?![A-Za-z])"
+)
+_ROMAN_LABEL_RE = re.compile(
+    r"\b(?:chapters?|sections?|parts?|steps?|grades?|classes?|groups?|types?|"
+    r"levels?|experiments?|labs?|figures?|tables?|questions?|options?|"
+    r"categories?|phases?|stages?)\s+$",
+    re.IGNORECASE,
+)
+_ROMAN_NEIGHBOR_BEFORE_RE = re.compile(
+    r"\b[IVXLCDM]+\s*(?:,|\band\b|\bor\b)\s*$"
+)
+_ROMAN_NEIGHBOR_AFTER_RE = re.compile(
+    r"^\s*(?:,|\band\b|\bor\b)\s*[IVXLCDM]+\b"
+)
 
 _UNIT_NAMES = {
     "ml": "milliliter",
@@ -291,14 +307,39 @@ def _replace_range(match: Match[str]) -> str:
     )
 
 
+def _replace_roman(match: Match[str]) -> str:
+    roman = match.group("roman")
+    before = match.string[: match.start()]
+    after = match.string[match.end() :]
+    contextual = (
+        _ROMAN_LABEL_RE.search(before)
+        or _ROMAN_NEIGHBOR_BEFORE_RE.search(before)
+        or _ROMAN_NEIGHBOR_AFTER_RE.match(after)
+        or (not before.strip() and not after.strip())
+        or (re.search(r"(?:^|\n)\s*$", before) and re.match(r"[.)]", after))
+        or (before.endswith("(") and after.startswith(")"))
+    )
+    if not contextual:
+        return roman
+
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = previous = 0
+    for char in reversed(roman):
+        value = values[char]
+        total += -value if value < previous else value
+        previous = max(previous, value)
+    return english_cardinal(total)
+
+
 def normalize_english_text(text: str) -> str:
     """Expand common spoken forms while preserving formulas, URLs, files, and IDs."""
-    if not text or not any(char.isdigit() for char in text):
+    if not text:
         return text
 
     protector = _Protector()
     normalized = _ISO_DATE_RE.sub(_replace_date, text)
     normalized = _DOTTED_DATE_RE.sub(_replace_date, normalized)
+    normalized = _ROMAN_RE.sub(_replace_roman, normalized)
     normalized = _mask_nonlinguistic(normalized, protector)
     normalized = protector.protect(normalized, _DOTTED_IDENTIFIER_RE)
     normalized = _TIME_RE.sub(_replace_time, normalized)

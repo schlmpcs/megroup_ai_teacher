@@ -264,6 +264,14 @@ def test_english_normalization_handles_signed_grouped_and_range_values(
     assert normalize_english_text(source) == expected
 
 
+def test_english_normalization_reads_roman_numerals_without_changing_pronouns():
+    source = "Groups I, II, IV and V. Chapter VI. I am ready."
+
+    assert normalize_english_text(source) == (
+        "Groups one, two, four and five. Chapter six. I am ready."
+    )
+
+
 class _FakeStt:
     loaded = ["stt_ru", "stt_kk", "stt_en"]
 
