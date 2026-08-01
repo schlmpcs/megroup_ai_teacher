@@ -47,6 +47,7 @@ from app.services.memory import (
     conversation_memory,
     latest_user_message,
 )
+from app.services import openai_client
 from app.services.scenarios import (
     ScenarioNotFoundError,
     format_scenario_state,
@@ -54,7 +55,10 @@ from app.services.scenarios import (
 )
 from app.services.voice import resolve_tts_backend, synthesize, transcribe_with_language
 
-router = APIRouter(dependencies=[Depends(verify_api_key)])
+router = APIRouter(
+    dependencies=[Depends(verify_api_key)],
+    lifespan=openai_client.keep_warm_lifespan,
+)
 logger = logging.getLogger("assistant.api")
 
 # Set RATE_LIMIT_PER_MINUTE<=0 to disable rate limiting entirely (e.g. for bulk

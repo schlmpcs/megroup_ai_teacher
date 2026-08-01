@@ -4,12 +4,18 @@ Centralised so every service uses the same configured client and so tests can
 monkeypatch ``app.services.openai_client.client`` with a fake.
 """
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
+
 from openai import AsyncOpenAI
 
 from app.core.config import settings
 
 
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+_KEEP_WARM_INTERVAL_S = 240.0
+logger = logging.getLogger("assistant.openai")
 
 
 def _build_client() -> AsyncOpenAI:
@@ -27,3 +33,42 @@ def _build_client() -> AsyncOpenAI:
 
 
 client: AsyncOpenAI = _build_client()
+
+
+async def _warm_once() -> bool:
+    try:
+        await client.responses.create(
+            model=settings.OPENAI_MODEL,
+            input="Reply with OK.",
+            max_output_tokens=16,
+            temperature=0,
+            store=False,
+            **(
+                {"service_tier": settings.OPENAI_SERVICE_TIER}
+                if settings.OPENAI_SERVICE_TIER
+                else {}
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - warm-up is best-effort
+        logger.warning("OpenAI warm-up failed: %s", exc)
+        return False
+    return True
+
+
+async def _keep_warm_loop() -> None:
+    while True:
+        await asyncio.sleep(_KEEP_WARM_INTERVAL_S)
+        await _warm_once()
+
+
+@asynccontextmanager
+async def keep_warm_lifespan(_app):
+    if await _warm_once():
+        logger.info("OpenAI generation path warmed")
+    task = asyncio.create_task(_keep_warm_loop(), name="openai-keep-warm")
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
