@@ -219,7 +219,7 @@ async def synthesize(
     body = {
         "text": text,
         "language": lang,
-        "speed": 0.9 if selected_backend == "omnivoice" else 1.0,
+        "speed": 1.0,
     }
     body["backend"] = selected_backend
     if voice is not None:

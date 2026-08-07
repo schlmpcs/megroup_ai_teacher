@@ -1,4 +1,4 @@
-"""Dedicated service for the fixed young-male Kazakh OmniVoice profile."""
+"""Dedicated service for the fixed youthful-male Kazakh OmniVoice profile."""
 
 import asyncio
 import io
@@ -45,7 +45,7 @@ def _env_bool(name: str, default: bool) -> bool:
 class Settings:
     model: str = os.getenv("OMNIVOICE_MODEL", "shyngys879/KazakhTTS-OmniVoice")
     instruct: str = os.getenv(
-        "OMNIVOICE_INSTRUCT", "male, young adult, low pitch"
+        "OMNIVOICE_INSTRUCT", "male, teenager, moderate pitch"
     )
     steps: int = int(os.getenv("OMNIVOICE_STEPS", "24"))
     audio_tokenizer_path: str = os.getenv(

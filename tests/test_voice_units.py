@@ -130,7 +130,7 @@ async def test_synthesize_defaults_kazakh_to_omnivoice(monkeypatch):
     assert fake.calls[0][1]["json"] == {
         "text": "Сәлеметсіз бе",
         "language": "kk",
-        "speed": 0.9,
+        "speed": 1.0,
         "backend": "omnivoice",
     }
 
