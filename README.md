@@ -16,6 +16,9 @@ follow-up вопросов `/ask` и `/voice_ask` держат ограниче�
   `file_search`). Ссылки на источники собираются из метаданных чанков (ТЗ §4).
 - **Контекст сценария** (текущая сцена, шаги, объекты) подставляется в системный
   промт по `scenario_id` (ТЗ §3.2).
+- **Профили ассистентов:** встроенные и созданные администратором профили имеют
+  отдельные system prompt, коллекцию Qdrant и корень корпуса. Динамические
+  профили хранятся в общей SQLite-базе API и ingestion worker.
 - **Голос**: STT и TTS обслуживает встроенный GPU-сайдкар `voice` (Whisper
   ru/kk/en/auto + Supertonic по умолчанию / Qwen3-TTS 0.6B по явному выбору на русском и английском,
   отдельный OmniVoice с фиксированным молодым мужским голосом на казахском и
@@ -34,7 +37,8 @@ VR-клиент (Unity)
    │  Authorization: Bearer <INTERNAL_API_KEY>
    ▼
 FastAPI-прокси (этот репозиторий)            ┌─ scenarios/*.json  (контекст сцен)
-   │  http://api:8000 (хост :8001)            └─ инъекция в system prompt
+   │  http://api:8000 (хост :8001)            ├─ инъекция в system prompt
+   │                                           └─ assistant_profiles.sqlite3
    ├─► embedder (bge-m3, GPU)        POST http://embedder:8080/embed
    │       └─ dense + sparse эмбеддинг запроса
    ├─► Qdrant                        http://qdrant:6333 (Query API + RRF)
@@ -421,8 +425,8 @@ curl -sS "$API_BASE/admin/corpus_status" -H "Authorization: Bearer $KEY"
 
 ## Подключения и порты
 
-Прокси является единственным сервисом, который ходит наружу. К каждому из трёх локальных
-сервисов он подключается по HTTP через ленивый `httpx.AsyncClient` (Qdrant через
+Прокси является единственным сервисом, который ходит наружу. К локальным
+сервисам он подключается по HTTP через ленивый `httpx.AsyncClient` (Qdrant через
 свой клиент). Под docker-compose адреса по умолчанию указывают на имена сервисов;
 для запуска прокси вне Docker переопределите их на `localhost` + host-mapped порт.
 
@@ -461,10 +465,12 @@ Gateway выставлен наружу через **Tailscale Funnel**, пуб�
 Каждый вызов `/ask`/`/hint` идёт в OpenAI и стоит денег. Держите
 `INTERNAL_API_KEY` в секрете и `RATE_LIMIT_PER_MINUTE > 0`.
 
-### Переменные окружения (генерация и кэш)
+### Переменные окружения (API, генерация и состояние)
 
 | Переменная | Назначение |
 |-----------|-----------|
+| `INTERNAL_API_KEY` | Bearer-ключ публичного VR API; не даёт доступ к `/admin/*` |
+| `ADMIN_API_KEY` | отдельный Bearer-ключ backend endpoints `/admin/*`; не передавать VR-клиенту |
 | `OPENAI_API_KEY` | ключ OpenAI, обязательный для генерации ответов |
 | `OPENAI_BASE_URL` | необязательный URL Azure или совместимого прокси |
 | `OPENAI_MODEL` | модель Responses API, по умолчанию `gpt-4.1-mini` |
@@ -475,6 +481,7 @@ Gateway выставлен наружу через **Tailscale Funnel**, пуб�
 | `CHAT_MEMORY_MAX_CONVERSATIONS` / `CHAT_MEMORY_TTL_S` | размер и TTL эфемерной памяти VR-диалогов; ≤0 отключает серверную память |
 | `CHAT_MEMORY_MAX_MESSAGES` / `CHAT_MEMORY_HISTORY_CHARS` | лимиты истории одного диалога |
 | `CHAT_MEMORY_RETRIEVAL_CONTEXT_CHARS` | объём предыдущего диалога, добавляемый к ретривалу follow-up вопроса |
+| `INGESTION_DATA_DIR` | общий каталог SQLite очереди, загруженных файлов и динамических профилей; compose использует `/data/ingestion` |
 | `ALLOW_GENERAL_KNOWLEDGE_FALLBACK` | разрешить ответ из общеизвестных научных знаний без цитат только вне структурированного контекста лабораторной работы, если найденные материалы непригодны и нет авторитетного контекста сцены/процедуры |
 
 ### Переменные окружения (ретривал)
@@ -524,6 +531,13 @@ Gateway выставлен наружу через **Tailscale Funnel**, пуб�
 | `TTS_NORMALIZE_EN_NUMBERS` | безопасно раскрывать английские числа, единицы, даты, время, проценты и температуры; по умолчанию `true` |
 | `DEFAULT_LANGUAGE` | резервный язык ответа после явного `language`, текущего текста, недавней истории и `lab.lang`; также язык TTS по умолчанию (`ru`/`kk`/`en`), STT без `language` использует `auto` |
 
+`VOICE_TTS_EN_DEFAULT_BACKEND` управляет публичными `/tts` и `/voice_ask`:
+прокси всегда передаёт выбранный backend в voice-сайдкар. `TTS_EN_BACKEND`
+используется только как default при прямом вызове sidecar API. Обычно оба
+значения должны совпадать. Английский STT использует уже загруженную
+мультиязычную Whisper-модель, поэтому отдельного английского checkpoint или
+keep-warm аудиофайла не требуется.
+
 ### Нормализация чисел для TTS
 
 Русский, казахский и английский маршруты используют отдельные детерминированные нормализаторы
@@ -561,22 +575,50 @@ H2O, LAB-204, report2.csv, and URLs remain unchanged.
 
 ## Эндпоинты
 
-Все требуют `Authorization: Bearer <INTERNAL_API_KEY>` (кроме `/health`, `/ready`).
+Публичные endpoints требуют `Authorization: Bearer <INTERNAL_API_KEY>`,
+административные `/admin/*` требуют отдельный `ADMIN_API_KEY`, а `/health` и
+`/ready` доступны без авторизации.
 
 | Метод | Путь | Назначение |
 |------|------|-----------|
-| POST | `/ask` | Вопрос с грунтингом: `{query, language?, conversation_id?, scenario_id?, scenario_state?, lab?}` → ответ + `language` + `citations` + `conversation_id` |
-| POST | `/v1/chat/completions` | OpenAI-совместимый чат (`stream` поддерживается), расширен полями `language=ru/kk/en`, `scenario_id`, `scenario_state`, `lab` |
+| POST | `/ask` | Вопрос с грунтингом: `{assistant_type?, query, language?, conversation_id?, scenario_id?, scenario_state?, lab?}` → ответ + `language` + `citations` + `conversation_id` |
+| POST | `/v1/chat/completions` | OpenAI-совместимый чат (`stream` поддерживается), расширен полями `assistant_type`, `language=ru/kk/en`, `scenario_id`, `scenario_state`, `lab` |
 | POST | `/hint` | Перефразирование подсказки: `{hint_text, hint_level, language?, scenario_id?, scenario_state?}` с возвращаемым `language` |
 | POST | `/stt` | multipart `file`, необязательный `language=ru/kk/en/auto` → `{text, language}`; без `language` включается автоопределение |
 | POST | `/tts` | `{text, language?, backend?, voice?, format?, instructions?}` → WAV; русский = `supertonic` / `qwen` / `mms`, английский = `supertonic` (default) / `qwen`, казахский = `omnivoice` (default) / `mms` |
-| POST | `/voice_ask` | multipart `file` + `language=ru/kk/en/auto`, optional `response_language=ru/kk/en`, `tts_backend` и поля лаборатории → JSON или SSE с language metadata |
-| DELETE | `/v1/conversations/{conversation_id}` | немедленно удалить эфемерную историю VR-диалога |
+| POST | `/voice_ask` | multipart `file`, `language=ru/kk/en/auto` и необязательные `assistant_type`, `response_language=ru/kk/en`, `tts_backend`, поля лаборатории → JSON или SSE с language metadata |
+| DELETE | `/v1/conversations/{conversation_id}` | удалить историю VR-диалога в namespace выбранного `assistant_type` |
+| GET/POST | `/admin/assistant-profiles` | список профилей / создание динамического профиля |
 | GET | `/admin/corpus_status` | состояние коллекции Qdrant |
 | POST | `/admin/documents` | загрузить общий или структурированный документ в KB: multipart `file`, метаданные и необязательный OCR |
 | GET/DELETE | `/admin/documents[/{file_id}]` | список / удаление по `file_id` |
 | GET | `/admin/scenarios` | список сценариев |
 | GET | `/health`, `/ready` | проверки |
+
+### Профили ассистентов
+
+Клиент передаёт только доверенный идентификатор `assistant_type`. Сервер
+разрешает его во встроенном реестре или в общей SQLite-базе и сам выбирает
+system prompt, коллекцию Qdrant и corpus root. По умолчанию используется
+`vr_lab_teacher`.
+
+Администратор может создать профиль без изменения кода и перезапуска сервисов:
+
+```bash
+curl -sS -X POST "$API_BASE/admin/assistant-profiles" \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assistant_type": "math_tutor",
+    "system_prompt": "You are a mathematics tutor."
+  }'
+```
+
+Backend создаст коллекцию `math_tutor_kb`, каталог
+`$INGESTION_DATA_DIR/assistant_corpora/math_tutor` и сохранит профиль в
+`assistant_profiles.sqlite3`. Поля инфраструктуры в запросе запрещены. Полный
+контракт, операции с корпусом и ограничения описаны в
+[руководстве по профилям](docs/multi-assistant-profiles.md).
 
 ### English support
 
@@ -597,9 +639,74 @@ curl -s localhost:8000/ask \
 ```
 
 The same `language=en` extension is supported by `/v1/chat/completions` and
-`/hint`. STT accepts `en` or `auto`; TTS accepts English with Supertonic by
-default or Qwen by explicit selection. `/voice_ask` accepts STT `language` plus
-an optional `response_language`. Structured uploads accept `lang=en`.
+`/hint`. Structured uploads accept `lang=en`.
+
+#### English STT and TTS
+
+VR clients should call the authenticated proxy endpoints, not the internal
+voice-sidecar endpoints. The English voice contract is:
+
+| Endpoint | English fields | Result |
+|----------|----------------|--------|
+| `/stt` | multipart `language=en` or `language=auto` | JSON `{text, language}`; detected English is returned as `language=en` |
+| `/tts` | JSON `language=en`, optional `backend=supertonic|qwen`, optional `voice` | WAV bytes with `Content-Language: en` and `X-TTS-Backend` headers |
+| `/voice_ask` | multipart STT `language`, optional `response_language=en`, optional `tts_backend=supertonic|qwen` | English answer plus base64 WAV; JSON includes `stt_language`, `language`, and `tts_backend` |
+
+`Supertonic` is the default English TTS backend. `Qwen` can be selected per
+request. `MMS` and `OmniVoice` do not support English and are rejected with HTTP
+422. Output from the proxy `/tts` endpoint is always `audio/wav`; legacy
+`format` and `instructions` fields are accepted only for client compatibility.
+
+English STT with explicit language selection or automatic detection:
+
+```bash
+curl -sS localhost:8000/stt \
+  -H "Authorization: Bearer $KEY" \
+  -F 'file=@question_en.wav' \
+  -F 'language=en'
+
+curl -sS localhost:8000/stt \
+  -H "Authorization: Bearer $KEY" \
+  -F 'file=@question_en.wav' \
+  -F 'language=auto'
+```
+
+English TTS with the default Supertonic backend or explicit Qwen selection:
+
+```bash
+curl -sS localhost:8000/tts \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Heat 250 mL to 25 °C.","language":"en"}' \
+  -o answer_supertonic_en.wav
+
+curl -sS localhost:8000/tts \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Heat 250 mL to 25 °C.","language":"en","backend":"qwen"}' \
+  -o answer_qwen_en.wav
+```
+
+Full English voice pipeline. `language` controls STT, `response_language`
+controls the generated answer and TTS, and `lang` continues to select the
+laboratory procedure and corpus language:
+
+```bash
+curl -sS localhost:8000/voice_ask \
+  -H "Authorization: Bearer $KEY" \
+  -F 'file=@question_en.wav' \
+  -F 'language=auto' \
+  -F 'response_language=en' \
+  -F 'tts_backend=supertonic' \
+  -F 'subject=physics' \
+  -F 'grade=10' \
+  -F 'lang=en' \
+  -F 'lab_number=2'
+```
+
+If `response_language` is omitted, `/voice_ask` uses the resolved STT language
+for both the answer and TTS. The non-streaming response contains `audio_base64`;
+with `stream=true`, sentence-level WAV chunks arrive in SSE `audio` frames.
 
 See [the English migration and operations runbook](docs/english-support-runbook.md)
 for complete curl examples, corpus layout, ingestion, health checks, and rollout

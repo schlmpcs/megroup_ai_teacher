@@ -30,4 +30,16 @@ labs.json
 /grades.json
 /missing_content.json
 graphify-out/
-tts_formula_samples/
+
+# Generated local voice samples
+/english_tts_samples/
+/generated_audio/
+/tts_formula_samples/
+/tts_number_samples/
+/kazakh_mms_fallback_sample.wav
+/kazakh_young_male_omnivoice.wav
+/qwen3_tts_0.6b_russian_sample.wav
+/supertonic_russian_sample.wav
+
+# Temporary implementation prompts
+/docs/superpowers/prompts/

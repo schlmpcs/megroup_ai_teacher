@@ -88,3 +88,26 @@ def test_validate_assistant_profiles_rejects_duplicate_qdrant_collections():
 
     with pytest.raises(ValueError, match="duplicate qdrant_collection"):
         validate_assistant_profiles(profiles)
+
+
+def test_validate_assistant_profiles_rejects_duplicate_corpus_roots():
+    profiles = MappingProxyType(
+        {
+            DEFAULT_ASSISTANT_TYPE: ASSISTANT_PROFILES[DEFAULT_ASSISTANT_TYPE],
+            "alpha": AssistantProfile(
+                assistant_type="alpha",
+                system_prompt="Alpha assistant.",
+                qdrant_collection="alpha_kb",
+                corpus_root="/data/shared",
+            ),
+            "beta": AssistantProfile(
+                assistant_type="beta",
+                system_prompt="Beta assistant.",
+                qdrant_collection="beta_kb",
+                corpus_root="/data/shared",
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="duplicate corpus_root"):
+        validate_assistant_profiles(profiles)

@@ -74,6 +74,11 @@ async def test_startup_resumes_pending_deletions_after_schema_init(monkeypatch):
 
     events = []
     monkeypatch.setattr(main, "missing_required_env_vars", lambda: [])
+    monkeypatch.setattr(
+        main,
+        "initialize_assistant_profiles",
+        lambda: events.append("profiles"),
+    )
     monkeypatch.setattr(main.ingestion_jobs, "initialize", lambda: events.append("initialize"))
     monkeypatch.setattr(
         main.ingestion_jobs,
@@ -89,7 +94,7 @@ async def test_startup_resumes_pending_deletions_after_schema_init(monkeypatch):
     async with main.lifespan(main.app):
         pass
 
-    assert events == ["initialize", "pending", "stale"]
+    assert events == ["profiles", "initialize", "pending", "stale"]
 
 
 # ── /ask ──────────────────────────────────────────────────────────────────

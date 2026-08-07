@@ -5,15 +5,19 @@ from pathlib import Path, PurePath
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from app.api.routes import _assistant_profile_or_422, _handle_llm_error
 from app.api.upload_utils import read_upload, stream_upload
 from app.core.config import settings
 from app.core.languages import LanguageCode
 from app.core.security import verify_admin_api_key
-from app.services.assistant_profiles import DEFAULT_ASSISTANT_TYPE
-from app.services import corpus_meta, ingestion, ingestion_jobs
+from app.services import assistant_profiles, corpus_meta, ingestion, ingestion_jobs
+from app.services.assistant_profiles import (
+    ASSISTANT_TYPE_PATTERN,
+    AssistantProfileConflictError,
+    DEFAULT_ASSISTANT_TYPE,
+)
 from app.services.corpus_meta import build_upload_metadata
 from app.services.errors import LLMError
 from app.services.llm import clear_answer_cache
@@ -25,6 +29,37 @@ admin_router = APIRouter(
 )
 
 PreviewPath = Annotated[str, Field(min_length=1, max_length=1024)]
+
+
+class AssistantProfileCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    assistant_type: str = Field(pattern=ASSISTANT_TYPE_PATTERN)
+    system_prompt: str
+
+    @field_validator("system_prompt")
+    @classmethod
+    def _valid_system_prompt(cls, value: str) -> str:
+        prompt = value.strip()
+        if not prompt:
+            raise ValueError("system_prompt must not be empty")
+        if len(prompt) > settings.MAX_INPUT_CHARS:
+            raise ValueError(
+                f"system_prompt must not exceed {settings.MAX_INPUT_CHARS} characters"
+            )
+        return prompt
+
+
+class AssistantProfileResponse(BaseModel):
+    assistant_type: str
+    system_prompt: str
+    qdrant_collection: str
+    corpus_root: str
+    built_in: bool
+
+
+class AssistantProfileListResponse(BaseModel):
+    profiles: list[AssistantProfileResponse]
 
 
 class UploadPreviewRequest(BaseModel):
@@ -143,6 +178,56 @@ def _prunable_documents(documents: list[dict], present_doc_ids: set[str]) -> lis
         and corpus_meta.parse_path(document["source_path"]) is not None
         and document["file_id"] not in present_doc_ids
     ]
+
+
+def _profile_response(
+    profile: assistant_profiles.AssistantProfile,
+    *,
+    built_in: bool,
+) -> AssistantProfileResponse:
+    return AssistantProfileResponse(
+        assistant_type=profile.assistant_type,
+        system_prompt=profile.system_prompt,
+        qdrant_collection=profile.qdrant_collection,
+        corpus_root=profile.corpus_root,
+        built_in=built_in,
+    )
+
+
+@admin_router.get(
+    "/assistant-profiles",
+    response_model=AssistantProfileListResponse,
+)
+async def list_assistant_profiles_endpoint() -> AssistantProfileListResponse:
+    return AssistantProfileListResponse(
+        profiles=[
+            _profile_response(item.profile, built_in=item.built_in)
+            for item in assistant_profiles.list_assistant_profiles()
+        ]
+    )
+
+
+@admin_router.post(
+    "/assistant-profiles",
+    status_code=status.HTTP_201_CREATED,
+    response_model=AssistantProfileResponse,
+)
+async def create_assistant_profile_endpoint(
+    request: AssistantProfileCreateRequest,
+) -> AssistantProfileResponse:
+    try:
+        profile = await assistant_profiles.create_assistant_profile(
+            request.assistant_type,
+            request.system_prompt,
+        )
+    except AssistantProfileConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except LLMError as exc:
+        _handle_llm_error(exc)
+    return _profile_response(profile, built_in=False)
 
 
 @admin_router.get("/corpus_status")

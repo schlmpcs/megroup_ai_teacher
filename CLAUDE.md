@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-dont coauthor commits
+Do not add coauthor trailers to commits.
 
 ## Repo Purpose
 
@@ -29,10 +29,12 @@ halves and differ only in keeping the LLM on OpenAI.
 ```text
 app/
   main.py                 # FastAPI app, lifespan (env validation), CORS, health/ready
-  core/config.py          # pydantic-settings; required: INTERNAL_API_KEY, OPENAI_API_KEY
-  core/security.py        # Bearer INTERNAL_API_KEY auth
-  api/routes.py           # /ask /v1/chat/completions /hint /stt /tts /voice_ask /admin/*
+  core/config.py          # pydantic-settings; required API/admin/OpenAI secrets
+  core/security.py        # separate Bearer auth for public and admin APIs
+  api/routes.py           # /ask /v1/chat/completions /hint /stt /tts /voice_ask
+  api/admin_routes.py     # admin profile, corpus, document, and ingestion endpoints
   services/
+    assistant_profiles.py # built-ins + shared SQLite dynamic profile registry
     openai_client.py      # single shared AsyncOpenAI client (monkeypatch target in tests)
     llm.py                # Responses API: retrieve->inject chunks, citations, streaming, hint rephrasing
     embeddings.py         # httpx client to the bge-m3 embedder sidecar (POST /embed -> dense+sparse)
@@ -42,9 +44,14 @@ app/
     corpus_meta.py        # derive subject/grade/lang/lab_id metadata from corpus paths
     voice.py              # httpx client to the in-repo STT/TTS sidecar (./voice)
     ingestion.py          # to_markdown -> chunk+embed (PDF/DOCX/EPUB/TXT/MD) -> Qdrant; bulk ingest + manifest
+    ingestion_jobs.py     # durable SQLite ingestion queue and artifact lifecycle
+    ingestion_worker.py   # background upload/corpus job execution
     memory.py             # bounded history + ephemeral TTL conversation memory
+admin_ui/                 # separately deployed operator UI and backend proxy
+gateway/                  # public nginx ingress for API and operator UI
 embedder/                 # GPU sidecar container (FlagEmbedding BGEM3FlagModel, RTX 3060 / sm_86)
 voice/                    # GPU STT/TTS sidecar (Whisper + Qwen3-TTS/Supertonic/MMS); vendored from ../vrrag_ttsstt
+voice_omnivoice/          # isolated Kazakh OmniVoice GPU sidecar
 scripts/manage_corpus.py  # CLI: create-collection / upload / bulk-ingest / gen-manifest / list / status / delete
 scenarios/*.json          # one file per lab; filename stem == scenario_id
 tests/                    # pytest, OpenAI + Qdrant + embedder mocked (no network)
@@ -55,6 +62,7 @@ tests/                    # pytest, OpenAI + Qdrant + embedder mocked (no networ
 ```text
 routes.py
   -> verify_api_key (Bearer INTERNAL_API_KEY)
+  -> assistant_profiles.get_assistant_profile(assistant_type)
   -> scenarios.get_scenario_context(scenario_id)   # 404 if unknown
   -> llm.generate_answer / stream_answer
        -> embeddings.embed(query)                   # bge-m3 sidecar -> dense + sparse
@@ -90,6 +98,11 @@ routes.py
   English share loaded Supertonic and Qwen3-TTS 0.6B instances; Supertonic is
   their default. Kazakh keeps its existing OmniVoice/MMS routing.
 - Responses API param is `max_output_tokens` (not `max_tokens`).
+- Public clients supply only `assistant_type`. Trusted system prompts, Qdrant
+  collections, and corpus roots come from built-in profiles or the shared
+  `INGESTION_DATA_DIR/assistant_profiles.sqlite3` registry. Admin profile
+  creation derives infrastructure values server-side. API, worker, and CLI read
+  the same SQLite file without an in-memory profile cache.
 - Qdrant collection has one point per chunk with two named vectors: `dense`
   (1024-d, cosine, configured by `EMBEDDING_DIM`) and `sparse` (learned-sparse
   from bge-m3).
@@ -128,6 +141,9 @@ routes.py
 - Retrieval changes: `app/services/vectorstore.py` (Qdrant query / RRF) and
   `app/services/embeddings.py` (embedder client); ingestion in
   `app/services/ingestion.py`.
+- Profile changes: `app/services/assistant_profiles.py` and
+  `app/api/admin_routes.py`. Preserve the boundary where clients choose only an
+  `assistant_type` and the server owns prompts, collections, and paths.
 - New settings: add to `app/core/config.py` and `.env.example`. Retrieval knobs:
   `QDRANT_URL`, `QDRANT_COLLECTION`, `EMBEDDING_BASE_URL`, `EMBEDDING_DIM`,
   `RETRIEVAL_TOP_K`, `RETRIEVAL_CANDIDATES`, `RETRIEVAL_SCORE_THRESHOLD`,
@@ -138,8 +154,10 @@ routes.py
   Omitted STT language auto-detects RU/KK/EN; omitted standalone TTS language
   follows `DEFAULT_LANGUAGE`. (`OPENAI_VECTOR_STORE_ID` and the old `STT_MODEL`/
   `TTS_MODEL`/`TTS_VOICE`/`TTS_FORMAT`/`TTS_INSTRUCTIONS` are removed.)
-- There is no app DB. VR conversation memory is ephemeral TTL/LRU process state;
-  deploys and container restarts clear it. KB state lives in Qdrant.
+- VR conversation memory remains ephemeral TTL/LRU process state and is cleared
+  by deploys or container restarts. Operational ingestion state and dynamic
+  assistant profiles use SQLite under `INGESTION_DATA_DIR`; KB state lives in
+  Qdrant.
 - Run `pytest` (fast, fully mocked, no network/GPU) before declaring done.
 
 ## Safe commands
@@ -150,13 +168,13 @@ uvicorn app.main:app --reload --port 8000
 python -m scripts.manage_corpus status        # Qdrant collection status
 python -m scripts.manage_corpus gen-manifest  # labs.json (no embedding; offline)
 python -m scripts.manage_corpus bulk-ingest   # walk CORPUS_ROOT, tag+embed all files
-docker compose up --build                     # api + qdrant + embedder + voice
+docker compose up --build                     # full eight-service stack
 ```
 
-`docker compose up --build` brings up four services: `api`, `qdrant`, the
-`embedder` GPU sidecar, and the `voice` GPU STT/TTS sidecar (both need the NVIDIA
-Container Toolkit; the embedder and voice share the single GPU, and first boot
-downloads bge-m3 + Whisper/Qwen3-TTS/Supertonic/MMS models, so it's slow).
+`docker compose up --build` brings up `gateway`, `api`, `ingestion-worker`,
+`admin-ui`, `qdrant`, `embedder`, `voice`, and `voice-omnivoice`. The three GPU
+sidecars need the NVIDIA Container Toolkit and share one GPU. First boot is slow
+because it downloads the embedding, STT, and TTS models.
 
 ## Running accuracy evals
 
@@ -175,8 +193,8 @@ EVAL_BASE_URL=http://megroup-b560m-hdv-m-2:8001 EVAL_API_KEY=<server INTERNAL_AP
   python -m scripts.eval.run_eval
 #    -> eval_results.json/.md, eval_slim.json, eval_batches/batch_*.json (49 × 15 Q)
 
-# 2. Grade every answer (this is an LLM-judge step, done by Claude subagents;
-#    there is no grader script). Spawn ~10 parallel agents, each assigned a group
+# 2. Grade every answer (this is an LLM-judge step; there is no grader script).
+#    Run ~10 parallel graders, each assigned a group
 #    of batch_*.json files, each comparing `answer` vs `expected` and WRITING its
 #    grades to eval_batches/grades_gNN.json as [{"id","score","verdict"}].
 #    Rubric: score 0–100 on scientific correctness/coverage vs the reference;

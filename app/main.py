@@ -14,6 +14,7 @@ from app.api.routes import limiter, router
 from app.core.config import missing_required_env_vars, settings
 from app.core.languages import SUPPORTED_LANGUAGES
 from app.services import ingestion_jobs
+from app.services.assistant_profiles import initialize as initialize_assistant_profiles
 
 
 def setup_logging() -> None:
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     missing = missing_required_env_vars()
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+    initialize_assistant_profiles()
     ingestion_jobs.initialize()
     ingestion_jobs.cleanup_pending_deletions()
     ingestion_jobs.cleanup_stale_tmp()

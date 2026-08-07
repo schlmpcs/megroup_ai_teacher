@@ -383,6 +383,16 @@ async def test_run_forever_invalidates_after_recovering_interrupted_jobs(worker_
         events.append("poll")
         raise RuntimeError("stop")
 
+    monkeypatch.setattr(
+        ingestion_worker,
+        "initialize_assistant_profiles",
+        lambda: events.append("profiles"),
+    )
+    monkeypatch.setattr(
+        ingestion_worker.ingestion_jobs,
+        "initialize",
+        lambda: events.append("jobs"),
+    )
     monkeypatch.setattr(ingestion_worker.ingestion_jobs, "recover_interrupted_jobs", lambda: 1)
     monkeypatch.setattr(ingestion_worker, "invalidate_answer_cache", fake_invalidate)
     monkeypatch.setattr(ingestion_worker, "run_once", stop_after_startup)
@@ -390,7 +400,7 @@ async def test_run_forever_invalidates_after_recovering_interrupted_jobs(worker_
     with pytest.raises(RuntimeError, match="stop"):
         await ingestion_worker.run_forever("worker-1")
 
-    assert events == ["invalidate", "poll"]
+    assert events == ["profiles", "jobs", "invalidate", "poll"]
 
 
 async def test_run_once_fatal_exit_invalidates_and_cancels_pending_items(

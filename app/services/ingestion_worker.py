@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.services.assistant_profiles import (
     DEFAULT_ASSISTANT_TYPE,
     get_assistant_profile,
+    initialize as initialize_assistant_profiles,
 )
 from app.services import ingestion, ingestion_jobs
 
@@ -345,6 +346,7 @@ async def _heartbeat_loop(worker_id: str) -> None:
 
 
 async def run_forever(worker_id: str | None = None) -> None:
+    initialize_assistant_profiles()
     ingestion_jobs.initialize()
     with worker_lock():
         recovered = ingestion_jobs.recover_interrupted_jobs()
