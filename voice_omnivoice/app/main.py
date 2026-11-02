@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .abbreviation_normalization import normalize_kazakh_tts_text
-from .model_resolution import resolve_model_path
+from .model_resolution import resolve_cached_model_path
 
 logger = logging.getLogger("omnivoice")
 
@@ -136,7 +136,7 @@ class OmniVoiceBackend:
         from huggingface_hub import snapshot_download
 
         hub_cache = hf_constants.HF_HUB_CACHE
-        model_path = resolve_model_path(
+        model_path = resolve_cached_model_path(
             self.settings.model,
             hub_cache,
             lambda repo_id: snapshot_download(repo_id, cache_dir=hub_cache),

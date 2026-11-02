@@ -60,7 +60,7 @@ def _complete_snapshots_newest_first(repo_dir: Path) -> list[Path]:
     return sorted(complete, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def resolve_model_path(
+def resolve_cached_model_path(
     repo_id_or_path: str,
     hub_cache: str | Path,
     download: Callable[[str], str],
