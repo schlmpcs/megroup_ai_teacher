@@ -41,7 +41,7 @@ from app.services.assistant_profiles import (
     DEFAULT_ASSISTANT_TYPE,
     get_assistant_profile,
 )
-from app.services.openai_client import client
+from app.services.openai_client import client, generation_kwargs
 from app.services.memory import (
     build_input_messages,
     build_retrieval_query,
@@ -1087,12 +1087,6 @@ def _answer_cache_key(
     )
 
 
-def _tier_kwargs() -> dict:
-    """Optional OpenAI service tier (e.g. "priority" for faster first-token)."""
-    tier = settings.OPENAI_SERVICE_TIER
-    return {"service_tier": tier} if tier else {}
-
-
 @dataclass
 class _AnswerGrounding:
     system_prompt: str
@@ -1227,12 +1221,12 @@ async def _complete_answer(
     async def _create(instructions: str):
         try:
             return await client.responses.create(
-                model=settings.OPENAI_MODEL,
                 instructions=instructions,
                 input=input_messages,
-                max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
-                temperature=settings.LLM_TEMPERATURE,
-                **_tier_kwargs(),
+                **generation_kwargs(
+                    max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
+                    temperature=settings.LLM_TEMPERATURE,
+                ),
             )
         except openai.APIError as exc:
             raise _map_openai_error(exc) from exc
@@ -1467,12 +1461,12 @@ async def stream_answer(
 
     try:
         async with client.responses.stream(
-            model=settings.OPENAI_MODEL,
             instructions=grounding.system_prompt,
             input=input_messages,
-            max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
-            temperature=settings.LLM_TEMPERATURE,
-            **_tier_kwargs(),
+            **generation_kwargs(
+                max_output_tokens=max_tokens or settings.LLM_MAX_TOKENS,
+                temperature=settings.LLM_TEMPERATURE,
+            ),
         ) as stream:
             async for event in stream:
                 if getattr(event, "type", None) == "response.output_text.delta":
@@ -1564,12 +1558,9 @@ async def rephrase_hint(
 
     try:
         response = await client.responses.create(
-            model=settings.OPENAI_MODEL,
             instructions=instructions,
             input=[{"role": "user", "content": user_msg}],
-            max_output_tokens=256,
-            **_tier_kwargs(),
-            temperature=0.4,
+            **generation_kwargs(max_output_tokens=256, temperature=0.4),
         )
     except openai.APIError as exc:
         raise _map_openai_error(exc) from exc

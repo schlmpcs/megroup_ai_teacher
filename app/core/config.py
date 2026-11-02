@@ -44,10 +44,37 @@ class Settings(BaseSettings):
     # ── OpenAI (key required) ────────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = ""
-    OPENAI_MODEL: str = "gpt-4.1-mini"
+    OPENAI_MODEL: str = "gpt-6-luna"
+    # Responses API reasoning effort. "" omits the param (non-reasoning models
+    # such as gpt-4.1-mini); "none" turns reasoning off and keeps temperature.
+    # Any other effort drops temperature, which reasoning models reject.
+    OPENAI_REASONING_EFFORT: str = "low"
+    # Reasoning tokens count against max_output_tokens, so this many extra
+    # tokens are added to each generation budget whenever reasoning is on.
+    # Without it, reasoning would eat into LLM_MAX_TOKENS and cut answers short.
+    OPENAI_REASONING_TOKEN_HEADROOM: int = 1024
     # "" omits the param; "priority" buys faster first-token at ~2x token cost.
     OPENAI_SERVICE_TIER: str = ""
     REQUEST_TIMEOUT_S: float = 60.0
+
+    @field_validator("OPENAI_REASONING_EFFORT")
+    @classmethod
+    def _valid_reasoning_effort(cls, v: str) -> str:
+        effort = v.strip().lower()
+        allowed = {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+        if effort not in allowed:
+            raise ValueError(
+                "OPENAI_REASONING_EFFORT must be one of: "
+                + ", ".join(sorted(e or '""' for e in allowed))
+            )
+        return effort
+
+    @field_validator("OPENAI_REASONING_TOKEN_HEADROOM")
+    @classmethod
+    def _valid_reasoning_headroom(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("OPENAI_REASONING_TOKEN_HEADROOM must be >= 0")
+        return v
 
     # ── In-process response caches (size or TTL <= 0 disables) ──────────────
     # Same teacher questions repeat across students; cached answers/audio

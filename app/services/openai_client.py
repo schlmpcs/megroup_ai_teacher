@@ -35,18 +35,48 @@ def _build_client() -> AsyncOpenAI:
 client: AsyncOpenAI = _build_client()
 
 
+def reasoning_enabled() -> bool:
+    """True when the configured effort makes the model reason before answering."""
+    return settings.OPENAI_REASONING_EFFORT not in ("", "none")
+
+
+def generation_kwargs(
+    *,
+    max_output_tokens: int,
+    temperature: float,
+    reasoning_headroom: bool = True,
+) -> dict:
+    """Model/sampling/budget kwargs shared by every ``responses`` call.
+
+    Reasoning models reject ``temperature`` unless reasoning is off, and their
+    reasoning tokens are billed against ``max_output_tokens``. So with reasoning
+    on, temperature is omitted and ``OPENAI_REASONING_TOKEN_HEADROOM`` is added
+    to the visible-answer budget (unless ``reasoning_headroom`` is False).
+    """
+    kwargs: dict = {"model": settings.OPENAI_MODEL}
+    effort = settings.OPENAI_REASONING_EFFORT
+    if effort:
+        kwargs["reasoning"] = {"effort": effort}
+    if reasoning_enabled():
+        if reasoning_headroom:
+            max_output_tokens += settings.OPENAI_REASONING_TOKEN_HEADROOM
+    else:
+        kwargs["temperature"] = temperature
+    kwargs["max_output_tokens"] = max_output_tokens
+    if settings.OPENAI_SERVICE_TIER:
+        kwargs["service_tier"] = settings.OPENAI_SERVICE_TIER
+    return kwargs
+
+
 async def _warm_once() -> bool:
     try:
+        # No reasoning headroom: the ping only keeps the connection and route
+        # warm, so a capped ("incomplete") reply is fine and stays cheap.
         await client.responses.create(
-            model=settings.OPENAI_MODEL,
             input="Reply with OK.",
-            max_output_tokens=16,
-            temperature=0,
             store=False,
-            **(
-                {"service_tier": settings.OPENAI_SERVICE_TIER}
-                if settings.OPENAI_SERVICE_TIER
-                else {}
+            **generation_kwargs(
+                max_output_tokens=16, temperature=0, reasoning_headroom=False
             ),
         )
     except Exception as exc:  # noqa: BLE001 - warm-up is best-effort
