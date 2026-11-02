@@ -197,10 +197,12 @@ services:
       - OMNIVOICE_STEPS=${OMNIVOICE_STEPS:-24}
       - OMNIVOICE_NORMALIZE_KK_NUMBERS=${OMNIVOICE_NORMALIZE_KK_NUMBERS:-true}
       - OMNIVOICE_AUDIO_TOKENIZER_PATH=/models/hf_cache/higgs-audio-v2-tokenizer
-      # The server's direct Hugging Face route intermittently returns 504 for
-      # the mandatory Higgs audio tokenizer. This public mirror is configurable
-      # through .env and used only by the isolated OmniVoice container.
-      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      # The Higgs audio tokenizer is mounted locally (above) and the checkpoint
+      # is resolved cache-first, so the Hub is only hit when no complete copy
+      # is cached. hf-mirror.com now only redirects to huggingface.co without
+      # the X-Repo-Commit/ETag headers huggingface_hub needs, which broke every
+      # download, so the default is the Hub itself (override through .env).
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
     restart: unless-stopped
     deploy:
       resources:

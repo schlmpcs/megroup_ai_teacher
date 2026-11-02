@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .abbreviation_normalization import normalize_kazakh_tts_text
+from .model_resolution import resolve_model_path
 
 logger = logging.getLogger("omnivoice")
 
@@ -128,8 +129,20 @@ class OmniVoiceBackend:
             return resolve_model_path(name_or_path)
 
         omnivoice_module._resolve_model_path = resolve_local_tokenizer
-        self.model = OmniVoice.from_pretrained(
+
+        # Resolve the checkpoint cache-first so restarts do not depend on the
+        # Hub; a local directory also stops OmniVoice's own snapshot_download.
+        from huggingface_hub import constants as hf_constants
+        from huggingface_hub import snapshot_download
+
+        hub_cache = hf_constants.HF_HUB_CACHE
+        model_path = resolve_model_path(
             self.settings.model,
+            hub_cache,
+            lambda repo_id: snapshot_download(repo_id, cache_dir=hub_cache),
+        )
+        self.model = OmniVoice.from_pretrained(
+            model_path,
             device_map="cuda:0" if self.settings.device.startswith("cuda") else "cpu",
             dtype=dtype,
             cache_dir=self.settings.hf_cache,
