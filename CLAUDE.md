@@ -124,6 +124,13 @@ routes.py
   steps. `scripts/manage_corpus.py gen-manifest` writes `labs.json` reporting
   which labs are complete/stub and which paths it couldn't tag (topic-named labs
   with no number land there).
+- Off-topic scope: with a `lab`, `_lab_scope_refusal` rejects other subjects /
+  unrelated questions in code before OpenAI. Without a `lab`, the prompt gets a
+  `TOPIC SCOPE` block (school physics/chemistry/biology for the default profile,
+  the role's own area for other profiles) with an exact refusal sentence. A
+  detected refusal is final: no general-knowledge retry, no citations, appended
+  text dropped. Whole-message small talk (greetings/thanks/"who are you") gets a
+  brief reply in both modes.
 - KB metadata: every chunk payload carries `doc_type` (`textbook` |
   `lab_instruction`), `subject`, `grade`, `lang`, and (for labs) `lab_id` /
   `lab_number`, derived from the corpus path by `corpus_meta.parse_path`. Bulk
